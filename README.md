@@ -1,5 +1,7 @@
 # qwen-hyperdrive — Qwen3.8-27B (qwen35) 専用 128K コンテキスト推論エンジン
 
+## 俺が良い感じにローカルLLM動かしたかったからOpus 5.5 Xhighに書かせたエンジン、普通に早くてビビってる今
+
 `Huihui-Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_XXS-mtp.gguf` を、このPC（RTX 3080 10GB + Ryzen 5 5600X + DDR4 32GB）で
 **128K (131072) トークンのコンテキスト**を確保したまま実用速度で動かすために、C++/CUDA でゼロから書いた推論エンジンです。
 既存エンジンのラッパーではありません（llama.cpp は精度・速度比較用のリファレンスとしてのみ flake に入っています）。
