@@ -1,0 +1,8 @@
+/build/
+result
+result-*
+*.gguf
+/bench-results/data/
+/bench-results/*.log
+/bench-results/*.txt
+/bench-results/*.json
