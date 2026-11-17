@@ -106,6 +106,7 @@ class Generator {
   // n-gram ("prompt lookup") drafts: continuation of the latest earlier occurrence of the last n tokens
   bool ngram_on_ = true, last_ng_ = false;
   double ng_run_ = 3.0;
+  int first_top_[4] = {-1, -1, -1, -1};
   int ngram_n_ = 3;
   std::unordered_map<uint64_t, int> ng_idx_;
   size_t ng_built_ = 0;

@@ -431,6 +431,17 @@ void Generator::step(std::vector<int>& out) {
   } else {
     update_policy(nd, a, qe_now() - t0);
   }
+  static const bool m2 = getenv("QE_MEASURE_TOP2") != nullptr;
+  static long m2_rej = 0, m2_hit[4] = {0, 0, 0, 0};
+  if (m2 && nd > 0 && !last_ng_) {
+    if (a == 0) {
+      m2_rej++;
+      for (int k = 1; k < 4; k++) if (first_top_[k] == s) m2_hit[k]++;
+    }
+    if (st_.steps % 100 == 0 && m2_rej)
+      fprintf(stderr, "[top2] first draft rejected %ld times: 2nd candidate right %.1f%%, 3rd %.1f%%, 4th %.1f%% (steps %d)\n", m2_rej,
+              100.0 * m2_hit[1] / m2_rej, 100.0 * m2_hit[2] / m2_rej, 100.0 * m2_hit[3] / m2_rej, st_.steps);
+  }
   st_.drafted += nd;
   st_.accepted += a;
   st_.acc_hist[std::min(a, 3)]++;
@@ -456,6 +467,7 @@ void Generator::step(std::vector<int>& out) {
   st_.generated += a + 1;
   float conf = 1.f;
   const int d = m_.mtp_draft(0, toks, a + 1, pos_ - a, g && draft_pmin_ > 0 ? &conf : nullptr, g ? nullptr : mtp_logits_.data());
+  for (int k = 0; k < 4; k++) first_top_[k] = m_.top2_[k];
   const double hp2 = qe_now();
   drafts_.clear();
   dq_.clear();

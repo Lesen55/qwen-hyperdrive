@@ -1478,7 +1478,13 @@ int Model::mtp_finish(int n, float* conf, float* logits_host) {
     qk::argmax_rows(logits_dev_, nl, 1, argmax_dev_, stream_);
   }
   CUDA_CHECK(cudaMemcpyAsync(&d, argmax_dev_, 4, cudaMemcpyDeviceToHost, stream_));
+  static const bool m2 = getenv("QE_MEASURE_TOP2") != nullptr;
+  if (m2) {  // experiment: second-best MTP candidate
+    qk::topk_rows(logits_dev_, nl, 1, 4, topk_v_d_, topk_i_d_, topk_work_, stream_);
+    CUDA_CHECK(cudaMemcpyAsync(top2_, topk_i_d_, 16, cudaMemcpyDeviceToHost, stream_));
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+  if (m2 && sub) for (int& t : top2_) t = dv_host_[t];
   if (sub && tk) {
     int* ti = topk_i_h_ + (size_t)qk::kMaxB * kTopKMax;
     for (int i = 0; i < topk_K_; i++) ti[i] = dv_host_[ti[i]];

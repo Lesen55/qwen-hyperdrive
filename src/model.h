@@ -144,6 +144,7 @@ class Model {
   // topk rows (forward: row j of the requested logits; MTP: row kMaxB) instead of the full rows
   void set_topk(int K) { topk_K_ = K; }
   void sync() { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
+  int top2_[4] = {-1, -1, -1, -1};  // QE_MEASURE_TOP2: top-4 ids of the last MTP head output
   int topk_K() const { return topk_K_; }
   const int* topk_idx(int row) const { return topk_i_h_ + (size_t)row * kTopKMax; }
   const float* topk_val(int row) const { return topk_v_h_ + (size_t)row * kTopKMax; }
