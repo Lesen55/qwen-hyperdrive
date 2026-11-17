@@ -13,6 +13,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstring>
+#include <map>
 #include <atomic>
 #include <deque>
 #include <cmath>
@@ -309,15 +311,17 @@ struct Server {
         respond(fd, 200, j.dump());
       }
     } else if (rq.method == "GET" && rq.path == "/v1/models") {
-      Json m = Json::object();
-      m["id"] = model_name;
-      m["object"] = "model";
-      m["owned_by"] = "local";
-      m["meta"]["n_ctx"] = opt.ctx;
       Json list = Json::object();
       list["object"] = "list";
       list["data"] = Json::array();
-      list["data"].push_back(m);
+      for (const std::string id : {model_name, std::string("qwen-hyperdrive"), std::string("qwen-hyperdrive-low"), std::string("qwen-hyperdrive-fast")}) {
+        Json m = Json::object();
+        m["id"] = id;
+        m["object"] = "model";
+        m["owned_by"] = "local";
+        m["meta"]["n_ctx"] = opt.ctx;
+        list["data"].push_back(m);
+      }
       respond(fd, 200, list.dump());
     } else if (rq.method == "POST" && (rq.path == "/v1/chat/completions" || rq.path == "/v1/completions")) {
       try {
@@ -339,20 +343,39 @@ struct Server {
     std::string prompt;
     bool thinking = true;
     Json tools;
+    int alias_budget = -1;
+    std::string effort, roles;
+    const int req_max = (int)b.get_num("max_completion_tokens", b.get_num("max_tokens", -1));
     if (chat) {
       if (!b["messages"].is_array()) throw std::runtime_error("messages must be an array");
       const Json& kw = b["chat_template_kwargs"];
-      thinking = kw.get_bool("enable_thinking", b.get_bool("enable_thinking", true));
-      if (b.get_str("reasoning_effort") == "none") thinking = false;
+      // model aliases: <name>-fast = no thinking, <name>-low = short thinking (agents)
+      const std::string mname = b.get_str("model");
+      auto ends = [&](const char* suf) { const size_t n = strlen(suf); return mname.size() >= n && mname.compare(mname.size() - n, n, suf) == 0; };
+      bool def_think = true;
+      if (ends("-fast")) def_think = false;
+      if (ends("-low")) { effort = "low"; alias_budget = 2048; }
+      thinking = kw.get_bool("enable_thinking", b.get_bool("enable_thinking", def_think));
+      // reasoning_effort as sent by OpenAI-style clients (none/minimal/low/medium/high/xhigh)
+      const std::string re = b.get_str("reasoning_effort");
+      if (re == "none") thinking = false;
+      else if (re == "minimal" || re == "low") effort = "low";
+      else if (re == "medium") effort = "medium";
+      else if (re == "high" || re == "xhigh") effort = "xhigh";
+      if (req_max > 0 && req_max < 256) thinking = false;  // short calls (titles etc.): no room to think
       if (b["tools"].is_array() && !b["tools"].arr().empty() && b.get_str("tool_choice") != "none") tools = b["tools"];
-      std::string effort = b.get_str("reasoning_effort");
-      if (effort != "xhigh" && effort != "medium" && effort != "low") effort = "";
+      std::map<std::string, int> rc;
+      for (auto& m : b["messages"].arr()) rc[m.get_str("role")]++;
+      for (auto& [r, n] : rc) roles += r + ":" + std::to_string(n) + " ";
+      QE_LOG("[server] request: model=%s think=%d effort=%s max_tokens=%d tools=%zu roles=%s\n", mname.c_str(), (int)thinking,
+             effort.empty() ? (thinking ? "xhigh" : "-") : effort.c_str(), req_max, tools.is_array() ? tools.arr().size() : (size_t)0,
+             roles.c_str());
       prompt = chat_render(chat_messages_from_json(b["messages"]), true, thinking, tools, effort);
     } else {
       prompt = b.get_str("prompt");
     }
     const bool stream = b.get_bool("stream", false);
-    int max_tokens = (int)b.get_num("max_completion_tokens", b.get_num("max_tokens", -1));
+    int max_tokens = req_max;
     std::vector<std::string> stops;
     if (b["stop"].is_string()) stops.push_back(b["stop"].str());
     if (b["stop"].is_array())
@@ -372,7 +395,7 @@ struct Server {
     if (chat && thinking) {
       const Json& kw2 = b["chat_template_kwargs"];
       const int reserve = std::min(2048, std::max(128, max_tokens / 4));
-      think_budget = (int)b.get_num("thinking_budget", kw2.get_num("thinking_budget", max_tokens - reserve));
+      think_budget = (int)b.get_num("thinking_budget", kw2.get_num("thinking_budget", alias_budget > 0 ? alias_budget : max_tokens - reserve));
       think_budget = std::clamp(think_budget, 1, std::max(1, max_tokens - 64));
     }
 

@@ -21,6 +21,7 @@ std::vector<ChatMessage> chat_messages_from_json(const Json& messages) {
   for (auto& m : messages.arr()) {
     ChatMessage cm;
     cm.role = m.get_str("role");
+    if (cm.role == "developer") cm.role = "system";  // OpenAI's newer name for the system role
     cm.content = content_text(m["content"]);
     cm.reasoning = m.get_str("reasoning_content");
     if (m["tool_calls"].is_array()) cm.tool_calls = m["tool_calls"];
