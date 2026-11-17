@@ -77,7 +77,9 @@ static __device__ __forceinline__ float h2f(const uint8_t* p) {
 // expand 4 sign bits into byte masks and apply to 4 unsigned grid bytes
 static __device__ __forceinline__ int apply_signs4(uint32_t g, uint32_t s4) {
   const uint32_t m = (((s4 & 0xFu) * 0x00204081u) & 0x01010101u) * 0xFFu;
-  return (int)__vsub4(g ^ m, m);
+  // per-byte negate where m = 0xFF: (g ^ 0xFF) + 1 == -g; grid bytes are never 0, so no carry
+  // crosses a byte (__vsub4 is emulated on sm_86)
+  return (int)((g ^ m) + (m & 0x01010101u));
 }
 
 template <int T>
@@ -558,6 +560,62 @@ __global__ void k_mmv_float(const uint8_t* __restrict__ W, size_t rb, int K, int
   }
 }
 
+// Few-row float matvec (GDN alpha/beta: 48 x 5120 BF16): one 256-thread block per row, K split over
+// all threads with 16-byte weight loads, block reduction.  The warp-per-row kernel above launches only
+// N/8 blocks for such matrices and leaves most SMs idle.
+template <int WT, int B>
+__global__ void __launch_bounds__(256) k_mmv_float_row(const uint8_t* __restrict__ W, size_t rb, int K,
+                                                       const float* __restrict__ x, float* __restrict__ y, int ldy, int acc) {
+  const int row = blockIdx.x;
+  const uint8_t* wr = W + (size_t)row * rb;
+  constexpr int E = WT == QT_F32 ? 4 : 8;  // elements per 16-byte load
+  float sum[B];
+#pragma unroll
+  for (int b = 0; b < B; b++) sum[b] = 0.f;
+  for (int k0 = threadIdx.x * E; k0 < K; k0 += 256 * E) {
+    const uint4 raw = __ldg((const uint4*)(wr + (size_t)k0 * (WT == QT_F32 ? 4 : 2)));
+    float w[E];
+    if constexpr (WT == QT_F32) {
+      w[0] = __uint_as_float(raw.x); w[1] = __uint_as_float(raw.y); w[2] = __uint_as_float(raw.z); w[3] = __uint_as_float(raw.w);
+    } else {
+      const uint32_t u[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        if constexpr (WT == QT_F16) {
+          const float2 f = __half22float2(*(const __half2*)&u[i]);
+          w[2 * i] = f.x; w[2 * i + 1] = f.y;
+        } else {
+          w[2 * i] = __uint_as_float(u[i] << 16); w[2 * i + 1] = __uint_as_float(u[i] & 0xFFFF0000u);
+        }
+      }
+    }
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+      const float4* xp = (const float4*)(x + (size_t)b * K + k0);
+#pragma unroll
+      for (int i = 0; i < E / 4; i++) {
+        const float4 xv = __ldg(xp + i);
+        sum[b] += w[4 * i] * xv.x + w[4 * i + 1] * xv.y + w[4 * i + 2] * xv.z + w[4 * i + 3] * xv.w;
+      }
+    }
+  }
+  __shared__ float red[8][B];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const float v = warp_sum(sum[b]);
+    if (lane == 0) red[warp][b] = v;
+  }
+  __syncthreads();
+  if (threadIdx.x < B) {
+    float v = 0.f;
+#pragma unroll
+    for (int w2 = 0; w2 < 8; w2++) v += red[w2][threadIdx.x];
+    float* o = y + (size_t)threadIdx.x * ldy + row;
+    *o = acc ? *o + v : v;
+  }
+}
+
 static int mmv_mode() {
   static int m = getenv("QE_MMV") ? atoi(getenv("QE_MMV")) : 0;  // 0 = direct (faster on sm_86)
   return m;
@@ -609,6 +667,14 @@ static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* x
 template <int WT>
 static void launch_mmv_float(const void* W, size_t rb, int K, int N, const float* x, int B,
                              float* y, int ldy, bool acc, cudaStream_t s) {
+  if (N <= 256 && K % 8 == 0 && rb % 16 == 0 && !getenv("QE_FLOAT_OLD")) {
+    const uint8_t* w8 = (const uint8_t*)W;
+    switch (B) {
+#define CASE(n) case n: k_mmv_float_row<WT, n><<<N, 256, 0, s>>>(w8, rb, K, x, y, ldy, acc); return;
+      CASE(1) CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+    }
+  }
   const dim3 grid(cdiv(N, MMV_WARPS)), block(MMV_WARPS * 32);
   const uint8_t* w = (const uint8_t*)W;
   switch (B) {
