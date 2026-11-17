@@ -201,6 +201,8 @@ class Model {
   size_t ck_carry_off() const;
   int n_gdn_ = 0;
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
+  bool legacy16_ = false;
+  float* state_bk_host_ = nullptr;  // pinned backup of the GDN states for the fp16-GEMM guard
   void ensure_kv(int npos);
   void refresh_streamed();
   size_t arena_bytes_ = 0;

@@ -21,10 +21,10 @@ struct Prof {
   // QE_PROFILE=1: synchronizing region timers (prefill analysis); =2: event-only decode profile
   bool on = getenv("QE_PROFILE") && atoi(getenv("QE_PROFILE")) == 1;
   double t[16] = {};
-  const char* names[16] = {"attn_layer", "gdn_layer", "ffn", "fa_kernel", "gemm", "dequant", "other"};
+  const char* names[16] = {"attn_layer", "gdn_layer", "ffn", "fa_kernel", "gemm", "dequant", "gdn_core", "gdn_rec"};
   ~Prof() {
     if (!on) return;
-    for (int i = 0; i < 7; i++) fprintf(stderr, "[prof] %-12s %8.3f s\n", names[i], t[i]);
+    for (int i = 0; i < 8; i++) fprintf(stderr, "[prof] %-12s %8.3f s\n", names[i], t[i]);
   }
 } g_prof;
 struct ProfScope {
@@ -241,8 +241,10 @@ void Model::plan_and_load() {
   size_t ssm_bytes = (size_t)n_gdn * ((size_t)c.nv * c.dv * c.dk * 4 + 3 * (size_t)c.conv_dim() * 4);
   if (has_mtp()) {
     opt_.draft_max = std::clamp(opt_.draft_max, 1, 3);
-    // ping-pong state + saved recurrence inputs of the verified tokens (for rollback by recompute)
-    ssm_bytes += (size_t)n_gdn * ((size_t)c.nv * c.dv * c.dk * 4 + (3 + qk::kMaxB) * (size_t)c.conv_dim() * 4 +
+    // saved recurrence inputs of the verified tokens (the accepted prefix is recomputed in place after
+    // verification, so no second copy of the state is needed); legacy fp16-GEMM mode keeps a backup
+    legacy16_ = getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 1;
+    ssm_bytes += (size_t)n_gdn * ((legacy16_ ? (size_t)c.nv * c.dv * c.dk * 4 : 0) + (3 + qk::kMaxB) * (size_t)c.conv_dim() * 4 +
                                   (size_t)(opt_.draft_max + 1) * (c.conv_dim() + 2 * c.nv) * 4);
   }
   Tmax_ = opt_.ubatch;
@@ -521,7 +523,7 @@ void Model::plan_and_load() {
       L.ssm_state = (float*)dalloc((size_t)c.nv * c.dv * c.dk * 4);
       L.gdn_idx = n_gdn_++;
       if (has_mtp()) {
-        L.ssm_alt = (float*)dalloc((size_t)c.nv * c.dv * c.dk * 4);
+        if (legacy16_) L.ssm_alt = (float*)dalloc((size_t)c.nv * c.dv * c.dk * 4);
         L.sv_qkv = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.conv_dim() * 4);
         L.sv_g = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.nv * 4);
         L.sv_beta = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.nv * 4);
@@ -566,7 +568,14 @@ void Model::plan_and_load() {
   carve(ws_small_, qk::kMaxB, false);
   select_ws(true);
   hsafe_ = (float*)dalloc((size_t)qk::kMaxB * c.n_embd * 4);
-  gemm16_ = !(getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 0);  // default on (guarded)
+  // fp16-accumulate cuBLAS prefill (for the types GQ does not take), guarded: the recurrent state is
+  // backed up to pinned host memory before each chunk and restored if a GEMM overflowed
+  gemm16_ = !(getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 0);
+  if (gemm16_ && has_mtp() && !legacy16_) {
+    const size_t sb = (size_t)n_gdn_ * c.nv * c.dv * c.dk * 4;
+    if (cudaHostAlloc((void**)&state_bk_host_, sb, cudaHostAllocDefault) != cudaSuccess) gemm16_ = false;
+    else host_allocs_.push_back(state_bk_host_);
+  }
   use_mmq_ = !(getenv("QE_MMQ") && atoi(getenv("QE_MMQ")) == 0);
   mmq_gs_ = getenv("QE_MMQ_GS") ? atoi(getenv("QE_MMQ_GS")) : 32;
   use_gq_ = !getenv("QE_GQ") || atoi(getenv("QE_GQ")) != 0;
@@ -897,24 +906,31 @@ void Model::layer_gdn(int il, int T) {
   qe_debug_dump("linear_attn_qkv_mixed", il, qkv_raw, T, C, s);
   qe_debug_dump("z", il, z, T, c.d_inner, s);
   float* qkv = t3_;
-  const bool snap = snapshot_ && L.ssm_alt;
+  const bool snap = snapshot_ && L.sv_qkv;
   if (snap) qkv = L.sv_qkv;  // keep the recurrence inputs of the verified tokens for a rollback
   float* gg = snap ? L.sv_g : g_;
   float* bb = snap ? L.sv_beta : beta_;
   // checkpoint capture: stage in device memory (alt state / conv history), DMA to the host slot after
   // the chunk -- zero-copy kernel writes over PCIe are far too slow for 150 MB
-  float* ck_conv = (snap_t_ >= 0) ? L.conv_hist : nullptr;
-  float* ck_state = (snap_t_ >= 0) ? L.ssm_alt : nullptr;
+  float* ck_conv = nullptr;
+  float* ck_state = nullptr;
+  float* o = t2_;
+  {
+  ProfScope psc(6, s);
   qk::ssm_conv(qkv_raw, C, L.conv_state, L.conv_w, qkv, C, T, snap ? L.conv_hist : nullptr, s, snap_t_, ck_conv);
   qk::gdn_prep(qkv, C, ab, ab + (size_t)T * c.nv, c.nv, L.dt_bias, L.ssm_a, gg, bb, c.nk, c.nv, c.dk, T,
                c.eps, s);
   qe_debug_dump("conv_output_silu", il, qkv, T, C, s);
-  float* o = t2_;
   // verify pass: read state A, write B (A survives for a rollback); otherwise in place
-  qk::gdn_recurrence(qkv, C, gg, bb, L.ssm_state, snap ? L.ssm_alt : L.ssm_state, o, c.nk, c.nv, c.dk, T, s,
-                     snap_t_, ck_state);
+  {
+    ProfScope psr(7, s);
+    // verify pass: the state is only read; rollback() recomputes the accepted prefix in place
+    qk::gdn_recurrence(qkv, C, gg, bb, L.ssm_state, snap ? nullptr : L.ssm_state, o, c.nk, c.nv, c.dk, T, s,
+                       -1, ck_state);
+  }
   qe_debug_dump("attn_output", il, o, T, c.d_inner, s);
   qk::gdn_gated_norm(o, z, c.d_inner, L.ssm_norm, c.nv, c.dv, T, c.eps, s);
+  }
   qe_debug_dump("final_output", il, o, T, c.d_inner, s);
   prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   linear(&L, L.wssm_out, o, T, t4_, c.n_embd, false, s);
@@ -1404,14 +1420,11 @@ void Model::rollback(int n_keep) {
   const Config& c = cfg_;
   QE_ASSERT(snap_valid_ && n_keep >= 1 && n_keep <= snap_T_);
   for (auto& L : layers_) {
-    if (!L.ssm_alt) continue;
-    if (n_keep < snap_T_) {
-      // recompute the state after the first n_keep tokens from the pre-pass state A into B
-      qk::gdn_recurrence(L.sv_qkv, c.conv_dim(), L.sv_g, L.sv_beta, L.ssm_state, L.ssm_alt, nullptr, c.nk, c.nv,
-                         c.dk, n_keep, stream_);
-      qk::ssm_conv_rollback(L.conv_state, L.conv_hist, c.conv_dim(), n_keep, stream_);
-    }
-    std::swap(L.ssm_state, L.ssm_alt);
+    if (!L.sv_qkv) continue;
+    // advance the (untouched) pre-pass state by the accepted tokens, in place
+    qk::gdn_recurrence(L.sv_qkv, c.conv_dim(), L.sv_g, L.sv_beta, L.ssm_state, L.ssm_state, nullptr, c.nk, c.nv,
+                       c.dk, n_keep, stream_);
+    if (n_keep < snap_T_) qk::ssm_conv_rollback(L.conv_state, L.conv_hist, c.conv_dim(), n_keep, stream_);
   }
   snap_valid_ = false;
   CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -1449,24 +1462,26 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
       }
     pool_->start([this, &jobs, n](int tid) { cpu_ffn_job(jobs, n, tid); });
   }
-  for (int b0 = 0; b0 < n; b0 += Tmax_) {
-    const int T = std::min(Tmax_, n - b0);
+  for (int b0 = 0, T = 0; b0 < n; b0 += T) {
+    T = std::min(Tmax_, n - b0);
     const int p0 = pos0 + b0;
+    // prompt-cache checkpoint inside this chunk: end the chunk there and save the live state after it
+    if (cap_slot_ >= 0 && cap_pos_ > p0 && cap_pos_ < p0 + T) T = cap_pos_ - p0;
     if (p0 + T > opt_.ctx) QE_FATAL("context overflow (%d > %d)", p0 + T, opt_.ctx);
     // fp16-accumulate GEMMs for prefill chunks, guarded: on any non-finite GEMM output the chunk
     // is recomputed with fp32 accumulation from the saved recurrent state.
-    const bool capture_here = cap_slot_ >= 0 && has_mtp() && cap_pos_ > p0 && cap_pos_ <= p0 + T;
-    const bool g16 = gemm16_ && T > qk::kMaxB && has_mtp() && !capture_here;  // the guard's backup buffers stage the capture
+    const bool g16 = gemm16_ && T > qk::kMaxB && has_mtp();
     if (g16) {
       for (auto& L : layers_) {
-        if (!L.ssm_alt) continue;
-        CUDA_CHECK(cudaMemcpyAsync(L.ssm_alt, L.ssm_state, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToDevice, stream_));
+        if (!L.conv_hist) continue;
+        if (L.ssm_alt) CUDA_CHECK(cudaMemcpyAsync(L.ssm_alt, L.ssm_state, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToDevice, stream_));
+        else CUDA_CHECK(cudaMemcpyAsync(state_bk_host_ + (size_t)L.gdn_idx * c.nv * c.dv * c.dk, L.ssm_state, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToHost, stream_));
         CUDA_CHECK(cudaMemcpyAsync(L.conv_hist, L.conv_state, 3 * (size_t)c.conv_dim() * 4, cudaMemcpyDeviceToDevice, stream_));
       }
       CUDA_CHECK(cudaMemcpyAsync(hcarry_bk_, hcarry_, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
       CUDA_CHECK(cudaMemsetAsync(ovf_dev_, 0, 4, stream_));
     }
-    snap_t_ = capture_here ? cap_pos_ - 1 - p0 : -1;
+    snap_t_ = -1;
     for (int attempt = 0; attempt < 2; attempt++) {
     use16_ = g16 && attempt == 0;
     std::vector<int> pos(T);
@@ -1486,15 +1501,6 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     }
     // final norm for all rows (MTP needs every row's hidden state)
     qk::rmsnorm(x_, output_norm_, hid_, c.n_embd, T, c.eps, stream_);
-    if (snap_t_ >= 0) {  // checkpoint: staged states -> host slot; carry = normed hidden before it
-      for (auto& L : layers_) {
-        if (L.gdn_idx < 0) continue;
-        CUDA_CHECK(cudaMemcpyAsync(ck_host_[cap_slot_] + ck_state_off(L.gdn_idx), L.ssm_alt, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToHost, stream_));
-        CUDA_CHECK(cudaMemcpyAsync(ck_host_[cap_slot_] + ck_conv_off(L.gdn_idx), L.conv_hist, 3 * (size_t)c.conv_dim() * 4, cudaMemcpyDeviceToHost, stream_));
-      }
-      CUDA_CHECK(cudaMemcpyAsync(ck_host_[cap_slot_] + ck_carry_off(), hid_ + (size_t)snap_t_ * c.n_embd,
-                                 (size_t)c.n_embd * 4, cudaMemcpyDeviceToHost, stream_));
-    }
     // logits for rows that fall in this chunk
     const int first_logit_row = n - n_logits;  // global index
     const int r_begin = std::max(first_logit_row, b0), r_end = b0 + T;
@@ -1540,8 +1546,9 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
       if (ovf || test_ovf) {
         if (!test_ovf) QE_LOG("[warn] fp16 GEMM overflow in chunk at %d: recomputing with fp32 accumulation\n", p0);
         for (auto& L : layers_) {
-          if (!L.ssm_alt) continue;
-          CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, L.ssm_alt, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToDevice, stream_));
+          if (!L.conv_hist) continue;
+          if (L.ssm_alt) CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, L.ssm_alt, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToDevice, stream_));
+          else CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, state_bk_host_ + (size_t)L.gdn_idx * c.nv * c.dv * c.dk, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyHostToDevice, stream_));
           CUDA_CHECK(cudaMemcpyAsync(L.conv_state, L.conv_hist, 3 * (size_t)c.conv_dim() * 4, cudaMemcpyDeviceToDevice, stream_));
         }
         CUDA_CHECK(cudaMemcpyAsync(hcarry_, hcarry_bk_, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
@@ -1552,6 +1559,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     CUDA_CHECK(cudaGetLastError());
     break;
     }  // attempt
+    if (cap_slot_ >= 0 && cap_pos_ == p0 + T && p0 + T < pos0 + n) ck_save_live(cap_slot_);
   }
   if (use_cpu) pool_->wait();
   { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) QE_FATAL("forward: %s", cudaGetErrorString(e)); }

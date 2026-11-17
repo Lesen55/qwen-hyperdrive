@@ -1062,19 +1062,33 @@ __global__ void k_gq_decode(const uint8_t* __restrict__ W, size_t rb, int K, int
   const uint8_t* blk = W + (size_t)row * rb + (size_t)kb * BB;
   WI w;
   D::dec(blk, gg, w);
+  constexpr bool FOLD = T == QT_IQ1_S;  // d*s*(w +- 1/8) = (d/8)*s*(8w +- 1): exact int8, no min term
+  if constexpr (FOLD) {
+    const int sg = w.m[0] > 0 ? 1 : -1;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      uint32_t v = 0;
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const int q = (int)(int8_t)((uint32_t)w.w[i] >> (8 * b));
+        v |= (uint32_t)(uint8_t)(int8_t)(8 * q + sg) << (8 * b);
+      }
+      w.w[i] = (int)v;
+    }
+  }
   int4* dst = (int4*)(w8 + (size_t)row * K + (size_t)j * 32);
   dst[0] = make_int4(w.w[0], w.w[1], w.w[2], w.w[3]);
   dst[1] = make_int4(w.w[4], w.w[5], w.w[6], w.w[7]);
   const size_t so = (size_t)row * (K / 16) + (size_t)j * 2;
   s8[so] = (int8_t)w.s[0];
   s8[so + 1] = (int8_t)(D::SC == 2 ? w.s[1] : w.s[0]);
-  if constexpr (D::MIN) {
+  if constexpr (D::MIN && !FOLD) {
     m8[so] = (int8_t)w.m[0];
     m8[so + 1] = (int8_t)(D::SC == 2 ? w.m[1] : w.m[0]);
   }
   if (gg == 0) {
-    fac[(size_t)row * (K / 256) + kb] = D::fac(blk);
-    if constexpr (D::MIN) mfac[(size_t)row * (K / 256) + kb] = D::mfac(blk);
+    fac[(size_t)row * (K / 256) + kb] = FOLD ? D::fac(blk) * 0.125f : D::fac(blk);
+    if constexpr (D::MIN && !FOLD) mfac[(size_t)row * (K / 256) + kb] = D::mfac(blk);
   }
 }
 
@@ -1327,9 +1341,9 @@ void gq_xsum(const int8_t* xq, int K, int T, int16_t* xs, cudaStream_t s) {
   k_gq_xsum<<<(int)((n + 255) / 256), 256, 0, s>>>(xq, K, T, xs);
 }
 
-bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K || type == QT_IQ1_S; }
+bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K; }  // IQ1_S: min folded
 bool gq_supported(uint32_t type) {
-  static const bool all = getenv("QE_GQ_MIN") != nullptr;  // MIN types: slower than cuBLAS so far
+  static const bool all = getenv("QE_GQ_MIN") && atoi(getenv("QE_GQ_MIN")) != 0;  // MIN types: +0.4% PPL so far
   return mmq_supported(type) && (all || !gq_needs_xsum(type));
 }
 
@@ -2823,15 +2837,35 @@ __global__ void __launch_bounds__(256)
     S[jj][0] = v.x; S[jj][1] = v.y; S[jj][2] = v.z; S[jj][3] = v.w;
   }
   const float qscale = rsqrtf((float)DK);
-  for (int t = 0; t < T; t++) {
-    const float* base = qkv + (size_t)t * qts;
-    const float4 q4 = *(const float4*)(base + hk * DK + 4 * lane);
-    const float4 k4 = *(const float4*)(base + nk * DK + hk * DK + 4 * lane);
-    const float* vv = base + 2 * nk * DK + h * DV;
-    const float decay = __expf(g[(size_t)t * nv + h]);
-    const float b = beta[(size_t)t * nv + h];
+  // the per-token inputs do not depend on the state: prefetch PF tokens ahead so the sequential
+  // chain only sees the FMAs and warp reductions, not the memory latency
+  constexpr int PF = 4;
+  float4 pq[PF], pk[PF], pv[PF];
+  float pg[PF], pb[PF];
+  auto fetch = [&](int t, int slot) {
+    if (t < T) {
+      const float* base = qkv + (size_t)t * qts;
+      pq[slot] = __ldg((const float4*)(base + hk * DK + 4 * lane));
+      pk[slot] = __ldg((const float4*)(base + nk * DK + hk * DK + 4 * lane));
+      pv[slot] = __ldg((const float4*)(base + 2 * nk * DK + h * DV + j0));
+      pg[slot] = __ldg(g + (size_t)t * nv + h);
+      pb[slot] = __ldg(beta + (size_t)t * nv + h);
+    }
+  };
+#pragma unroll
+  for (int i = 0; i < PF; i++) fetch(i, i);
+  for (int t0 = 0; t0 < T; t0 += PF) {
+#pragma unroll
+  for (int u = 0; u < PF; u++) {
+    const int t = t0 + u;
+    if (t >= T) break;
+    const float4 q4 = pq[u], k4 = pk[u], v4 = pv[u];
+    const float decay = __expf(pg[u]);
+    const float b = pb[u];
+    fetch(t + PF, u);
     const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
     const float qq[4] = {q4.x, q4.y, q4.z, q4.w};
+    const float vj[4] = {v4.x, v4.y, v4.z, v4.w};
 #pragma unroll
     for (int jj = 0; jj < 4; jj++) {
       float sk = 0.f;
@@ -2841,7 +2875,7 @@ __global__ void __launch_bounds__(256)
         sk += S[jj][r] * kk[r];
       }
       sk = warp_sum(sk);
-      const float delta = (vv[j0 + jj] - sk) * b;
+      const float delta = (vj[jj] - sk) * b;
       float o = 0.f;
 #pragma unroll
       for (int r = 0; r < 4; r++) {
@@ -2860,6 +2894,8 @@ __global__ void __launch_bounds__(256)
         *(float4*)(sn + (size_t)(j0 + jj) * DK + 4 * lane) = make_float4(S[jj][0], S[jj][1], S[jj][2], S[jj][3]);
     }
   }
+  }
+  if (!state_out) return;  // verify pass: state is read-only
   float* so = state_out + (size_t)h * DV * DK;
 #pragma unroll
   for (int jj = 0; jj < 4; jj++)
