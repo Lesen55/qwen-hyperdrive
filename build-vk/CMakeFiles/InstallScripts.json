@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/spring/llm-engine/build-vk/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
