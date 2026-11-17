@@ -37,6 +37,8 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 }'
 ```
 
+**WebUI**: ブラウザで `http://<host>:8080/` を開くと、チャットと、GPU/CPU の温度・電力・使用率・VRAM・PCIe 帯域、プリフィル/デコード速度・TTFT・MTP 採択率・KV/貸し出し層のリアルタイム表示（`GET /api/stats`）が使えます。
+
 エンドポイント: `POST /v1/chat/completions`（stream 対応、`<think>` 部分は `reasoning_content` に分離、
 `chat_template_kwargs.enable_thinking: false` で思考なし）、
 `POST /v1/completions`、`GET /v1/models`、`GET /health`。

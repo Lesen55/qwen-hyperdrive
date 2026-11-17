@@ -2,6 +2,8 @@
 //   POST /v1/chat/completions   (stream / non-stream; reasoning_content for <think> output)
 //   POST /v1/completions        (raw prompt)
 //   GET  /v1/models, /health
+//   GET  /            web UI (chat + live hardware / engine dashboard)
+//   GET  /api/stats   telemetry for the web UI
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -9,13 +11,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <deque>
 #include <cmath>
 #include <ctime>
 #include <mutex>
 #include <thread>
 
 #include "chat.h"
+#include "hwmon.h"
+#include "webui_html.h"
 #include "engine.h"
 #include "json.h"
 #include "tokenizer.h"
@@ -105,6 +111,130 @@ struct Server {
   std::string model_name;
   std::atomic<int> id_counter{0};
   int stop_ids[2] = {-1, -1};
+  std::string skip_ffn_str;
+
+  // ---- live engine telemetry (written by the generating thread, read by /api/stats) ----
+  struct ReqStat {
+    std::string id, finish;
+    double t_end = 0, ttft_ms = 0, prefill_s = 0, prefill_tps = 0, decode_s = 0, decode_tps = 0;
+    int prompt_n = 0, cache_n = 0, gen_n = 0, drafted = 0, accepted = 0, steps = 0;
+  };
+  struct Live {
+    std::mutex m;
+    std::string phase = "idle", id;
+    double t_start = 0;
+    ReqStat cur;
+    std::deque<ReqStat> hist;
+    Model::KvInfo kv;
+    int pos = 0;
+    uint64_t total_gen = 0, total_prompt = 0, requests = 0;
+  } live;
+  const double t_boot = qe_now();
+
+  void live_update(const char* phase, const ReqStat* r, bool kv) {
+    Model::KvInfo k;
+    if (kv) k = model->kv_info();
+    std::lock_guard<std::mutex> g(live.m);
+    if (phase) live.phase = phase;
+    if (r) live.cur = *r;
+    if (kv) { live.kv = k; live.pos = gen->pos(); }
+  }
+
+  std::string stats_json() {
+    const GpuStats gs = read_gpu_stats();
+    const CpuStats cs = read_cpu_stats();
+    Json j = Json::object();
+    Json g = Json::object();
+    g["ok"] = gs.ok;
+    g["name"] = gs.name;
+    g["temp_c"] = gs.temp_c;
+    g["fan_pct"] = gs.fan_pct;
+    g["power_w"] = gs.power_w;
+    g["power_limit_w"] = gs.power_limit_w;
+    g["util_gpu"] = gs.util_gpu;
+    g["util_mem"] = gs.util_mem;
+    g["mem_used_mb"] = gs.mem_used_mb;
+    g["mem_total_mb"] = gs.mem_total_mb;
+    g["clock_gpu_mhz"] = gs.clock_gpu_mhz;
+    g["clock_mem_mhz"] = gs.clock_mem_mhz;
+    g["clock_sm_max_mhz"] = gs.clock_sm_max_mhz;
+    g["pcie_rx_mbs"] = gs.pcie_rx_mbs;
+    g["pcie_tx_mbs"] = gs.pcie_tx_mbs;
+    g["pcie_gen"] = gs.pcie_gen;
+    g["pcie_width"] = gs.pcie_width;
+    j["gpu"] = g;
+    Json c = Json::object();
+    c["name"] = cs.name;
+    c["temp_c"] = cs.temp_c;
+    c["util_pct"] = cs.util_pct;
+    c["freq_avg_mhz"] = cs.freq_avg_mhz;
+    c["freq_max_mhz"] = cs.freq_max_mhz;
+    c["threads"] = cs.threads;
+    c["ram_used_mb"] = cs.ram_used_mb;
+    c["ram_total_mb"] = cs.ram_total_mb;
+    j["cpu"] = c;
+    auto rs = [](const ReqStat& r) {
+      Json o = Json::object();
+      o["id"] = r.id;
+      o["finish"] = r.finish;
+      o["t_end"] = r.t_end;
+      o["ttft_ms"] = r.ttft_ms;
+      o["prompt_n"] = r.prompt_n;
+      o["cache_n"] = r.cache_n;
+      o["prefill_s"] = r.prefill_s;
+      o["prefill_tps"] = r.prefill_tps;
+      o["gen_n"] = r.gen_n;
+      o["decode_s"] = r.decode_s;
+      o["decode_tps"] = r.decode_tps;
+      o["drafted"] = r.drafted;
+      o["accepted"] = r.accepted;
+      o["steps"] = r.steps;
+      return o;
+    };
+    Json e = Json::object();
+    {
+      std::lock_guard<std::mutex> lk(live.m);
+      e["phase"] = live.phase;
+      e["elapsed_s"] = live.phase == "idle" ? 0.0 : qe_now() - live.t_start;
+      e["current"] = rs(live.cur);
+      e["history"] = Json::array();
+      for (auto& h : live.hist) e["history"].push_back(rs(h));
+      e["pos"] = live.pos;
+      Json k = Json::object();
+      k["blocks_used"] = live.kv.blocks_used;
+      k["blocks_total"] = live.kv.blocks_total;
+      k["blocks_lendable"] = live.kv.blocks_lendable;
+      k["block_mb"] = live.kv.block_mb;
+      k["seqs"] = live.kv.seqs;
+      k["seqs_offloaded"] = live.kv.seqs_offloaded;
+      k["host_mb"] = live.kv.host_mb;
+      k["borrowed_kv"] = live.kv.borrowed_kv;
+      k["borrowed_ws"] = live.kv.borrowed_ws;
+      k["streamed"] = live.kv.streamed;
+      e["kv"] = k;
+      e["requests"] = (double)live.requests;
+      e["total_gen"] = (double)live.total_gen;
+      e["total_prompt"] = (double)live.total_prompt;
+    }
+    e["uptime_s"] = qe_now() - t_boot;
+    j["engine"] = e;
+    Json cf = Json::object();
+    cf["model"] = model_name;
+    cf["ctx"] = opt.ctx;
+    const char* kvn[] = {"f16", "q8", "q4", "q3"};
+    cf["kv_type"] = kvn[std::clamp((int)opt.kv_type, 0, 3)];
+    cf["mtp"] = opt.use_mtp;
+    cf["draft_max"] = model->options().draft_max;
+    cf["spec_relax"] = spec_relax;
+    cf["skip_ffn"] = skip_ffn_str;
+    cf["resident_mb"] = model->plan_res_mb_;
+    cf["streamed_mb"] = model->plan_stream_mb_;
+    cf["cpu_mb"] = model->plan_cpu_mb_;
+    cf["resident_ffn"] = model->plan_res_ffn_;
+    cf["n_layer"] = model->cfg().n_layer;
+    j["config"] = cf;
+    return j.dump();
+  }
 
   SamplingParams sampling_from(const Json& b) {
     SamplingParams sp;
@@ -122,8 +252,12 @@ struct Server {
     if (!read_request(fd, rq)) { close(fd); return; }
     if (rq.method == "OPTIONS") {
       send_all(fd, std::string("HTTP/1.1 204 No Content\r\n") + kCors + "Content-Length: 0\r\nConnection: close\r\n\r\n");
-    } else if (rq.method == "GET" && (rq.path == "/health" || rq.path == "/")) {
+    } else if (rq.method == "GET" && rq.path == "/health") {
       respond(fd, 200, "{\"status\":\"ok\"}");
+    } else if (rq.method == "GET" && (rq.path == "/" || rq.path == "/ui" || rq.path == "/index.html")) {
+      respond(fd, 200, kWebUi, "text/html; charset=utf-8");
+    } else if (rq.method == "GET" && rq.path.rfind("/api/stats", 0) == 0) {
+      respond(fd, 200, stats_json());
     } else if (rq.method == "GET" && rq.path == "/v1/models") {
       Json m = Json::object();
       m["id"] = model_name;
@@ -171,6 +305,7 @@ struct Server {
       for (auto& s : b["stop"].arr()) if (s.is_string()) stops.push_back(s.str());
     const SamplingParams sp = sampling_from(b);
 
+    const double t_req = qe_now();
     std::unique_lock<std::mutex> lk(mu);
     std::vector<int> ids = tok->encode(prompt, true);
     if ((int)ids.size() >= opt.ctx - 1) throw std::runtime_error("prompt too long: " + std::to_string(ids.size()) + " tokens");
@@ -211,7 +346,26 @@ struct Server {
     ThinkSplitter split(chat && thinking);
     const char* finish = "length";
     bool alive = true;
+    ReqStat rsn;
+    rsn.id = id;
+    rsn.prompt_n = (int)ids.size();
+    {
+      std::lock_guard<std::mutex> g(live.m);
+      live.t_start = t_req;
+      live.cur = rsn;
+    }
+    live_update("prefill", nullptr, false);
     out.push_back(gen->start(ids));
+    {
+      const auto& st0 = gen->stats();
+      rsn.cache_n = gen->reused();
+      rsn.prompt_n = (int)ids.size() - gen->reused();
+      rsn.prefill_s = st0.t_prefill;
+      rsn.prefill_tps = rsn.prompt_n / std::max(st0.t_prefill, 1e-9);
+      rsn.ttft_ms = (qe_now() - t_req) * 1e3;
+      rsn.gen_n = 1;
+    }
+    live_update("decode", &rsn, true);
     size_t emitted = 0;
     auto flush = [&](bool final) {
       std::string piece_r, piece_c;
@@ -248,6 +402,16 @@ struct Server {
       }
       if (stop || (int)out.size() >= max_tokens || !alive) break;
       gen->step(out);
+      {
+        const auto& sx = gen->stats();
+        rsn.gen_n = (int)out.size();
+        rsn.decode_s = sx.t_decode;
+        rsn.decode_tps = std::max(0, sx.generated - 1) / std::max(sx.t_decode, 1e-9);
+        rsn.drafted = sx.drafted;
+        rsn.accepted = sx.accepted;
+        rsn.steps = sx.steps;
+        live_update(nullptr, &rsn, (sx.steps & 15) == 0);
+      }
     }
     if (std::string(finish) != "stop") flush(true);
     const auto& st = gen->stats();
@@ -265,6 +429,23 @@ struct Server {
     timings["predicted_per_second"] = std::max(0, st.generated - 1) / std::max(st.t_decode, 1e-9);
     timings["draft_n"] = st.drafted;
     timings["draft_n_accepted"] = st.accepted;
+    rsn.gen_n = (int)out.size();
+    rsn.decode_s = st.t_decode;
+    rsn.decode_tps = std::max(0, st.generated - 1) / std::max(st.t_decode, 1e-9);
+    rsn.drafted = st.drafted;
+    rsn.accepted = st.accepted;
+    rsn.steps = st.steps;
+    rsn.finish = finish;
+    rsn.t_end = qe_now() - t_boot;
+    live_update("idle", &rsn, true);
+    {
+      std::lock_guard<std::mutex> g(live.m);
+      live.hist.push_back(rsn);
+      if (live.hist.size() > 100) live.hist.pop_front();
+      live.requests++;
+      live.total_gen += out.size();
+      live.total_prompt += rsn.prompt_n;
+    }
     QE_LOG("[server] %s: prompt %zu (+%d cached) in %.2fs, gen %zu tok %.2f tok/s, mtp %d/%d, finish=%s\n", id.c_str(),
            ids.size() - gen->reused(), gen->reused(), st.t_prefill, out.size(),
            std::max(0, st.generated - 1) / std::max(st.t_decode, 1e-9), st.accepted, st.drafted, finish);
@@ -347,6 +528,7 @@ int main(int argc, char** argv) {
     else if (a == "--cache-host-mb") srv.opt.cache_host_mb = std::stoi(next());
     else if (a == "--skip-ffn") {
       const std::string v = next();
+      srv.skip_ffn_str = v;
       for (size_t i = 0; i < v.size();) { srv.opt.skip_ffn.push_back(std::stoi(v.substr(i))); i = v.find(',', i); if (i == std::string::npos) break; i++; }
     }
     else if (a == "--no-elastic") srv.opt.elastic_kv = false;

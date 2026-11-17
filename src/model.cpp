@@ -480,6 +480,10 @@ void Model::plan_and_load() {
     for (int il = 0; il < c.n_layer; il++)
       if (layers_[il].ffn_streamed) streamed_layers_.push_back(il);
   }
+  plan_res_mb_ = res_bytes / (double)MiB;
+  plan_stream_mb_ = str_bytes / (double)MiB;
+  plan_cpu_mb_ = cpu_bytes / (double)MiB;
+  plan_res_ffn_ = n_res_ffn;
   QE_LOG("[plan] resident weights %.0f MiB (%d/%d FFN layers), host FFN: %.0f MiB streamed over PCIe + %.0f MiB computed on CPU (%s)\n",
          res_bytes / (double)MiB, n_res_ffn, c.n_layer, str_bytes / (double)MiB, cpu_bytes / (double)MiB,
          opt_.cpu_frac < 0 ? "auto-balanced per layer" : ("frac " + std::to_string(opt_.cpu_frac)).c_str());
@@ -1465,6 +1469,24 @@ void Model::prepare_context(int npos) {
     QE_DBG("[kv] context reserve %d: borrowed %d more FFN layers into the KV pool (%zu total, KV limit %d)\n", npos, added,
            borrowed_.size(), kv_limit());
   }
+}
+
+Model::KvInfo Model::kv_info() const {
+  KvInfo k;
+  k.blocks_total = n_kv_blocks_;
+  for (int b = 0; b < n_kv_blocks_; b++) k.blocks_used += blk_owner_[b] >= 0;
+  k.blocks_lendable = (int)(borrow_floor_ / std::max<size_t>(1, kv_block_bytes_));
+  k.seqs = (int)seqs_.size();
+  for (auto& [id, si] : seqs_) k.seqs_offloaded += si.blocks.empty() && !si.host.empty();
+  k.cur_positions = cur_seq_ >= 0 && seqs_.count(cur_seq_) ? (int)seqs_.at(cur_seq_).blocks.size() * qk::KV_BLOCK : 0;
+  k.borrowed_kv = (int)borrowed_.size();
+  k.borrowed_ws = (int)ws_borrowed_.size();
+  int streamed = 0;
+  for (int il = 0; il < cfg_.n_layer; il++) streamed += layers_[il].ffn_streamed && !layers_[il].borrowed_dev;
+  k.streamed = streamed;
+  k.host_mb = host_kv_bytes_ / (double)MiB;
+  k.block_mb = kv_block_bytes_ / (double)MiB;
+  return k;
 }
 
 int Model::borrowed_layers() const { return (int)(borrowed_.size() + ws_borrowed_.size()); }

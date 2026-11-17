@@ -20,7 +20,7 @@ let
         let
           rel = lib.removePrefix (toString ../. + "/") (toString name);
         in
-        rel == "CMakeLists.txt" || lib.hasPrefix "src" rel || lib.hasPrefix "tools" rel;
+        rel == "CMakeLists.txt" || lib.hasPrefix "src" rel || lib.hasPrefix "tools" rel || lib.hasPrefix "web" rel;
     };
 
     nativeBuildInputs = [

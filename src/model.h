@@ -142,6 +142,15 @@ class Model {
   // streamed FFN layers (evicted automatically if the context later grows).
   void prepare_context(int npos);
   int borrowed_layers() const;
+  struct KvInfo {
+    int blocks_used = 0, blocks_total = 0, blocks_lendable = 0, seqs = 0, seqs_offloaded = 0, cur_positions = 0;
+    int borrowed_kv = 0, borrowed_ws = 0, streamed = 0;
+    double host_mb = 0, block_mb = 0;
+  };
+  KvInfo kv_info() const;
+  double plan_res_mb_ = 0, plan_stream_mb_ = 0, plan_cpu_mb_ = 0;
+  int plan_res_ffn_ = 0;
+  const EngineOptions& options() const { return opt_; }
   int kv_limit() const;  // carried hidden := row of the last forward (for prefix continuation)
   bool has_mtp() const { return cfg_.n_mtp > 0 && opt_.use_mtp; }
   void reset();  // clear recurrent state (KV positions are simply overwritten)
