@@ -132,6 +132,16 @@ void gdn_prep(float* qkv, int qkv_tstride, const float* alpha_raw, const float* 
               int nk, int nv, int dk, int T, float eps, cudaStream_t s);
 // Recurrence over T tokens: state_out = f(state_in, tokens) (state_out may equal state_in).
 // State layout [nv][dv][dk] (row j = column j of S); out [T][nv*dv] (may be null).
+struct GdnBatch {  // per-layer pointers for the batched rollback
+  const float* qkv;
+  const float* g;
+  const float* beta;
+  float* state;
+  float* conv_state;
+  const float* conv_hist;
+};
+void gdn_rollback_batched(const GdnBatch* tab, int nl, int qts, int nk, int nv, int dk, int n_keep, int C, bool conv,
+                          cudaStream_t s);
 void gdn_recurrence(const float* qkv, int qkv_tstride, const float* g, const float* beta,
                     const float* state_in, float* state_out, float* out, int nk, int nv, int dk, int T,
                     cudaStream_t s, int snap_t = -1, float* snap = nullptr);

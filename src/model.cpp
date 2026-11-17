@@ -634,6 +634,16 @@ void Model::plan_and_load() {
   carve(ws_small_, qk::kMaxB, false);
   select_ws(true);
   hsafe_ = (float*)dalloc((size_t)qk::kMaxB * c.n_embd * 4);
+  if (has_mtp() && !getenv("QE_NO_BATCH_RB")) {
+    std::vector<qk::GdnBatch> tab;
+    for (auto& L : layers_)
+      if (L.sv_qkv) tab.push_back({L.sv_qkv, L.sv_g, L.sv_beta, L.ssm_state, L.conv_state, L.conv_hist});
+    if (!tab.empty()) {
+      gdn_tab_ = (qk::GdnBatch*)dalloc(tab.size() * sizeof(qk::GdnBatch));
+      CUDA_CHECK(cudaMemcpy(gdn_tab_, tab.data(), tab.size() * sizeof(qk::GdnBatch), cudaMemcpyHostToDevice));
+      n_gdn_tab_ = (int)tab.size();
+    }
+  }
   // fp16-accumulate cuBLAS prefill (for the types GQ does not take), guarded: the recurrent state is
   // backed up to pinned host memory before each chunk and restored if a GEMM overflowed
   gemm16_ = !(getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 0);
@@ -1772,12 +1782,16 @@ void Model::set_carry_row(int row) {
 void Model::rollback(int n_keep) {
   const Config& c = cfg_;
   QE_ASSERT(snap_valid_ && n_keep >= 1 && n_keep <= snap_T_);
-  for (auto& L : layers_) {
-    if (!L.sv_qkv) continue;
-    // advance the (untouched) pre-pass state by the accepted tokens, in place
-    qk::gdn_recurrence(L.sv_qkv, c.conv_dim(), L.sv_g, L.sv_beta, L.ssm_state, L.ssm_state, nullptr, c.nk, c.nv,
-                       c.dk, n_keep, stream_);
-    if (n_keep < snap_T_) qk::ssm_conv_rollback(L.conv_state, L.conv_hist, c.conv_dim(), n_keep, stream_);
+  if (gdn_tab_) {  // one launch for all layers (state traffic at full bandwidth instead of 96 small launches)
+    qk::gdn_rollback_batched(gdn_tab_, n_gdn_tab_, c.conv_dim(), c.nk, c.nv, c.dk, n_keep, c.conv_dim(), n_keep < snap_T_, stream_);
+  } else {
+    for (auto& L : layers_) {
+      if (!L.sv_qkv) continue;
+      // advance the (untouched) pre-pass state by the accepted tokens, in place
+      qk::gdn_recurrence(L.sv_qkv, c.conv_dim(), L.sv_g, L.sv_beta, L.ssm_state, L.ssm_state, nullptr, c.nk, c.nv,
+                         c.dk, n_keep, stream_);
+      if (n_keep < snap_T_) qk::ssm_conv_rollback(L.conv_state, L.conv_hist, c.conv_dim(), n_keep, stream_);
+    }
   }
   snap_valid_ = false;  // no sync: the next MTP step is enqueued behind it on the same stream
 }

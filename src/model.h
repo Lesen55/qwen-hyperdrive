@@ -234,6 +234,8 @@ class Model {
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
   bool legacy16_ = false;
   bool zc_ = true;
+  qk::GdnBatch* gdn_tab_ = nullptr;  // per-GDN-layer pointers for the batched rollback
+  int n_gdn_tab_ = 0;
   // online choice of the decode CPU mode (0 = GPU-only, 1 = hybrid)
   double dm_ema_[2] = {0, 0};
   int dm_cnt_[2] = {0, 0}, dm_pass_ = 0, dm_explore_ = 0, dm_last_ = -2;

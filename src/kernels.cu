@@ -3441,6 +3441,13 @@ void ssm_conv(const float* x, int xts, float* conv_state, const float* w, float*
               float* hist, cudaStream_t s, int snap_t, float* snap) {
   k_ssm_conv<<<cdiv(C, 256), 256, 0, s>>>(x, xts, conv_state, w, y, C, T, hist, snap ? snap_t : -1, snap);
 }
+__global__ void k_conv_rollback_b(const GdnBatch* __restrict__ tab, int C, int n_acc) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  const GdnBatch& b = tab[blockIdx.y];
+#pragma unroll
+  for (int i = 0; i < 3; i++) b.conv_state[(size_t)i * C + c] = b.conv_hist[(size_t)(n_acc + i) * C + c];
+}
 __global__ void k_conv_rollback(float* conv_state, const float* hist, int C, int n_acc) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
@@ -3489,8 +3496,13 @@ void gdn_prep(float* qkv, int qts, const float* alpha, const float* beta_raw, in
 __global__ void __launch_bounds__(256)
     k_gdn_rec(const float* __restrict__ qkv, int qts, const float* __restrict__ g,
               const float* __restrict__ beta, const float* state, float* state_out,
-              float* __restrict__ out, int nk, int nv, int T, int snap_t, float* snap) {
+              float* __restrict__ out, int nk, int nv, int T, int snap_t, float* snap,
+              const GdnBatch* __restrict__ tab = nullptr) {
   constexpr int DK = 128, DV = 128;
+  if (tab) {  // batched rollback: one launch for all GDN layers (blockIdx.z = layer)
+    const GdnBatch& b = tab[blockIdx.z];
+    qkv = b.qkv; g = b.g; beta = b.beta; state = b.state; state_out = b.state;
+  }
   const int h = blockIdx.x;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int j0 = blockIdx.y * 32 + warp * 4;
@@ -3566,6 +3578,13 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
   for (int jj = 0; jj < 4; jj++)
     *(float4*)(so + (size_t)(j0 + jj) * DK + 4 * lane) = make_float4(S[jj][0], S[jj][1], S[jj][2], S[jj][3]);
+}
+void gdn_rollback_batched(const GdnBatch* tab, int nl, int qts, int nk, int nv, int dk, int n_keep, int C, bool conv,
+                          cudaStream_t s) {
+  QE_ASSERT(dk == 128);
+  k_gdn_rec<<<dim3(nv, 128 / 32, nl), 256, 0, s>>>(nullptr, qts, nullptr, nullptr, nullptr, nullptr, nullptr, nk, nv, n_keep,
+                                                   -1, nullptr, tab);
+  if (conv) k_conv_rollback_b<<<dim3(cdiv(C, 256), nl), 256, 0, s>>>(tab, C, n_keep);
 }
 void gdn_recurrence(const float* qkv, int qts, const float* g, const float* beta, const float* state_in,
                     float* state_out, float* out, int nk, int nv, int dk, int T, cudaStream_t s, int snap_t,
