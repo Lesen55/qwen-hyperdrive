@@ -36,6 +36,7 @@
 
 - 手動チューニング版の llama.cpp は全 FFN を CPU に置く構成しか 128K で VRAM に収まらず、CUDA graphs も OOM で無効化が必要でした（`bench-results/BASELINE.md`）。
 - 精度（docs テキスト 4×512 トークンの perplexity、同条件同士）: f16 KV 同士で llama.cpp 5.120 / 本エンジン 5.170、4bit KV 同士で 5.148 / 5.129。
+- 起動ラッパー `llm-engine` は `~/.config/llm-engine/tunnel-token`（Cloudflare トンネルのトークン）があればサーバーと一緒に `cloudflared tunnel run` を起動・停止します（`LLM_ENGINE_TUNNEL=0` で無効）。
 - 起動ラッパー `llm-engine` は動作中だけ hazkey-server（IME、約 0.8 GB VRAM）を止め、終了時に戻します（`LLM_ENGINE_STOP_HAZKEY=0` で無効）。
 
 ## 使い方
