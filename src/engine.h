@@ -97,6 +97,12 @@ class Generator {
   int nstep_[9] = {};
   int want_drafts_ = 3;
   int mtp_max_ = 3;  // MTP chain length cap (drafting cost grows per token)
+  int mtp_long_ = 6, long_ctx_ = 16384;  // longer chains at long context (passes are PCIe-bound, drafts cheap)
+  int mtp_cap() const {
+    static const int lc = getenv("QE_MTP_LONG") ? atoi(getenv("QE_MTP_LONG")) : -1;
+    const int lng = lc >= 1 ? lc : mtp_long_;
+    return pos_ >= long_ctx_ ? std::max(mtp_max_, lng) : mtp_max_;
+  }
   // n-gram ("prompt lookup") drafts: continuation of the latest earlier occurrence of the last n tokens
   bool ngram_on_ = true, last_ng_ = false;
   double ng_run_ = 3.0;

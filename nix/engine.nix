@@ -7,6 +7,7 @@
   writeShellScriptBin,
   symlinkJoin,
   curl,
+  cloudflared,
 }:
 
 let
@@ -70,7 +71,21 @@ let
         sleep 1
       fi
     fi
+    # Cloudflare named tunnel: started with the server when a token is present (token file is local,
+    # never in the repository).  Disable with LLM_ENGINE_TUNNEL=0.
+    tunnel_pid=
+    token_file="''${LLM_ENGINE_TUNNEL_TOKEN_FILE:-$HOME/.config/llm-engine/tunnel-token}"
+    if [ "''${LLM_ENGINE_TUNNEL:-1}" = 1 ] && [ -s "$token_file" ]; then
+      TUNNEL_TOKEN="$(cat "$token_file")" ${cloudflared}/bin/cloudflared tunnel --no-autoupdate run &
+      tunnel_pid=$!
+      echo "llm-engine: started cloudflared tunnel (pid $tunnel_pid)" >&2
+    fi
     cleanup() {
+      if [ -n "$tunnel_pid" ]; then
+        kill -TERM "$tunnel_pid" 2>/dev/null
+        wait "$tunnel_pid" 2>/dev/null
+        tunnel_pid=
+      fi
       if [ "$restore" = 1 ]; then
         systemctl --user start hazkey-server.service && echo "llm-engine: restarted hazkey-server.service" >&2
         restore=0

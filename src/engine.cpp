@@ -271,7 +271,7 @@ void Generator::make_drafts(int first_argmax, bool have_logits) {
   }
   drafts_.push_back(d);
   hist.push_back(d);
-  const int maxd = std::min({m_.draft_max(), mtp_max_, want_drafts_});
+  const int maxd = std::min({m_.draft_max(), mtp_cap(), want_drafts_});
   for (int k = 1; k < maxd; k++) {
     float conf = 1.f;
     const int a = m_.mtp_chain(d, pos_ + k, g && draft_pmin_ > 0 ? &conf : nullptr, g ? nullptr : mtp_logits_.data());
@@ -329,7 +329,7 @@ void Generator::update_policy(int nd, int a, double dt) {
   }
   tstep_[nd] = nstep_[nd] ? (1 - 0.1) * tstep_[nd] + 0.1 * dt : dt;
   nstep_[nd]++;
-  const int maxd = std::min(m_.draft_max(), mtp_max_);
+  const int maxd = std::min(m_.draft_max(), mtp_cap());
   int best = maxd;
   double best_rate = 0;
   bool explore = false;
@@ -340,7 +340,9 @@ void Generator::update_policy(int nd, int a, double dt) {
     const double rate = e / tstep_[n];
     if (rate > best_rate) { best_rate = rate; best = n; }
   }
-  if (!explore && st_.steps % 32 == 0) best = 1 + (st_.steps / 32) % maxd;  // periodic re-measurement
+  // periodic re-measurement of the neighbouring lengths (cycling through all lengths costs too much
+  // once long chains are allowed)
+  if (!explore && st_.steps % 32 == 0) best = std::clamp(best + ((st_.steps / 32) % 2 ? 1 : -1), 1, maxd);
   want_drafts_ = best;
 }
 
@@ -472,7 +474,7 @@ void Generator::step(std::vector<int>& out) {
       drafts_.push_back(d0);
       std::vector<int> hist = history_;
       hist.push_back(d0);
-      const int maxd = std::min({m_.draft_max(), mtp_max_, want_drafts_});
+      const int maxd = std::min({m_.draft_max(), mtp_cap(), want_drafts_});
       int dd = d0;
       for (int k = 1; k < maxd; k++) {
         m_.mtp_chain(dd, pos_ + k, nullptr, mtp_logits_.data());
