@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
   std::string ids_path;
   int n_gen = 32, chunk = 512, reserve = 4096;
   float spec_relax = 1.f;
-  int mtp_max = 3;
+  int mtp_max = 5;
   bool ngram = true;
   float draft_pmin = 0.f;
   SamplingParams sp;

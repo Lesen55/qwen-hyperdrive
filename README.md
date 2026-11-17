@@ -92,7 +92,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 | `--vram-reserve` | 64 | 空けておく VRAM (MiB) |
 | `--skip-ffn i,j,..` | | 指定層の FFN を丸ごと省く（非可逆）。PCIe 転送量が 1 層あたり約 64 MB 減る。PPL 影響の小さい順は `bench-results/SKIP_FFN_PPL.txt`（例: 29,10 で PPL +0.3% / +8%、29,10,17,16 で +1.3% / +13%） |
 | `--cache-keep` / `--cache-host-mb` | 1 / 6144 | 非アクティブな会話の KV は VRAM から host RAM へ退避（VRAM は FFN 層の貸し出しに戻す）。戻ると書き戻してキャッシュ再開 |
-| `--no-ngram` / `--draft n` | | n-gram（プロンプト参照）ドラフトを無効化 / MTP 連鎖の最大長（既定 3）。n-gram は MTP の 1 トークン目と一致したときだけ最大 7 トークンまで延長 |
+| `--no-ngram` / `--draft n` | | n-gram（プロンプト参照）ドラフトを無効化 / MTP 連鎖の最大長（既定 5、16K 超では 7）。n-gram は MTP の 1 トークン目と一致したときだけ最大 7 トークンまで延長 |
 | `--spec-relax λ` | 1 | 投機デコードの採択を min(1, λp/q) に緩める（λ>1 で速くなる代わりに分布がわずかに MTP 側へ偏る。λ=2 で約 +10%。n-gram ドラフトには適用しない） |
 
 開発: `nix develop` → `cmake -S . -B build -G Ninja && ninja -C build`。

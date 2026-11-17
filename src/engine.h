@@ -96,8 +96,8 @@ class Generator {
   double tstep_[9] = {};
   int nstep_[9] = {};
   int want_drafts_ = 3;
-  int mtp_max_ = 3;  // MTP chain length cap (drafting cost grows per token)
-  int mtp_long_ = 6, long_ctx_ = 16384;  // longer chains at long context (passes are PCIe-bound, drafts cheap)
+  int mtp_max_ = 5;  // MTP chain length cap (the adaptive policy picks the length below it)
+  int mtp_long_ = 7, long_ctx_ = 16384;  // longer chains at long context (passes are PCIe-bound, drafts cheap)
   int mtp_cap() const {
     static const int lc = getenv("QE_MTP_LONG") ? atoi(getenv("QE_MTP_LONG")) : -1;
     const int lng = lc >= 1 ? lc : mtp_long_;

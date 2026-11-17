@@ -110,7 +110,7 @@ std::string take_utf8(std::string& buf) {
 struct Server {
   EngineOptions opt;
   bool ngram = true;
-  int mtp_max = 3;
+  int mtp_max = 5;
   float spec_relax = 1.f;  // >1: lenient speculative acceptance (faster, slightly biased sampling)
   std::unique_ptr<Model> model;
   std::unique_ptr<Tokenizer> tok;

@@ -14,7 +14,7 @@ gen() { $BIN gen -m "$MODEL" --ids "$1" -n $N -c $CTX "${@:2}" 2>/dev/null | hea
 # the decode CPU/GPU split is normally chosen online from timings (run-dependent numerics): pin each mode
 for mode in 0 1; do
 export QE_CPU_MODE=$mode QE_FIXED_DRAFT=1  # timing-independent: draft length and CPU split fixed
-for p in bench-results/data/story.ids bench-results/data/ja.ids bench-results/data/chunk3b.ids; do  # chunk3b: chunk3 minus its last 12 tokens (chunk3 ends on a near-tie)
+for p in bench-results/data/code.ids bench-results/data/ja.ids bench-results/data/chunk3b.ids; do  # story.ids has a near-tie at token 6  # chunk3b: chunk3 minus its last 12 tokens (chunk3 ends on a near-tie)
   ref=$(gen "$p" --no-mtp --no-elastic --ubatch 512)
   for cfg in "" "--draft 1" "--draft 2" "--ubatch 512" "--no-elastic" "--no-mtp" "--kv q8" ; do
     out=$(gen "$p" $cfg)
