@@ -65,6 +65,8 @@ void rope_neox(float* x, const int* pos, int hd, int nh, int hstride, int tokens
                int rot_dims, float theta_base, cudaStream_t s);
 
 void add_inplace(float* y, const float* x, int64_t n, cudaStream_t s);
+void copy_f32_zc(float* dst, const float* host_src, int64_t n, cudaStream_t s);  // host_src: pinned
+void iota_i32(int* dst, int p0, int n, cudaStream_t s);
 // h[t][i] = silu(g[t][i]) * u[t][i]
 void silu_mul(const float* g, const float* u, float* h, int64_t n, cudaStream_t s,
               __half* h16 = nullptr);
@@ -132,6 +134,8 @@ void gdn_gated_norm(float* o, const float* z, int z_tstride, const float* w, int
 // ---- sampling ------------------------------------------------------------------------------------
 // argmax over rows: idx[r] = argmax(logits[r*n ...])
 void argmax_rows(const float* logits, int n, int rows, int* idx, cudaStream_t s);
+size_t topk_work_bytes(int rows);
+void topk_rows(const float* logits, int V, int rows, int K, float* out_val, int* out_idx, void* work, cudaStream_t s);
 // argmax of one row and its softmax probability
 void argmax_prob(const float* logits, int n, int* idx, float* prob, cudaStream_t s);
 // top-k candidates per row (k <= 64): writes ids/vals sorted desc.

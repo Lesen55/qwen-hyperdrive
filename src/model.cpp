@@ -592,12 +592,20 @@ void Model::plan_and_load() {
   use_mmq_ = !(getenv("QE_MMQ") && atoi(getenv("QE_MMQ")) == 0);
   mmq_gs_ = getenv("QE_MMQ_GS") ? atoi(getenv("QE_MMQ_GS")) : 32;
   use_gq_ = !getenv("QE_GQ") || atoi(getenv("QE_GQ")) != 0;
+  zc_ = !getenv("QE_ZC") || atoi(getenv("QE_ZC")) != 0;
   mmq_max_T_ = getenv("QE_MMQ_MAXT") ? atoi(getenv("QE_MMQ_MAXT")) : 192;
   ovf_dev_ = (int*)dalloc(256);
   hcarry_bk_ = (float*)dalloc((size_t)c.n_embd * 4);
   attn_work_ = (float*)dalloc(attn_work_bytes_);
   t5_ = (float*)dalloc((size_t)kCpuMaxB * c.n_embd * 4);
   logits_dev_ = (float*)dalloc((size_t)qk::kMaxB * c.n_vocab * 4);
+  topk_i_d_ = (int*)dalloc((size_t)(qk::kMaxB + 1) * kTopKMax * 4);
+  topk_v_d_ = (float*)dalloc((size_t)(qk::kMaxB + 1) * kTopKMax * 4);
+  topk_work_ = dalloc(qk::topk_work_bytes(qk::kMaxB));
+  CUDA_CHECK(cudaHostAlloc((void**)&topk_i_h_, (size_t)(qk::kMaxB + 1) * kTopKMax * 4, cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc((void**)&topk_v_h_, (size_t)(qk::kMaxB + 1) * kTopKMax * 4, cudaHostAllocDefault));
+  host_allocs_.push_back(topk_i_h_);
+  host_allocs_.push_back(topk_v_h_);
   if (has_mtp() && opt_.mtp_vocab > 0) dv_dev_ = (int*)dalloc((size_t)kDraftVocabCap * 4);
   hcarry_ = (float*)dalloc((size_t)c.n_embd * 4);
   argmax_dev_ = (int*)dalloc(64 * 4);
@@ -856,7 +864,8 @@ void Model::embed(const int* tokens, int n, float* dst) {
     dequant_row_ref(tok_embd_.type, tok_embd_.host + (size_t)tokens[t] * tok_embd_.row_bytes, c.n_embd,
                     embd_host_ + (size_t)t * c.n_embd);
   }
-  CUDA_CHECK(cudaMemcpyAsync(dst, embd_host_, (size_t)n * c.n_embd * 4, cudaMemcpyHostToDevice, stream_));
+  if (n <= qk::kMaxB && zc_) qk::copy_f32_zc(dst, embd_host_, (int64_t)n * c.n_embd, stream_);
+  else CUDA_CHECK(cudaMemcpyAsync(dst, embd_host_, (size_t)n * c.n_embd * 4, cudaMemcpyHostToDevice, stream_));
 }
 
 void Model::layer_attn(int il, int T, int pos0) {
@@ -1004,7 +1013,8 @@ void Model::layer_ffn(int il, int T) {
     if (cuStreamWaitValue32((CUstream)s, dflags_ + 64, L.job_seq, CU_STREAM_WAIT_VALUE_GEQ) != CUDA_SUCCESS)
       QE_FATAL("cuStreamWaitValue32 failed");
     if (gprof_on_) CUDA_CHECK(cudaEventRecord(gp_ev(), s));
-    CUDA_CHECK(cudaMemcpyAsync(t5_, hy_out_, (size_t)T * c.n_embd * 4, cudaMemcpyHostToDevice, s));
+    if (zc_) qk::copy_f32_zc(t5_, hy_out_, (int64_t)T * c.n_embd, s);
+    else CUDA_CHECK(cudaMemcpyAsync(t5_, hy_out_, (size_t)T * c.n_embd * 4, cudaMemcpyHostToDevice, s));
     qk::add_inplace(t4_, t5_, (int64_t)T * c.n_embd, s);
   }
   qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
@@ -1098,9 +1108,7 @@ void Model::mtp_block(const float* hrows, const int* tokens, int T, int pos0) {
   const int il = c.n_layer;
   Layer& L = layers_[il];
   cudaStream_t s = stream_;
-  std::vector<int> pos(T);
-  for (int i = 0; i < T; i++) pos[i] = pos0 + i;
-  CUDA_CHECK(cudaMemcpyAsync(pos_dev_, pos.data(), T * 4, cudaMemcpyHostToDevice, s));
+  qk::iota_i32(pos_dev_, pos0, T, s);
   float* e = t1_;
   float* hn = t2_;
   embed(tokens, T, e);
@@ -1145,6 +1153,16 @@ void Model::draft_vocab_add(const int* ids, int n) {
   }
 }
 
+void Model::topk_to_host(const float* dev_logits, int V, int rows, int host_row0) {
+  qk::topk_rows(dev_logits, V, rows, topk_K_, topk_v_d_ + (size_t)host_row0 * kTopKMax, topk_i_d_ + (size_t)host_row0 * kTopKMax,
+                topk_work_, stream_);
+  // rows are packed with stride K on the device; host rows use stride kTopKMax
+  CUDA_CHECK(cudaMemcpy2DAsync(topk_v_h_ + (size_t)host_row0 * kTopKMax, kTopKMax * 4, topk_v_d_ + (size_t)host_row0 * kTopKMax,
+                               topk_K_ * 4, topk_K_ * 4, rows, cudaMemcpyDeviceToHost, stream_));
+  CUDA_CHECK(cudaMemcpy2DAsync(topk_i_h_ + (size_t)host_row0 * kTopKMax, kTopKMax * 4, topk_i_d_ + (size_t)host_row0 * kTopKMax,
+                               topk_K_ * 4, topk_K_ * 4, rows, cudaMemcpyDeviceToHost, stream_));
+}
+
 int Model::mtp_finish(int n, float* conf, float* logits_host) {
   const Config& c = cfg_;
   // keep the normed MTP output of the last row for chaining
@@ -1164,7 +1182,10 @@ int Model::mtp_finish(int n, float* conf, float* logits_host) {
     linear(nullptr, output_, hrow, 1, logits_dev_, c.n_vocab, false, stream_);
   }
   int d = 0;
-  if (logits_host) {
+  const bool tk = logits_host && topk_K_ > 0;
+  if (tk) {
+    topk_to_host(logits_dev_, nl, 1, qk::kMaxB);
+  } else if (logits_host) {
     if (sub) {
       dv_tmp_.resize(nl);
       CUDA_CHECK(cudaMemcpyAsync(dv_tmp_.data(), logits_dev_, (size_t)nl * 4, cudaMemcpyDeviceToHost, stream_));
@@ -1180,8 +1201,12 @@ int Model::mtp_finish(int n, float* conf, float* logits_host) {
   }
   CUDA_CHECK(cudaMemcpyAsync(&d, argmax_dev_, 4, cudaMemcpyDeviceToHost, stream_));
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+  if (sub && tk) {
+    int* ti = topk_i_h_ + (size_t)qk::kMaxB * kTopKMax;
+    for (int i = 0; i < topk_K_; i++) ti[i] = dv_host_[ti[i]];
+  }
   if (sub) {
-    if (logits_host) {
+    if (logits_host && !tk) {
       std::fill(logits_host, logits_host + c.n_vocab, -INFINITY);
       for (int i = 0; i < nl; i++) logits_host[dv_host_[i]] = dv_tmp_[i];
     }
@@ -1429,9 +1454,11 @@ void Model::trim_cache() {
   }
 }
 
-void Model::prepare_context(int npos) {
+void Model::prepare_context(int npos, bool small_prefill) {
   npos = std::min(npos, opt_.ctx);
-  ws_reclaim();  // re-plan lending after the KV borrow (decode will lend the workspace again)
+  // re-plan lending after the KV borrow (decode will lend the workspace again); a prefill of only a
+  // few tokens runs with the small workspace, so the lent layers (855 MiB of copies) can stay
+  if (!small_prefill) ws_reclaim();
   if (opt_.elastic_kv) trim_cache();
   ensure_kv(npos);
   if (!opt_.elastic_kv) return;
@@ -1573,8 +1600,7 @@ void Model::rollback(int n_keep) {
                        c.dk, n_keep, stream_);
     if (n_keep < snap_T_) qk::ssm_conv_rollback(L.conv_state, L.conv_hist, c.conv_dim(), n_keep, stream_);
   }
-  snap_valid_ = false;
-  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  snap_valid_ = false;  // no sync: the next MTP step is enqueued behind it on the same stream
 }
 
 void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax,
@@ -1631,9 +1657,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     snap_t_ = -1;
     for (int attempt = 0; attempt < 2; attempt++) {
     use16_ = g16 && attempt == 0;
-    std::vector<int> pos(T);
-    for (int i = 0; i < T; i++) pos[i] = p0 + i;
-    CUDA_CHECK(cudaMemcpyAsync(pos_dev_, pos.data(), T * 4, cudaMemcpyHostToDevice, stream_));
+    qk::iota_i32(pos_dev_, p0, T, stream_);
     embed(tokens + b0, T, x_);
     auto dsum = [&](const char* nm, int il, const float* p, size_t cnt) { qe_debug_dump(nm, il, p, T, (int)(cnt / T), stream_); };
     for (int il = 0; il < c.n_layer; il++) {
@@ -1660,7 +1684,9 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
           qe_debug_dump("result_norm", -1, hid_ + (size_t)(r + nb - 1 - b0) * c.n_embd, 1, c.n_embd, stream_);
           qe_debug_dump("result_output", -1, logits_dev_ + (size_t)(nb - 1) * c.n_vocab, 1, c.n_vocab, stream_);
         }
-        if (logits)
+        if (logits && topk_K_ > 0)
+          topk_to_host(logits_dev_, c.n_vocab, nb, r - first_logit_row);
+        else if (logits)
           CUDA_CHECK(cudaMemcpyAsync(logits + (size_t)(r - first_logit_row) * c.n_vocab, logits_dev_,
                                      (size_t)nb * c.n_vocab * 4, cudaMemcpyDeviceToHost, stream_));
         if (argmax) {

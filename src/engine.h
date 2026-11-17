@@ -24,6 +24,9 @@ class Sampler {
   explicit Sampler(const SamplingParams& p);
   bool greedy() const { return p_.temperature <= 0.f; }
   void dist(const float* logits, int n_vocab, const std::vector<int>& history, Dist& out);
+  // from GPU top-K candidates (sorted descending); exact when K >= top_k and no presence penalty
+  void dist_sparse(const int* idx, const float* val, int K, Dist& out);
+  const SamplingParams& params() const { return p_; }
   int draw(const Dist& d);
   double uniform() { return std::uniform_real_distribution<double>(0.0, 1.0)(rng_); }
   int sample(const float* logits, int n_vocab, const std::vector<int>& history);
@@ -31,6 +34,7 @@ class Sampler {
  private:
   SamplingParams p_;
   std::mt19937_64 rng_;
+  void finish(std::vector<std::pair<float, int>>& c, Dist& out);
 };
 
 struct GenStats {
@@ -100,6 +104,9 @@ class Generator {
   std::unordered_map<uint64_t, int> ng_idx_;
   size_t ng_built_ = 0;
   bool ngram_lookup(std::vector<int>& out);
+  bool topk_ = false;
+  void row_dist(int row, Dist& p);                                // verify row (logits_ or GPU top-K)
+  void mtp_dist(const std::vector<int>& hist, Dist& q);          // last MTP head output
   void update_policy(int nd, int a, double dt);
   int reused_ = 0;
   GenStats st_;

@@ -41,6 +41,18 @@ void Sampler::dist(const float* l, int n, const std::vector<int>& history, Dist&
   c.reserve(k);
   while (!heap.empty()) { c.push_back(heap.top()); heap.pop(); }
   std::reverse(c.begin(), c.end());  // descending
+  finish(c, out);
+}
+
+void Sampler::dist_sparse(const int* idx, const float* val, int K, Dist& out) {
+  out.clear();
+  const int k = std::min(K, p_.top_k > 0 ? p_.top_k : K);
+  std::vector<std::pair<float, int>> c(k);
+  for (int i = 0; i < k; i++) c[i] = {val[i], idx[i]};
+  finish(c, out);
+}
+
+void Sampler::finish(std::vector<std::pair<float, int>>& c, Dist& out) {
   std::vector<double> pr(c.size());
   const double mx = c[0].first;
   double sum = 0;
@@ -204,9 +216,14 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
   }
   reused_ = p0;
   m_.draft_vocab_add(prompt.data(), n);
-  m_.prepare_context(n + reserve);
+  m_.prepare_context(n + reserve, n - p0 <= qk::kMaxB);
   const double t_prep = qe_now();
   history_ = prompt;
+  {
+    const SamplingParams& sp = sampler_.params();
+    topk_ = !sampler_.greedy() && sp.top_k > 0 && sp.top_k <= 128 && sp.presence_penalty == 0.f && !getenv("QE_NO_GPU_TOPK");
+    m_.set_topk(topk_ ? sp.top_k : 0);
+  }
   ng_idx_.clear();
   ng_built_ = 0;
   last_ng_ = false;
@@ -214,7 +231,8 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
   if (sampler_.greedy()) m_.forward(prompt.data() + p0, m, p0, nullptr, 1, &last_, false, mtp_);
   else {
     m_.forward(prompt.data() + p0, m, p0, logits_.data(), 1, nullptr, false, mtp_);
-    last_ = sampler_.sample(logits_.data(), m_.cfg().n_vocab, history_);
+    if (topk_) { Dist p; row_dist(0, p); last_ = sampler_.draw(p); }
+    else last_ = sampler_.sample(logits_.data(), m_.cfg().n_vocab, history_);
   }
   committed().assign(prompt.begin(), prompt.end());
   QE_DBG("[gen] start: lookup/restore %.1f ms, prepare_context %.1f ms, prefill %.1f ms (%d tokens)\n",
@@ -248,7 +266,7 @@ void Generator::make_drafts(int first_argmax, bool have_logits) {
   } else {
     (void)have_logits;
     dq_.emplace_back();
-    sampler_.dist(mtp_logits_.data(), V, hist, dq_.back());
+    mtp_dist(hist, dq_.back());
     d = sampler_.draw(dq_.back());
   }
   drafts_.push_back(d);
@@ -262,12 +280,21 @@ void Generator::make_drafts(int first_argmax, bool have_logits) {
       d = a;
     } else {
       dq_.emplace_back();
-      sampler_.dist(mtp_logits_.data(), V, hist, dq_.back());
+      mtp_dist(hist, dq_.back());
       d = sampler_.draw(dq_.back());
     }
     drafts_.push_back(d);
     hist.push_back(d);
   }
+}
+
+void Generator::row_dist(int row, Dist& p) {
+  if (topk_) sampler_.dist_sparse(m_.topk_idx(row), m_.topk_val(row), m_.topk_K(), p);
+  else sampler_.dist(logits_.data() + (size_t)row * m_.cfg().n_vocab, m_.cfg().n_vocab, history_, p);
+}
+void Generator::mtp_dist(const std::vector<int>& hist, Dist& q) {
+  if (topk_) sampler_.dist_sparse(m_.topk_idx(qk::kMaxB), m_.topk_val(qk::kMaxB), m_.topk_K(), q);
+  else sampler_.dist(mtp_logits_.data(), m_.cfg().n_vocab, hist, q);
 }
 
 bool Generator::ngram_lookup(std::vector<int>& out) {
@@ -327,7 +354,8 @@ void Generator::step(std::vector<int>& out) {
     if (g) m_.forward(&last_, 1, pos_, nullptr, 1, &next);
     else {
       m_.forward(&last_, 1, pos_, logits_.data(), 1);
-      next = sampler_.sample(logits_.data(), V, history_);
+      if (topk_) { Dist p; row_dist(0, p); next = sampler_.draw(p); }
+      else next = sampler_.sample(logits_.data(), V, history_);
     }
     committed().push_back(last_);
     pos_ += 1;
@@ -363,7 +391,7 @@ void Generator::step(std::vector<int>& out) {
     // on rejection sample from norm(max(0, p_i - q_i)); if all accepted sample from p_nd.
     Dist p;
     for (;;) {
-      sampler_.dist(logits_.data() + (size_t)a * V, V, history_, p);
+      row_dist(a, p);
       for (auto& [id, pv] : p) m_.draft_vocab_add(&id, 1);  // learn the vocabulary in use
       if (a == nd) { s = sampler_.draw(p); break; }
       const int x = drafts_[a];
@@ -428,7 +456,7 @@ void Generator::step(std::vector<int>& out) {
     int d0 = d;
     if (!g) {
       dq_.emplace_back();
-      sampler_.dist(mtp_logits_.data(), m_.cfg().n_vocab, history_, dq_.back());
+      mtp_dist(history_, dq_.back());
       d0 = sampler_.draw(dq_.back());
     }
     if (d0 == ng[0]) {
@@ -449,7 +477,7 @@ void Generator::step(std::vector<int>& out) {
       for (int k = 1; k < maxd; k++) {
         m_.mtp_chain(dd, pos_ + k, nullptr, mtp_logits_.data());
         dq_.emplace_back();
-        sampler_.dist(mtp_logits_.data(), m_.cfg().n_vocab, hist, dq_.back());
+        mtp_dist(hist, dq_.back());
         dd = sampler_.draw(dq_.back());
         drafts_.push_back(dd);
         hist.push_back(dd);

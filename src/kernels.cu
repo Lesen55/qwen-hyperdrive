@@ -1405,6 +1405,75 @@ void gq_gemm(uint32_t type, const void* buf, int K, int N, const int8_t* xq, con
 #undef L
 }
 
+// Row-wise top-K (K <= 128) of logits for sampling: 64 chunks per row are bitonic-sorted in shared
+// memory keeping their top 128, then one block merges the 64x128 candidates.  Only K (id, logit)
+// pairs per row go back to the host instead of the whole 248K-entry row.
+constexpr int TK_CH = 64, TK_KEEP = 128, TK_S1 = 4096, TK_S2 = TK_CH * TK_KEEP;
+template <int N>
+static __device__ __forceinline__ void bitonic_desc(float* v, int* ix) {
+  for (int k = 2; k <= N; k <<= 1)
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        const int p = i ^ j;
+        if (p > i) {
+          const bool desc = (i & k) == 0;
+          if (desc ? v[i] < v[p] : v[i] > v[p]) {
+            const float tv = v[i]; v[i] = v[p]; v[p] = tv;
+            const int ti = ix[i]; ix[i] = ix[p]; ix[p] = ti;
+          }
+        }
+      }
+      __syncthreads();
+    }
+}
+__global__ void __launch_bounds__(1024) k_topk1(const float* __restrict__ l, int V, float* wv, int* wi) {
+  __shared__ float v[TK_S1];
+  __shared__ int ix[TK_S1];
+  const int row = blockIdx.y, ch = blockIdx.x;
+  const int len = (V + TK_CH - 1) / TK_CH, b = ch * len;
+  for (int i = threadIdx.x; i < TK_S1; i += blockDim.x) {
+    const int g = b + i;
+    const bool ok = i < len && g < V;
+    v[i] = ok ? l[(size_t)row * V + g] : -INFINITY;
+    ix[i] = ok ? g : 0;
+  }
+  __syncthreads();
+  bitonic_desc<TK_S1>(v, ix);
+  for (int i = threadIdx.x; i < TK_KEEP; i += blockDim.x) {
+    wv[((size_t)row * TK_CH + ch) * TK_KEEP + i] = v[i];
+    wi[((size_t)row * TK_CH + ch) * TK_KEEP + i] = ix[i];
+  }
+}
+__global__ void __launch_bounds__(1024) k_topk2(const float* wv, const int* wi, int K, float* ov, int* oi) {
+  extern __shared__ float sm2[];
+  float* v = sm2;
+  int* ix = (int*)(sm2 + TK_S2);
+  const int row = blockIdx.x;
+  for (int i = threadIdx.x; i < TK_S2; i += blockDim.x) {
+    v[i] = wv[(size_t)row * TK_S2 + i];
+    ix[i] = wi[(size_t)row * TK_S2 + i];
+  }
+  __syncthreads();
+  bitonic_desc<TK_S2>(v, ix);
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    ov[(size_t)row * K + i] = v[i];
+    oi[(size_t)row * K + i] = ix[i];
+  }
+}
+size_t topk_work_bytes(int rows) { return (size_t)rows * TK_S2 * 8; }
+void topk_rows(const float* logits, int V, int rows, int K, float* out_val, int* out_idx, void* work, cudaStream_t s) {
+  QE_ASSERT(K >= 1 && K <= TK_KEEP && (V + TK_CH - 1) / TK_CH <= TK_S1);
+  float* wv = (float*)work;
+  int* wi = (int*)(wv + (size_t)rows * TK_S2);
+  k_topk1<<<dim3(TK_CH, rows), 1024, 0, s>>>(logits, V, wv, wi);
+  static bool init = false;
+  if (!init) {
+    CUDA_CHECK(cudaFuncSetAttribute(k_topk2, cudaFuncAttributeMaxDynamicSharedMemorySize, TK_S2 * 8));
+    init = true;
+  }
+  k_topk2<<<rows, 1024, TK_S2 * 8, s>>>(wv, wi, K, out_val, out_idx);
+}
+
 bool mmq_supported(uint32_t type) {
   switch (type) {
     case QT_Q2_K: case QT_Q4_K: case QT_Q6_K: case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S:
@@ -1602,6 +1671,24 @@ void rope_neox(float* x, const int* pos, int hd, int nh, int hstride, int tokens
                int rot, float base, cudaStream_t s) {
   const int64_t n = (int64_t)tokens * nh * (rot / 2);
   k_rope_neox<<<cdiv(n, 256), 256, 0, s>>>(x, pos, hd, nh, hstride, tokens, tstride, rot, log2f(base));
+}
+
+// small host->device transfers done by the SMs (zero-copy reads of pinned host memory) so they do
+// not queue behind the big weight-streaming copies on the copy engine
+__global__ void k_copy_f32(float* __restrict__ y, const float* __restrict__ x, int64_t n) {
+  const int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (i + 3 < n) *(float4*)(y + i) = *(const float4*)(x + i);
+  else for (int64_t j = i; j < n; j++) y[j] = x[j];
+}
+void copy_f32_zc(float* dst, const float* host_src, int64_t n, cudaStream_t s) {
+  if (n > 0) k_copy_f32<<<(int)((n / 4 + 255) / 256 + 1), 256, 0, s>>>(dst, host_src, n);
+}
+__global__ void k_iota(int* p, int p0, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) p[i] = p0 + i;
+}
+void iota_i32(int* dst, int p0, int n, cudaStream_t s) {
+  if (n > 0) k_iota<<<(n + 255) / 256, 256, 0, s>>>(dst, p0, n);
 }
 
 __global__ void k_add(float* y, const float* x, int64_t n) {
@@ -2228,18 +2315,29 @@ __global__ void __launch_bounds__(128, 1)
     float s[4][4];
 #pragma unroll
     for (int nt = 0; nt < 4; nt++) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+    // f16 accumulation over 64-dim chunks (2x tensor rate on GeForce Ampere), chunks summed in f32
 #pragma unroll
-    for (int kk = 0; kk < FA_D / 16; kk++) {
-      uint32_t a[4];
-      const __half* qa = Qs + (warp * 16 + g) * FA_QLD + kk * 16 + tq * 2;
-      a[0] = *(const uint32_t*)(qa);
-      a[1] = *(const uint32_t*)(qa + 8 * FA_QLD);
-      a[2] = *(const uint32_t*)(qa + 8);
-      a[3] = *(const uint32_t*)(qa + 8 * FA_QLD + 8);
+    for (int kc = 0; kc < FA_D / 64; kc++) {
+      uint32_t hc[4][2] = {};
+#pragma unroll
+      for (int k4 = 0; k4 < 4; k4++) {
+        const int kk = kc * 4 + k4;
+        uint32_t a[4];
+        const __half* qa = Qs + (warp * 16 + g) * FA_QLD + kk * 16 + tq * 2;
+        a[0] = *(const uint32_t*)(qa);
+        a[1] = *(const uint32_t*)(qa + 8 * FA_QLD);
+        a[2] = *(const uint32_t*)(qa + 8);
+        a[3] = *(const uint32_t*)(qa + 8 * FA_QLD + 8);
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+          const __half* kb = Ks + (nt * 8 + g) * FA_QLD + kk * 16 + tq * 2;
+          mma16816_h(hc[nt], a, *(const uint32_t*)kb, *(const uint32_t*)(kb + 8));
+        }
+      }
 #pragma unroll
       for (int nt = 0; nt < 4; nt++) {
-        const __half* kb = Ks + (nt * 8 + g) * FA_QLD + kk * 16 + tq * 2;
-        mma16816(s[nt], a, *(const uint32_t*)kb, *(const uint32_t*)(kb + 8));
+        const float2 lo = __half22float2(*(__half2*)&hc[nt][0]), hi = __half22float2(*(__half2*)&hc[nt][1]);
+        s[nt][0] += lo.x; s[nt][1] += lo.y; s[nt][2] += hi.x; s[nt][3] += hi.y;
       }
     }
     // causal mask + online softmax (log2 domain; q was pre-scaled by log2e)

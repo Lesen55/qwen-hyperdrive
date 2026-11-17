@@ -139,10 +139,16 @@ class Model {
   // capture a checkpoint of the state after the first `pos` tokens during the next forward()
   void set_capture(int pos, int slot) { cap_pos_ = pos; cap_slot_ = slot; }
   void draft_vocab_add(const int* ids, int n);
+  // sampling top-K on the GPU: when K > 0, forward()/mtp_* with a host logits pointer only fill
+  // topk rows (forward: row j of the requested logits; MTP: row kMaxB) instead of the full rows
+  void set_topk(int K) { topk_K_ = K; }
+  int topk_K() const { return topk_K_; }
+  const int* topk_idx(int row) const { return topk_i_h_ + (size_t)row * kTopKMax; }
+  const float* topk_val(int row) const { return topk_v_h_ + (size_t)row * kTopKMax; }
   void trim_cache();  // drop old cached sequences beyond the budget and compact the KV pool  // tokens the MTP draft head may propose
   // Elastic KV: reserve KV space for `npos` positions and lend the rest of the KV pool to
   // streamed FFN layers (evicted automatically if the context later grows).
-  void prepare_context(int npos);
+  void prepare_context(int npos, bool small_prefill = false);
   int borrowed_layers() const;
   struct KvInfo {
     int blocks_used = 0, blocks_total = 0, blocks_lendable = 0, seqs = 0, seqs_offloaded = 0, cur_positions = 0;
@@ -224,6 +230,15 @@ class Model {
   int n_gdn_ = 0;
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
   bool legacy16_ = false;
+  bool zc_ = true;  // small H2D transfers by kernels (zero-copy) instead of the copy engine
+  static constexpr int kTopKMax = 128;
+  int topk_K_ = 0;
+  int* topk_i_h_ = nullptr;
+  float* topk_v_h_ = nullptr;
+  int* topk_i_d_ = nullptr;
+  float* topk_v_d_ = nullptr;
+  void* topk_work_ = nullptr;
+  void topk_to_host(const float* dev_logits, int V, int rows, int host_row0);
   static constexpr int kDraftVocabCap = 131072;
   std::vector<int> dv_host_;
   std::vector<uint8_t> dv_has_;
