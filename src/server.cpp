@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     else if (a == "--no-elastic") srv.opt.elastic_kv = false;
     else if (a == "-h" || a == "--help") {
       printf("usage: qwen35-server -m model.gguf [--host 127.0.0.1] [--port 8080] [-c 131072] [--kv q4|q8|f16]\n"
-             "                    [--cpu-frac auto|0..1] [--pcie-gbps 20] [-t 6] [--ubatch 512] [--vram-reserve 300] [--no-mtp] [--no-elastic]\n");
+             "                    [--cpu-frac auto|0..1] [--pcie-gbps 20] [-t 6] [--ubatch 512] [--vram-reserve 64] [--no-mtp] [--no-elastic]\n");
       return 0;
     } else QE_FATAL("unknown argument %s (see --help)", a.c_str());
   }

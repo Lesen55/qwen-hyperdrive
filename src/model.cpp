@@ -833,7 +833,9 @@ void Model::layer_attn(int il, int T, int pos0) {
   if (T <= attT && !getenv("QE_FORCE_FA")) {
     qk::attn_decode(opt_.kv_type, L.kcache, L.vcache, qg, 2 * c.hd, qw, o, c.n_head, c.n_kv, c.hd, pos0, T,
                     scale, attn_work_, attn_work_bytes_, kvmap(), s);
-  } else if (getenv("QE_SLOW_ATTN")) {  // reference path for testing the prefill kernel
+  } else if (T <= qk::kMaxB || getenv("QE_SLOW_ATTN")) {
+    // small batches run with the prefill workspace lent to FFN weights (fa_work_ lives there), so they
+    // use the decode kernel in chunks of attT; also the reference path for testing the prefill kernel
     for (int t0 = 0; t0 < T; t0 += attT) {
       const int nt = std::min(attT, T - t0);
       qk::attn_decode(opt_.kv_type, L.kcache, L.vcache, qg + (size_t)t0 * qw, 2 * c.hd, qw,
@@ -1166,11 +1168,13 @@ int Model::alloc_block() {
     for (int b = 0; b < floor_blk; b++)
       if (blk_owner_[b] < 0) {
         blk_owner_[b] = cur_seq_;
+        QE_DBG("[kv] seq %d <- block %d (floor %d)\n", cur_seq_, b, floor_blk);
         return b;
       }
     if (!borrowed_.empty()) {
       CUDA_CHECK(cudaStreamSynchronize(stream_));
       Layer& L = layers_[borrowed_.back()];
+      QE_DBG("[kv] evict borrowed layer %d\n", borrowed_.back());
       borrowed_.pop_back();
       L.borrowed_dev = nullptr;
       borrow_floor_ = borrowed_.empty() ? kv_pool_bytes_ : (size_t)(layers_[borrowed_.back()].borrowed_dev - kv_pool_);
@@ -1488,8 +1492,10 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     if (mtp_prefill && has_mtp()) {
       // pairs (h_{p-1}, x_p) for p in [p0, p0+T): rows [carry, hid_0 .. hid_{T-2}]
       float* hm = t3_;  // [T][n_embd] (t3_ is free between layers)
-      int skip = 0;
-      if (p0 == 0) skip = 1;  // no h_{-1}
+      // position 0 has no h_{-1}: run it with a zero hidden row so its MTP KV slot is written (the MTP
+      // attention reads every position; an unwritten slot holds stale bytes, e.g. lent FFN weights)
+      const int skip = 0;
+      if (p0 == 0) CUDA_CHECK(cudaMemsetAsync(hm, 0, (size_t)c.n_embd * 4, stream_));
       else CUDA_CHECK(cudaMemcpyAsync(hm, hcarry_, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
       if (T > 1) CUDA_CHECK(cudaMemcpyAsync(hm + (size_t)c.n_embd, hid_, (size_t)(T - 1) * c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
       CUDA_CHECK(cudaMemcpyAsync(hcarry_, hid_ + (size_t)(T - 1) * c.n_embd, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
@@ -1521,6 +1527,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     }  // attempt
   }
   if (use_cpu) pool_->wait();
+  { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) QE_FATAL("forward: %s", cudaGetErrorString(e)); }
   snap_t_ = -1;
   cap_slot_ = -1;
   if (gprof_on_) {

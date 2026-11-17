@@ -10,12 +10,12 @@
 
 | | llama.cpp (`--fit on`) | llama.cpp（手動チューニング） | **llm-engine** |
 |---|---|---|---|
-| デコード（短い文脈, temp 1.0, MTP） | 2.07 tok/s | 2.46 tok/s | **29〜32 tok/s** |
-| デコード（短い文脈, greedy, MTP） | – | 2.66 tok/s | **30〜37 tok/s** |
+| デコード（短い文脈, temp 1.0, MTP） | 2.07 tok/s | 2.46 tok/s | **33〜40 tok/s** |
+| デコード（短い文脈, greedy, MTP） | – | 2.66 tok/s | **34〜41 tok/s** |
 | デコード（127K トークン文脈） | – | – | **11〜12.6 tok/s** |
 | プリフィル 16K トークン | – | – | ~1000 tok/s |
 | プリフィル 127K トークン | – | 7 tok/s 程度 | **211 秒（602 tok/s）** |
-| 短いプロンプト（20 トークン）の処理 | – | – | 約 0.13 秒 |
+| 短いプロンプト（20 トークン）の処理 | – | – | 約 0.13 秒（キャッシュ再開 0.12 秒） |
 | 127K パスキー検索 | – | – | 正解（71432） |
 
 - 手動チューニング版の llama.cpp は全 FFN を CPU に置く構成しか 128K で VRAM に収まらず、CUDA graphs も OOM で無効化が必要でした（`bench-results/BASELINE.md`）。
@@ -58,7 +58,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 | `--ubatch` | 2048 | プリフィルのチャンク長 |
 | `--no-elastic` | | 未使用 KV プールの FFN 層への貸し出しを無効化 |
 | `-v` | | 詳細ログ（キャッシュ・貸し出し・TTFT 内訳） |
-| `--vram-reserve` | 300 | 空けておく VRAM (MiB) |
+| `--vram-reserve` | 64 | 空けておく VRAM (MiB) |
 
 開発: `nix develop` → `cmake -S . -B build -G Ninja && ninja -C build`。
 CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）。

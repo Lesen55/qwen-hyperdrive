@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
     else if (a == "--no-elastic") opt.elastic_kv = false;
     else if (a == "--reserve") reserve = std::stoi(next());
     else if (a == "--draft") opt.draft_max = std::stoi(next());
+    else if (a == "--vram-reserve") opt.vram_reserve_mb = std::stoul(next());
     else if (a == "--mtp-vocab") opt.mtp_vocab = std::stoi(next());
     else if (a == "--draft-pmin") draft_pmin = std::stof(next());
     else if (a == "-v") opt.verbose = true;
@@ -95,6 +96,17 @@ int main(int argc, char** argv) {
     Generator gen(model, sp, opt.use_mtp);
     gen.set_draft_pmin(draft_pmin);
     std::vector<int> out;
+    // QE_REPEAT=n: run the same generation n times through the prompt cache (server-like reuse)
+    for (int rep = getenv("QE_REPEAT") ? atoi(getenv("QE_REPEAT")) : 1; rep > 1; rep--) {
+      out.clear();
+      out.push_back(gen.start(ids, getenv("QE_REPEAT_NOREUSE") == nullptr, reserve));
+      while ((int)out.size() < n_gen) gen.step(out);
+      const auto& st = gen.stats();
+      fprintf(stderr, "[repeat] gen %d tok, mtp accepted %d/%d:", st.generated - 1, st.accepted, st.drafted);
+      for (int i = 0; i < 40 && i < (int)out.size(); i++) fprintf(stderr, " %d", out[i]);
+      fprintf(stderr, "\n");
+    }
+    out.clear();
     out.push_back(gen.start(ids, true, reserve));
     while ((int)out.size() < n_gen) gen.step(out);
     out.resize(n_gen);

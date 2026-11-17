@@ -20,7 +20,7 @@ struct EngineOptions {
   int ctx = 131072;            // max context length (tokens)
   int kv_type = qk::KV_Q4;     // KV cache format
   int ubatch = 2048;           // prefill chunk (its workspace is lent to FFN weights while decoding)
-  size_t vram_reserve_mb = 300;  // keep this much VRAM free
+  size_t vram_reserve_mb = 64;   // keep this much VRAM free (all big buffers are allocated up front)
   int64_t vram_budget_mb = -1;  // override total VRAM the engine may use (-1 = auto)
   int cpu_threads = 6;
   bool use_mtp = true;
