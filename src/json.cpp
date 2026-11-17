@@ -134,6 +134,20 @@ std::string json_escape(const std::string& s) {
   return o;
 }
 
+std::string Json::dump_py() const {
+  if (t_ == Array) {
+    std::string o = "[";
+    for (size_t k = 0; k < a_.size(); k++) o += (k ? ", " : "") + a_[k].dump_py();
+    return o + "]";
+  }
+  if (t_ == Object) {
+    std::string o = "{";
+    for (size_t k = 0; k < o_.size(); k++) o += (k ? ", \"" : "\"") + json_escape(o_[k].first) + "\": " + o_[k].second.dump_py();
+    return o + "}";
+  }
+  return dump();
+}
+
 std::string Json::dump() const {
   switch (t_) {
     case Null: return "null";

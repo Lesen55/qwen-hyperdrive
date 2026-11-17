@@ -54,10 +54,10 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 }'
 ```
 
-**WebUI**: ブラウザで `http://<host>:8080/` を開くと、チャット（🌐 Web検索: DuckDuckGo / Brave の結果と上位ページ本文を添えて回答、出典リンク付き）と、GPU/CPU の温度・電力・使用率・VRAM・PCIe 帯域、プリフィル/デコード速度（最速・平均つき）・TTFT・MTP 採択率・KV/貸し出し層のリアルタイム表示（`GET /api/stats`）が使えます。
+**WebUI**: ブラウザで `http://<host>:8080/` を開くと、チャット（🌐 Web検索: `web_search` ツールとしてモデルに渡し、必要なときだけモデルが呼び出す。DuckDuckGo / Brave の結果と上位ページ本文、出典リンク付き）と、GPU/CPU の温度・電力・使用率・VRAM・PCIe 帯域、プリフィル/デコード速度（最速・平均つき）・TTFT・MTP 採択率・KV/貸し出し層のリアルタイム表示（`GET /api/stats`）が使えます。
 
 エンドポイント: `POST /v1/chat/completions`（stream 対応、`<think>` 部分は `reasoning_content` に分離、
-`chat_template_kwargs.enable_thinking: false` で思考なし）、
+`chat_template_kwargs.enable_thinking: false` で思考なし、`tools` によるツール呼び出し（Qwen の XML 形式を解析して OpenAI 形式の `tool_calls` で返す。ストリーミング対応）、`reasoning_effort: xhigh|medium|low`）、
 `POST /v1/completions`、`GET /v1/models`、`GET /health`。
 サンプリング既定値はモデル推奨（temperature 1.0, top_k 20, top_p 0.95）。`temperature: 0` で greedy。
 **プロンプトキャッシュ**: KV はページ化（2048 位置ブロック）され、会話ごとに保持されます。DeltaNet の再帰状態は巻き戻せないため、
@@ -130,6 +130,6 @@ CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）
 ## 制限
 
 - 対象アーキテクチャは `qwen35`（Qwen3.5/3.8 系 dense ハイブリッド）のみ。ハード定数（sm_86, AVX2）に最適化。
-- 同時処理は 1 リクエスト（サーバーは直列化）。ツール呼び出しの構造化パースは未実装（テキストとして返ります）。
+- 同時処理は 1 リクエスト（サーバーは直列化、WebUI は順番待ち中に「待機中」と表示）。
 - プリフィルは FlashAttention と GEMM 律速。128K の一括投入には約 3.5 分かかります（会話の続きはプロンプトキャッシュで差分のみ）。
 - VRAM の空きが減るとストリーミング量が増えて遅くなります（例: hazkey-server が約 0.8 GB 使用中。止めればその分常駐が増えます）。

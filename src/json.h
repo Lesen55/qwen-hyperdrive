@@ -71,6 +71,7 @@ class Json {
 
   static Json parse(const std::string& s);
   std::string dump() const;
+  std::string dump_py() const;  // Python json.dumps style separators (", " and ": "), as Jinja tojson
 
  private:
   Type t_ = Null;

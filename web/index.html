@@ -70,6 +70,8 @@ details.think div { white-space: pre-wrap; font-size: 13px; }
 .sources span { color: var(--dim); }
 a.cite { color: var(--acc2); text-decoration: none; font-size: .85em; vertical-align: super; }
 .msg.user .web { font-size: 11px; color: var(--acc2); margin-top: 4px; }
+.msg .web { font-size: 12px; color: var(--acc2); }
+.msg.tool { margin-top: -8px; }
 .rec { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 8px; }
 .rec div { background: var(--panel2); border-radius: 8px; padding: 6px 8px; }
 .rec .v { font: 700 15px var(--mono); }
@@ -255,6 +257,19 @@ $("newBtn").onclick = newConv;
 $("delBtn").onclick = () => { convs = convs.filter((c) => c.id !== curId); curId = convs.length ? convs[convs.length - 1].id : null; if (!curId) newConv(); else { save(); renderAll(); } };
 
 function msgEl(m) {
+  if (m.role === "tool") {
+    const d = document.createElement("div");
+    d.className = "msg tool";
+    d.innerHTML = `<div class="web">🔎 ${esc(m.name || "tool")}${m.query ? "「" + esc(m.query) + "」" : ""} → ${m.sources ? m.sources.length + " 件" : "完了"}</div>`;
+    if (m.sources && m.sources.length) {
+      const det = document.createElement("details");
+      det.className = "think";
+      det.innerHTML = "<summary>検索結果</summary>";
+      det.appendChild(sourcesEl(m.sources, m.content));
+      d.appendChild(det);
+    }
+    return d;
+  }
   const d = document.createElement("div");
   d.className = "msg " + m.role;
   d.innerHTML = `<div class="who">${m.role === "user" ? "you" : "assistant"}</div>`;
@@ -270,7 +285,8 @@ function msgEl(m) {
   if (m.role === "user") b.textContent = m.content; else b.innerHTML = cite(md(m.content || ""), m.sources);
   d.appendChild(b);
   if (m.role === "user" && m.query) { const w = document.createElement("div"); w.className = "web"; w.textContent = "🌐 検索: " + m.query; d.appendChild(w); }
-  if (m.sources && m.sources.length) d.appendChild(sourcesEl(m.sources));
+  if (m.role === "assistant" && m.tool_calls && !m.content) b.innerHTML = `<div class="web">ツールを呼び出し: ${m.tool_calls.map((t) => esc(t.function.name)).join(", ")}</div>`;
+  if (m.sources && m.sources.length && !m.tool_calls) d.appendChild(sourcesEl(m.sources));
   if (m.stat) { const s = document.createElement("div"); s.className = "mstat"; s.textContent = m.stat; d.appendChild(s); }
   return d;
 }
@@ -281,10 +297,11 @@ function cite(html, src) {
     return s ? `<a class="cite" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.title)}">[${n}]</a>` : all;
   });
 }
-function sourcesEl(src) {
+function sourcesEl(src, toolText) {
   const d = document.createElement("div");
   d.className = "sources";
-  d.innerHTML = "<span>出典</span>" + src.map((s, i) => `<div>[${i + 1}] <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title || s.url)}</a> <span>${esc(new URL(s.url).hostname)}</span></div>`).join("");
+  const off = toolText ? Math.max(0, (+((toolText.match(/\n\[(\d+)\] /) || [])[1] || 1)) - 1) : 0;
+  d.innerHTML = "<span>出典</span>" + src.map((s, i) => `<div>[${i + 1 + off}] <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title || s.url)}</a> <span>${esc(new URL(s.url).hostname)}</span></div>`).join("");
   return d;
 }
 function renderMsgs() {
@@ -307,42 +324,41 @@ input.addEventListener("input", () => { input.style.height = "auto"; input.style
 input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
 $("sendBtn").onclick = () => (ctrl ? ctrl.abort() : send());
 
-async function send() {
-  const text = input.value.trim();
-  if (!text || ctrl) return;
-  const c = cur();
-  c.msgs.push({ role: "user", content: text });
-  if (c.title === "新しいチャット") c.title = text.slice(0, 40);
-  input.value = ""; input.style.height = "auto";
-  const um = c.msgs[c.msgs.length - 1];
-  const am = { role: "assistant", content: "", reasoning: "" };
-  c.msgs.push(am);
-  save(); renderAll();
+const WEB_TOOL = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "Search the web (DuckDuckGo/Brave) and return the top results with page text. Use it only when the question needs current, external or verifiable facts that you do not reliably know; otherwise answer directly.",
+    parameters: { type: "object", properties: { query: { type: "string", description: "search query (keywords)" } }, required: ["query"] },
+  },
+};
+
+function apiMessages(msgs) {
+  return msgs.map((m) => {
+    if (m.role === "tool") return { role: "tool", tool_call_id: m.tool_call_id, content: m.content };
+    const o = { role: m.role, content: m.role === "user" ? (m.send || m.content) : (m.content || "") };
+    if (m.role === "assistant" && m.reasoning) o.reasoning_content = m.reasoning;
+    if (m.role === "assistant" && m.tool_calls) o.tool_calls = m.tool_calls;
+    return o;
+  });
+}
+
+// one streamed model turn into the placeholder `am` (last element of c.msgs)
+async function streamTurn(c, am, withTools, signal) {
   const box = $("msgs");
   const el = box.lastChild;
   const body = el.querySelector(".body");
-  let thinkDiv = null;
-  ctrl = new AbortController();
-  $("sendBtn").textContent = "停止";
-  if (settings.web) {
-    try {
-      await webContext(c, um, am, body, ctrl.signal);
-      save();
-      const ub = el.previousSibling;
-      if (ub && um.query) { const w = document.createElement("div"); w.className = "web"; w.textContent = "🌐 検索: " + um.query; ub.appendChild(w); }
-    } catch (e) {
-      if (e.name === "AbortError") { ctrl = null; $("sendBtn").textContent = "送信"; am.stat = "（停止しました）"; save(); renderMsgs(); return; }
-      body.innerHTML = `<div class="status">検索に失敗しました（${esc(e.message)}）。検索なしで回答します…</div>`;
-    }
-  }
+  let thinkDiv = null, pending = false;
   const t0 = performance.now();
-  let tFirst = 0;
+  let tFirst = 0, gotHeaders = false;
+  const status = (t) => { if (!am.content) body.innerHTML = `<div class="status">${esc(t)}</div>`; };
+  const waitTimer = setTimeout(() => { if (!gotHeaders) status("待機中…（他のリクエストを処理中）"); }, 700);
   const req = {
-    messages: c.msgs.slice(0, -1).map((m) => ({ role: m.role, content: m.send || m.content })),
+    messages: apiMessages(c.msgs.slice(0, -1)),
     stream: true, temperature: settings.temp, max_tokens: settings.maxTok,
     chat_template_kwargs: { enable_thinking: settings.think },
   };
-  let pending = false;
+  if (withTools) req.tools = [WEB_TOOL];
   const paint = () => {
     pending = false;
     if (am.reasoning) {
@@ -355,17 +371,20 @@ async function send() {
       }
       thinkDiv.querySelector("div").textContent = am.reasoning;
       thinkDiv.querySelector("summary").textContent = am.content ? `思考 (${am.reasoning.length} 文字)` : "思考中…";
-      if (am.content && thinkDiv.open && !thinkDiv.dataset.user) thinkDiv.open = false;
+      if (am.content && thinkDiv.open) thinkDiv.open = false;
     }
-    body.innerHTML = am.content ? cite(md(am.content), am.sources) : body.innerHTML;
-    const near = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    if (am.content) body.innerHTML = cite(md(am.content), am.sources);
+    const near = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
     if (near) box.scrollTop = box.scrollHeight;
   };
+  let timings = null, finish = null, toolCalls = [];
   try {
-    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req), signal: ctrl.signal });
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req), signal });
+    gotHeaders = true;
     if (!r.ok) throw new Error(await r.text());
+    status("プロンプトを処理中…");
     const rd = r.body.getReader(), dec = new TextDecoder();
-    let buf = "", timings = null, finish = null;
+    let buf = "";
     for (;;) {
       const { value, done } = await rd.read();
       if (done) break;
@@ -377,66 +396,95 @@ async function send() {
         const data = line.slice(5).trim();
         if (data === "[DONE]") continue;
         const j = JSON.parse(data);
-        const d = j.choices && j.choices[0] && j.choices[0].delta;
+        const ch = j.choices && j.choices[0];
+        const d = ch && ch.delta;
         if (d) {
           if (!tFirst && (d.content || d.reasoning_content)) tFirst = performance.now();
           if (d.reasoning_content) am.reasoning += d.reasoning_content;
           if (d.content) am.content += d.content;
+          if (d.tool_calls) for (const tc of d.tool_calls) toolCalls.push({ id: tc.id, type: "function", function: tc.function });
         }
         if (j.timings) timings = j.timings;
-        if (j.choices && j.choices[0] && j.choices[0].finish_reason) finish = j.choices[0].finish_reason;
+        if (ch && ch.finish_reason) finish = ch.finish_reason;
         if (!pending) { pending = true; requestAnimationFrame(paint); }
       }
     }
-    if (finish === "length") am.cut = true;
-    if (timings) {
-      am.stat = (am.cut ? "⚠ 最大トークン数で打ち切り · " : "") + `prefill ${timings.prompt_n} tok` + (timings.cache_n ? ` (+${timings.cache_n} cached)` : "") +
-        ` ${fmt(timings.prompt_per_second, 0)} tok/s · TTFT ${fmt((tFirst || performance.now()) - t0, 0)} ms · ` +
-        `decode ${timings.predicted_n} tok ${fmt(timings.predicted_per_second, 1)} tok/s · MTP ${timings.draft_n_accepted}/${timings.draft_n}`;
+  } finally {
+    clearTimeout(waitTimer);
+  }
+  if (finish === "length") am.cut = true;
+  if (timings) {
+    am.stat = (am.cut ? "⚠ 最大トークン数で打ち切り · " : "") + `prefill ${timings.prompt_n} tok` + (timings.cache_n ? ` (+${timings.cache_n} cached)` : "") +
+      ` ${fmt(timings.prompt_per_second, 0)} tok/s · TTFT ${fmt((tFirst || performance.now()) - t0, 0)} ms · ` +
+      `decode ${timings.predicted_n} tok ${fmt(timings.predicted_per_second, 1)} tok/s · MTP ${timings.draft_n_accepted}/${timings.draft_n}`;
+  }
+  if (!am.reasoning) delete am.reasoning;
+  return { finish, toolCalls };
+}
+
+async function runTool(tc, turnSources, signal, statusEl) {
+  let args = {};
+  try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+  const tm = { role: "tool", tool_call_id: tc.id, name: tc.function.name, content: "" };
+  if (tc.function.name !== "web_search") { tm.content = `unknown tool: ${tc.function.name}`; return tm; }
+  tm.query = String(args.query || "").slice(0, 200);
+  statusEl.innerHTML = `<div class="status">🔎 検索中: ${esc(tm.query)}</div>`;
+  try {
+    const r = await fetch(`/api/search?q=${encodeURIComponent(tm.query)}&n=6&fetch=3&chars=2500`, { signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const res = ((await r.json()).results || []).filter((x) => x.url);
+    const base = turnSources.length;
+    tm.sources = res.map((x) => ({ title: x.title, url: x.url }));
+    turnSources.push(...tm.sources);
+    const today = new Date().toISOString().slice(0, 10);
+    tm.content = res.length
+      ? `検索日 ${today}、検索語「${tm.query}」の結果:\n\n` + res.map((x, i) => `[${base + i + 1}] ${x.title}\nURL: ${x.url}\n抜粋: ${x.snippet}` + (x.text ? `\n本文: ${x.text}` : "")).join("\n\n") +
+        `\n\n回答で根拠にした結果は [番号] で示してください。`
+      : `検索語「${tm.query}」の結果はありませんでした。`;
+  } catch (e) {
+    if (e.name === "AbortError") throw e;
+    tm.content = `検索に失敗しました: ${e.message}`;
+  }
+  return tm;
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || ctrl) return;
+  const c = cur();
+  c.msgs.push({ role: "user", content: text });
+  if (c.title === "新しいチャット") c.title = text.slice(0, 40);
+  input.value = ""; input.style.height = "auto";
+  ctrl = new AbortController();
+  $("sendBtn").textContent = "停止";
+  const turnSources = [];
+  let am = null;
+  try {
+    for (let round = 0; round < 4; round++) {
+      am = { role: "assistant", content: "", reasoning: "" };
+      if (turnSources.length) am.sources = turnSources.slice();
+      c.msgs.push(am);
+      save(); renderAll();
+      const { finish, toolCalls } = await streamTurn(c, am, settings.web && round < 3, ctrl.signal);
+      if (finish !== "tool_calls" || !toolCalls.length) break;
+      am.tool_calls = toolCalls;
+      save(); renderMsgs();
+      const statusEl = document.createElement("div");
+      statusEl.className = "msg";
+      $("msgs").appendChild(statusEl);
+      for (const tc of toolCalls) c.msgs.push(await runTool(tc, turnSources, ctrl.signal, statusEl));
     }
   } catch (e) {
-    if (e.name !== "AbortError") am.content += (am.content ? "\n\n" : "") + "⚠️ " + e.message;
-    else am.stat = "（停止しました）";
+    if (am) {
+      if (e.name !== "AbortError") am.content += (am.content ? "\n\n" : "") + "⚠️ " + e.message;
+      else am.stat = "（停止しました）";
+    }
   } finally {
     ctrl = null;
     $("sendBtn").textContent = "送信";
-    if (!am.reasoning) delete am.reasoning;
-    if (!am.sources) delete am.sources;
+    if (am && !am.sources) delete am.sources;
     save(); renderMsgs();
   }
-}
-
-// ---------------- web search ----------------
-async function webContext(c, um, am, body, signal) {
-  const status = (t) => { body.innerHTML = `<div class="status">${esc(t)}</div>`; };
-  let query = um.content.replace(/\s+/g, " ").slice(0, 200);
-  const prev = c.msgs.slice(0, -2);
-  if (prev.length) {  // follow-up: let the model turn the conversation into a search query
-    status("検索クエリを作成中…");
-    const hist = prev.slice(-6).map((m) => (m.role === "user" ? "ユーザー: " : "アシスタント: ") + m.content.slice(0, 600)).join("\n");
-    const r = await fetch("/v1/chat/completions", {
-      method: "POST", headers: { "Content-Type": "application/json" }, signal,
-      body: JSON.stringify({
-        messages: [{ role: "user", content: `次の会話の最後の質問に答えるためのWeb検索クエリを1つ、検索語だけで1行に出力してください。\n\n${hist}\nユーザー: ${um.content.slice(0, 800)}` }],
-        max_tokens: 40, temperature: 0, chat_template_kwargs: { enable_thinking: false },
-      }),
-    });
-    const j = await r.json();
-    const q = (j.choices && j.choices[0].message.content || "").split("\n")[0].replace(/^["'「]|["'」]$/g, "").trim();
-    if (q) query = q.slice(0, 200);
-  }
-  status(`🔎 検索中: ${query}`);
-  const r = await fetch(`/api/search?q=${encodeURIComponent(query)}&n=6&fetch=3&chars=2500`, { signal });
-  if (!r.ok) throw new Error("HTTP " + r.status);
-  const j = await r.json();
-  const res = (j.results || []).filter((x) => x.url);
-  um.query = query;
-  if (!res.length) { status("検索結果がありませんでした。知識だけで回答します…"); return; }
-  am.sources = res.map((x) => ({ title: x.title, url: x.url }));
-  const today = new Date().toISOString().slice(0, 10);
-  const ctx = res.map((x, i) => `[${i + 1}] ${x.title}\nURL: ${x.url}\n抜粋: ${x.snippet}` + (x.text ? `\n本文: ${x.text}` : "")).join("\n\n");
-  um.send = `【Web検索結果】(${today} 検索語: ${query})\n${ctx}\n\n上の検索結果を参考に回答してください。根拠にした結果は [1] のように番号で示してください。検索結果が質問と関係ない場合はそう述べ、自分の知識で答えてください。\n\n質問: ${um.content}`;
-  status(`${res.length} 件の結果を読み込みました。回答を生成中…`);
 }
 
 // ---------------- dashboard ----------------

@@ -338,12 +338,16 @@ struct Server {
   void completion(int fd, const Json& b, bool chat) {
     std::string prompt;
     bool thinking = true;
+    Json tools;
     if (chat) {
       if (!b["messages"].is_array()) throw std::runtime_error("messages must be an array");
       const Json& kw = b["chat_template_kwargs"];
       thinking = kw.get_bool("enable_thinking", b.get_bool("enable_thinking", true));
       if (b.get_str("reasoning_effort") == "none") thinking = false;
-      prompt = chat_render(chat_messages_from_json(b["messages"]), true, thinking);
+      if (b["tools"].is_array() && !b["tools"].arr().empty() && b.get_str("tool_choice") != "none") tools = b["tools"];
+      std::string effort = b.get_str("reasoning_effort");
+      if (effort != "xhigh" && effort != "medium" && effort != "low") effort = "";
+      prompt = chat_render(chat_messages_from_json(b["messages"]), true, thinking, tools, effort);
     } else {
       prompt = b.get_str("prompt");
     }
@@ -375,8 +379,11 @@ struct Server {
     const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++id_counter);
     const int64_t created = (int64_t)time(nullptr);
     if (stream)
-      send_all(fd, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n") + kCors +
-                       "Connection: close\r\n\r\n");
+      // no-transform / X-Accel-Buffering: keep proxies (Cloudflare, nginx) from compressing or buffering the
+      // stream; the padded comment pushes past proxies that hold back the first few KB
+      send_all(fd, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
+                               "Cache-Control: no-cache, no-transform\r\nX-Accel-Buffering: no\r\n") + kCors +
+                       "Connection: close\r\n\r\n:" + std::string(2048, ' ') + "\n\n");
     auto chunk = [&](const std::string& reasoning, const std::string& content, const char* finish) -> bool {
       Json c = Json::object();
       c["id"] = id;
@@ -403,6 +410,8 @@ struct Server {
     std::vector<int> out;
     std::string bytes_pending, reasoning, content, text_all;
     ThinkSplitter split(chat && thinking);
+    ToolCallFilter tfilter;
+    const bool use_tools = chat && tools.is_array();
     const char* finish = "length";
     bool alive = true;
     ReqStat rsn;
@@ -436,6 +445,7 @@ struct Server {
       text_all += text;
       if (chat) split.feed(text, piece_r, piece_c, final);
       else piece_c = text;
+      if (use_tools) piece_c = tfilter.feed(piece_c, final);
       reasoning += piece_r;
       content += piece_c;
       if (stream && alive && (!piece_r.empty() || !piece_c.empty())) alive = chunk(piece_r, piece_c, nullptr);
@@ -542,10 +552,37 @@ struct Server {
         if (rsn.decode_tps > live.best_decode.decode_tps) live.best_decode = rsn;
       }
     }
+    Json tool_calls;
+    if (use_tools && tfilter.in_call) {
+      tool_calls = parse_tool_calls(tfilter.raw, tools, id_counter.load());
+      if (!tool_calls.arr().empty()) finish = "tool_calls";
+    }
     QE_LOG("[server] %s: prompt %zu (+%d cached) in %.2fs, gen %zu tok %.2f tok/s, mtp %d/%d, finish=%s\n", id.c_str(),
            ids.size() - reused0, reused0, st.t_prefill, out.size(),
            std::max(0, st.generated - 1) / std::max(st.t_decode, 1e-9), st.accepted, st.drafted, finish);
     if (stream) {
+      if (alive && tool_calls.is_array() && !tool_calls.arr().empty()) {
+        Json c = Json::object();
+        c["id"] = id;
+        c["object"] = "chat.completion.chunk";
+        c["created"] = created;
+        c["model"] = model_name;
+        Json ch = Json::object();
+        ch["index"] = 0;
+        Json d = Json::object();
+        d["tool_calls"] = Json::array();
+        int k = 0;
+        for (const Json& tc : tool_calls.arr()) {
+          Json t = tc;
+          t["index"] = k++;
+          d["tool_calls"].push_back(t);
+        }
+        ch["delta"] = d;
+        ch["finish_reason"] = Json();
+        c["choices"] = Json::array();
+        c["choices"].push_back(ch);
+        alive = send_all(fd, "data: " + c.dump() + "\n\n");
+      }
       if (alive) {
         Json c = Json::object();
         c["id"] = id;
@@ -575,8 +612,10 @@ struct Server {
     if (chat) {
       Json msg = Json::object();
       msg["role"] = "assistant";
-      msg["content"] = content;
+      const bool tc = tool_calls.is_array() && !tool_calls.arr().empty();
+      msg["content"] = tc && content.empty() ? Json() : Json(content);
       if (!reasoning.empty()) msg["reasoning_content"] = reasoning;
+      if (tc) msg["tool_calls"] = tool_calls;
       ch["message"] = msg;
     } else {
       ch["text"] = content;
