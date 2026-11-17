@@ -1040,6 +1040,324 @@ static void launch_mmq_t(const void* W, size_t rb, int K, int N, const int8_t* x
   k_mmq<T, GS><<<grid, 256, sh, s>>>((const uint8_t*)W, rb, K, N, xq, xd, Tt, y, ldy, acc, dbg);
 }
 
+// =============================================================================================
+// GQ: "decode once, then int8 tensor-core GEMM" for long prefill chunks.
+//   1) gq_decode: GGUF blocks -> int8 weights W8[N][K], int8 sub-scales S8[N][K/16] (and min
+//      coefficients M8 for MIN types), float factors FAC/MFAC[N][K/256]   (QInt factorization)
+//   2) k_gq_gemm: 64x128 CTA tile, 4-stage cp.async pipeline, ldmatrix fragments, integer sub-scale
+//      accumulation per 16/32 group and one float epilogue per 256 (activations int8 per 256).
+// Each weight is decoded once per chunk instead of once per token tile (MMQ).
+// =============================================================================================
+template <int T>
+__global__ void k_gq_decode(const uint8_t* __restrict__ W, size_t rb, int K, int N, int8_t* __restrict__ w8,
+                            int8_t* __restrict__ s8, int8_t* __restrict__ m8, float* __restrict__ fac,
+                            float* __restrict__ mfac) {
+  using D = QInt<T>;
+  constexpr int BB = QDec<T>::BB;
+  const int nsub = K / 32;
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (long long)N * nsub) return;
+  const int row = (int)(i / nsub), j = (int)(i % nsub);
+  const int kb = j >> 3, gg = j & 7;
+  const uint8_t* blk = W + (size_t)row * rb + (size_t)kb * BB;
+  WI w;
+  D::dec(blk, gg, w);
+  int4* dst = (int4*)(w8 + (size_t)row * K + (size_t)j * 32);
+  dst[0] = make_int4(w.w[0], w.w[1], w.w[2], w.w[3]);
+  dst[1] = make_int4(w.w[4], w.w[5], w.w[6], w.w[7]);
+  const size_t so = (size_t)row * (K / 16) + (size_t)j * 2;
+  s8[so] = (int8_t)w.s[0];
+  s8[so + 1] = (int8_t)(D::SC == 2 ? w.s[1] : w.s[0]);
+  if constexpr (D::MIN) {
+    m8[so] = (int8_t)w.m[0];
+    m8[so + 1] = (int8_t)(D::SC == 2 ? w.m[1] : w.m[0]);
+  }
+  if (gg == 0) {
+    fac[(size_t)row * (K / 256) + kb] = D::fac(blk);
+    if constexpr (D::MIN) mfac[(size_t)row * (K / 256) + kb] = D::mfac(blk);
+  }
+}
+
+__global__ void k_gq_xsum(const int8_t* __restrict__ xq, int K, int T, int16_t* __restrict__ xs) {
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int ng = K / 16;
+  if (i >= (long long)T * ng) return;
+  const int4 v = __ldg((const int4*)(xq + (size_t)i * 16));
+  int s = __dp4a(v.x, 0x01010101, 0);
+  s = __dp4a(v.y, 0x01010101, s);
+  s = __dp4a(v.z, 0x01010101, s);
+  s = __dp4a(v.w, 0x01010101, s);
+  xs[i] = (int16_t)s;
+}
+
+static __device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(a), "l"(gmem));
+}
+static __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(a), "l"(gmem));
+}
+static __device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+constexpr int GQ_BN = 128, GQ_BK = 64, GQ_ST = 3, GQ_LDS = GQ_BK + 16;
+template <int MT, bool MIN>
+struct GQL {  // smem layout for a CTA of 32*MT weight rows x 128 tokens
+  static constexpr int BM = 32 * MT;
+  static constexpr int A = BM * GQ_LDS, B = GQ_BN * GQ_LDS, S = BM * (GQ_BK / 16), XS = MIN ? GQ_BN * (GQ_BK / 16) * 2 : 0;
+  static constexpr int F = (2 * BM + GQ_BN) * 4;  // fac, mfac per row and xd per token (last stage of a 256)
+  static constexpr int STAGE = A + B + 2 * S + XS + F;
+  static constexpr size_t SMEM = (size_t)STAGE * GQ_ST;
+};
+
+template <bool SC2, bool MIN, int MT>
+__global__ void __launch_bounds__(256, 1)
+    k_gq_gemm(const int8_t* __restrict__ w8, const int8_t* __restrict__ s8, const int8_t* __restrict__ m8,
+              const float* __restrict__ fac, const float* __restrict__ mfac, int K, int N,
+              const int8_t* __restrict__ xq, const float* __restrict__ xd, const int16_t* __restrict__ xs,
+              int Tt, float* __restrict__ y, int ldy, int accum) {
+  extern __shared__ __align__(16) uint8_t gq_sm[];
+  using LY = GQL<MT, MIN>;
+  constexpr int GQ_BM = LY::BM, GQ_A = LY::A, GQ_B = LY::B, GQ_S = LY::S, GQ_STAGE = LY::STAGE;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, tq = lane & 3;
+  const int wm = warp & 1, wn = warp >> 1;  // 2 x 4 warps, warp tile 16*MT rows x 32 tokens
+  const int t0 = blockIdx.x * GQ_BN, n0 = blockIdx.y * GQ_BM;
+  const int nk = K / GQ_BK, K16 = K / 16, K256 = K / 256;
+
+  auto load = [&](int ks, int st) {
+    uint8_t* base = gq_sm + (size_t)st * GQ_STAGE;
+    const int k0 = ks * GQ_BK;
+#pragma unroll
+    for (int i = 0; i < MT / 2; i++) {
+      const int idx = tid + i * 256, row = idx >> 2, ch = idx & 3;
+      const int r = min(n0 + row, N - 1);
+      cp_async16(base + row * GQ_LDS + ch * 16, w8 + (size_t)r * K + k0 + ch * 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+      const int idx = tid + i * 256, tok = idx >> 2, ch = idx & 3;
+      const int t = min(t0 + tok, Tt - 1);
+      cp_async16(base + GQ_A + tok * GQ_LDS + ch * 16, xq + (size_t)t * K + k0 + ch * 16);
+    }
+    if (tid < GQ_BM) {
+      const int r = min(n0 + tid, N - 1);
+      cp_async4(base + GQ_A + GQ_B + tid * 4, s8 + (size_t)r * K16 + k0 / 16);
+      if (MIN) cp_async4(base + GQ_A + GQ_B + GQ_S + tid * 4, m8 + (size_t)r * K16 + k0 / 16);
+    }
+    if (MIN && tid >= 128) {
+      const int tok = tid - 128, t = min(t0 + tok, Tt - 1);
+      cp_async8(base + GQ_A + GQ_B + 2 * GQ_S + tok * 8, xs + (size_t)t * K16 + k0 / 16);
+    }
+    if ((ks & 3) == 3) {  // per-256 factors, consumed by the epilogue of this stage
+      float* F = (float*)(base + GQ_A + GQ_B + 2 * GQ_S + LY::XS);
+      const int kb = ks >> 2;
+      if (tid < GQ_BM) {
+        const int r = min(n0 + tid, N - 1);
+        cp_async4(F + tid, fac + (size_t)r * K256 + kb);
+        if (MIN) cp_async4(F + GQ_BM + tid, mfac + (size_t)r * K256 + kb);
+      }
+      if (tid >= GQ_BM && tid < GQ_BM + GQ_BN) {
+        const int tok = tid - GQ_BM, t = min(t0 + tok, Tt - 1);
+        cp_async4(F + 2 * GQ_BM + tok, xd + (size_t)t * K256 + kb);
+      }
+    }
+  };
+
+  float acc[MT][4][4];
+  int tot[MT][4][4], mtot[MT][4][4];
+#pragma unroll
+  for (int a = 0; a < MT; a++)
+#pragma unroll
+    for (int b = 0; b < 4; b++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) { acc[a][b][e] = 0.f; tot[a][b][e] = 0; mtot[a][b][e] = 0; }
+
+#pragma unroll
+  for (int s = 0; s < GQ_ST - 1; s++) {
+    if (s < nk) load(s, s);
+    cp_async_commit();
+  }
+  for (int ks = 0; ks < nk; ks++) {
+    cp_async_wait<GQ_ST - 2>();
+    __syncthreads();
+    if (ks + GQ_ST - 1 < nk) load(ks + GQ_ST - 1, (ks + GQ_ST - 1) % GQ_ST);
+    cp_async_commit();
+    const uint8_t* base = gq_sm + (size_t)(ks % GQ_ST) * GQ_STAGE;
+    const uint8_t* As = base;
+    const uint8_t* Bs = base + GQ_A;
+    const int8_t* Ss = (const int8_t*)(base + GQ_A + GQ_B);
+    const int8_t* Ms = Ss + GQ_S;
+    const int16_t* Xs = (const int16_t*)(base + GQ_A + GQ_B + 2 * GQ_S);
+#pragma unroll
+    for (int kk = 0; kk < GQ_BK; kk += 32) {
+      uint32_t a[MT][4], b[4][2];
+#pragma unroll
+      for (int mt = 0; mt < MT; mt++)
+        ldsm_x4(a[mt], As + (wm * (16 * MT) + mt * 16 + (lane & 15)) * GQ_LDS + kk + (lane >> 4) * 16);
+#pragma unroll
+      for (int np = 0; np < 2; np++) {
+        uint32_t r[4];
+        ldsm_x4(r, Bs + (wn * 32 + np * 16 + (lane & 7) + ((lane >> 4) << 3)) * GQ_LDS + kk + ((lane >> 3) & 1) * 16);
+        b[2 * np][0] = r[0]; b[2 * np][1] = r[1]; b[2 * np + 1][0] = r[2]; b[2 * np + 1][1] = r[3];
+      }
+      const int gi = kk / 16;  // 16-group index within the stage
+#pragma unroll
+      for (int mt = 0; mt < MT; mt++) {
+        const int rl = wm * (16 * MT) + mt * 16 + g, rh = rl + 8;
+        if constexpr (!SC2) {
+          const int sl = Ss[rl * 4 + gi], sh = Ss[rh * 4 + gi];
+#pragma unroll
+          for (int nt = 0; nt < 4; nt++) {
+            int c[4] = {0, 0, 0, 0};
+            mma_s8_k32(c, a[mt], b[nt][0], b[nt][1]);
+            tot[mt][nt][0] += c[0] * sl; tot[mt][nt][1] += c[1] * sl;
+            tot[mt][nt][2] += c[2] * sh; tot[mt][nt][3] += c[3] * sh;
+          }
+          if constexpr (MIN) {
+            const int ml = Ms[rl * 4 + gi], mh = Ms[rh * 4 + gi];
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+              const int ta = wn * 32 + nt * 8 + 2 * tq;
+              const int x0 = Xs[ta * 4 + gi] + Xs[ta * 4 + gi + 1];
+              const int x1 = Xs[(ta + 1) * 4 + gi] + Xs[(ta + 1) * 4 + gi + 1];
+              mtot[mt][nt][0] += ml * x0; mtot[mt][nt][1] += ml * x1;
+              mtot[mt][nt][2] += mh * x0; mtot[mt][nt][3] += mh * x1;
+            }
+          }
+        } else {
+#pragma unroll
+          for (int h = 0; h < 2; h++) {
+            const int sl = Ss[rl * 4 + gi + h], sh = Ss[rh * 4 + gi + h];
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+              int c[4] = {0, 0, 0, 0};
+              mma_s8_k16(c, a[mt][2 * h], a[mt][2 * h + 1], b[nt][h]);
+              tot[mt][nt][0] += c[0] * sl; tot[mt][nt][1] += c[1] * sl;
+              tot[mt][nt][2] += c[2] * sh; tot[mt][nt][3] += c[3] * sh;
+            }
+            if constexpr (MIN) {
+              const int ml = Ms[rl * 4 + gi + h], mh = Ms[rh * 4 + gi + h];
+#pragma unroll
+              for (int nt = 0; nt < 4; nt++) {
+                const int ta = wn * 32 + nt * 8 + 2 * tq;
+                const int x0 = Xs[ta * 4 + gi + h], x1 = Xs[(ta + 1) * 4 + gi + h];
+                mtot[mt][nt][0] += ml * x0; mtot[mt][nt][1] += ml * x1;
+                mtot[mt][nt][2] += mh * x0; mtot[mt][nt][3] += mh * x1;
+              }
+            }
+          }
+        }
+      }
+    }
+    if ((ks & 3) == 3) {  // end of a 256-wide super-block: float epilogue
+      const float* F = (const float*)(base + GQ_A + GQ_B + 2 * GQ_S + LY::XS);
+#pragma unroll
+      for (int mt = 0; mt < MT; mt++) {
+        const int rl = wm * (16 * MT) + mt * 16 + g;
+        const float fa = F[rl], fb = F[rl + 8];
+        const float ma = MIN ? F[GQ_BM + rl] : 0.f, mb = MIN ? F[GQ_BM + rl + 8] : 0.f;
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+          const int tl = wn * 32 + nt * 8 + 2 * tq;
+          const float x0 = F[2 * GQ_BM + tl], x1 = F[2 * GQ_BM + tl + 1];
+          float v0 = fa * (float)tot[mt][nt][0], v1 = fa * (float)tot[mt][nt][1];
+          float v2 = fb * (float)tot[mt][nt][2], v3 = fb * (float)tot[mt][nt][3];
+          if (MIN) {
+            v0 += ma * (float)mtot[mt][nt][0]; v1 += ma * (float)mtot[mt][nt][1];
+            v2 += mb * (float)mtot[mt][nt][2]; v3 += mb * (float)mtot[mt][nt][3];
+          }
+          acc[mt][nt][0] += v0 * x0; acc[mt][nt][1] += v1 * x1;
+          acc[mt][nt][2] += v2 * x0; acc[mt][nt][3] += v3 * x1;
+#pragma unroll
+          for (int e = 0; e < 4; e++) { tot[mt][nt][e] = 0; mtot[mt][nt][e] = 0; }
+        }
+      }
+    }
+  }
+  cp_async_wait<0>();
+#pragma unroll
+  for (int mt = 0; mt < MT; mt++) {
+    const int ra = n0 + wm * (16 * MT) + mt * 16 + g, rb2 = ra + 8;
+#pragma unroll
+    for (int nt = 0; nt < 4; nt++) {
+      const int ta = t0 + wn * 32 + nt * 8 + 2 * tq;
+      const int rr[4] = {ra, ra, rb2, rb2}, tt[4] = {ta, ta + 1, ta, ta + 1};
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        if (rr[e] >= N || tt[e] >= Tt) continue;
+        float* o = y + (size_t)tt[e] * ldy + rr[e];
+        *o = accum ? *o + acc[mt][nt][e] : acc[mt][nt][e];
+      }
+    }
+  }
+}
+
+size_t gq_buffer_bytes(int K, int rows) {
+  // W8 + S8 + M8 + FAC + MFAC, each region 256-aligned
+  auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+  return al((size_t)rows * K) + 2 * al((size_t)rows * (K / 16)) + 2 * al((size_t)rows * (K / 256) * 4);
+}
+
+void gq_decode(uint32_t type, const void* W, size_t rb, int K, int N, void* buf, cudaStream_t s) {
+  auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+  int8_t* w8 = (int8_t*)buf;
+  int8_t* s8 = w8 + al((size_t)N * K);
+  int8_t* m8 = s8 + al((size_t)N * (K / 16));
+  float* fac = (float*)(m8 + al((size_t)N * (K / 16)));
+  float* mfac = (float*)((uint8_t*)fac + al((size_t)N * (K / 256) * 4));
+  const long long n = (long long)N * (K / 32);
+  const int blocks = (int)((n + 255) / 256);
+  const uint8_t* w = (const uint8_t*)W;
+  switch (type) {
+#define T(t) case t: k_gq_decode<t><<<blocks, 256, 0, s>>>(w, rb, K, N, w8, s8, m8, fac, mfac); break;
+    T(QT_Q2_K) T(QT_Q4_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ4_XS)
+#undef T
+    default: QE_FATAL("gq_decode: unsupported type %u", type);
+  }
+}
+
+void gq_xsum(const int8_t* xq, int K, int T, int16_t* xs, cudaStream_t s) {
+  const long long n = (long long)T * (K / 16);
+  k_gq_xsum<<<(int)((n + 255) / 256), 256, 0, s>>>(xq, K, T, xs);
+}
+
+bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K || type == QT_IQ1_S; }
+bool gq_supported(uint32_t type) {
+  static const bool all = getenv("QE_GQ_MIN") != nullptr;  // MIN types: slower than cuBLAS so far
+  return mmq_supported(type) && (all || !gq_needs_xsum(type));
+}
+
+void gq_gemm(uint32_t type, const void* buf, int K, int N, const int8_t* xq, const float* xd256,
+             const int16_t* xs, int T, float* y, int ldy, bool accumulate, cudaStream_t s) {
+  auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+  const int8_t* w8 = (const int8_t*)buf;
+  const int8_t* s8 = w8 + al((size_t)N * K);
+  const int8_t* m8 = s8 + al((size_t)N * (K / 16));
+  const float* fac = (const float*)(m8 + al((size_t)N * (K / 16)));
+  const float* mfac = (const float*)((const uint8_t*)fac + al((size_t)N * (K / 256) * 4));
+  const bool sc2 = type == QT_Q2_K || type == QT_Q6_K || type == QT_IQ2_XS || type == QT_IQ2_S;
+  const bool mn = gq_needs_xsum(type);
+#define L(a, b, mt)                                                                                    \
+  {                                                                                                   \
+    static bool init = false;                                                                         \
+    if (!init) {                                                                                      \
+      CUDA_CHECK(cudaFuncSetAttribute(k_gq_gemm<a, b, mt>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)GQL<mt, b>::SMEM)); \
+      init = true;                                                                                    \
+    }                                                                                                 \
+    const dim3 grid(cdiv(T, GQ_BN), cdiv(N, GQL<mt, b>::BM));                                         \
+    k_gq_gemm<a, b, mt><<<grid, 256, GQL<mt, b>::SMEM, s>>>(w8, s8, m8, fac, mfac, K, N, xq, xd256, xs, T, y, ldy, accumulate); \
+  }
+  if (sc2) { if (mn) L(true, true, 2) else L(true, false, 4) }
+  else { if (mn) L(false, true, 2) else L(false, false, 4) }
+#undef L
+}
+
 bool mmq_supported(uint32_t type) {
   switch (type) {
     case QT_Q2_K: case QT_Q4_K: case QT_Q6_K: case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S:

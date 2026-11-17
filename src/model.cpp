@@ -569,6 +569,7 @@ void Model::plan_and_load() {
   gemm16_ = !(getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 0);  // default on (guarded)
   use_mmq_ = !(getenv("QE_MMQ") && atoi(getenv("QE_MMQ")) == 0);
   mmq_gs_ = getenv("QE_MMQ_GS") ? atoi(getenv("QE_MMQ_GS")) : 32;
+  use_gq_ = !getenv("QE_GQ") || atoi(getenv("QE_GQ")) != 0;
   mmq_max_T_ = getenv("QE_MMQ_MAXT") ? atoi(getenv("QE_MMQ_MAXT")) : 192;
   ovf_dev_ = (int*)dalloc(256);
   hcarry_bk_ = (float*)dalloc((size_t)c.n_embd * 4);
@@ -775,7 +776,33 @@ void Model::linear(Layer* L, Mat& m, const float* x, int T, float* y, int ldy, b
     qk::mmq(m.type, W, m.row_bytes, m.K, m.N, xq_, xd_, T, y, ldy, acc, mmq_gs_, s);
     return;
   }
+  if (use_gq_ && qk::gq_supported(m.type) && m.K % 256 == 0) {
+    // decode-once int8 GEMM: activations int8 per 256 (+ 16-group sums for MIN types) in the f16
+    // activation buffer, weights decoded chunk-wise into the f16 dequant buffer
+    const bool xsum = qk::gq_needs_xsum(m.type);
+    auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+    int8_t* gx = (int8_t*)a16_;
+    float* gxd = (float*)(gx + al((size_t)T * m.K));
+    int16_t* gxs = (int16_t*)((uint8_t*)gxd + al((size_t)T * (m.K / 256) * 4));
+    if (gqp_ != x || gqp_K_ != m.K || gqp_T_ != T || (xsum && !gqp_xs_)) {
+      prep16_ = nullptr;  // a16_ is overwritten
+      { ProfScope ps(5, s); qk::quantize_q8_256(x, gx, gxd, m.K, T, s); }
+      if (xsum) qk::gq_xsum(gx, m.K, T, gxs, s);
+      gqp_ = x; gqp_K_ = m.K; gqp_T_ = T; gqp_xs_ = xsum;
+    }
+    const size_t per_row = (size_t)m.K + 2 * (m.K / 16) + 2 * (m.K / 256) * 4;
+    int rows_per = (int)std::min<size_t>(m.N, (w16_elems_ * 2 - 4096) / per_row);
+    if (rows_per < m.N) rows_per = std::max(64, rows_per / 64 * 64);
+    for (int r0 = 0; r0 < m.N; r0 += rows_per) {
+      const int nr = std::min(rows_per, m.N - r0);
+      { ProfScope ps(5, s); qk::gq_decode(m.type, (const uint8_t*)W + (size_t)r0 * m.row_bytes, m.row_bytes, m.K, nr, w16_, s); }
+      ProfScope ps(4, s);
+      qk::gq_gemm(m.type, w16_, m.K, nr, gx, gxd, gxs, T, y + r0, ldy, acc, s);
+    }
+    return;
+  }
   prepare_input(x, m.K, T, s, 2);
+  gqp_ = nullptr;  // a16_ is overwritten
   // chunk rows so the f16 dequant buffer suffices
   const int rows_per = std::max(1, (int)std::min<size_t>(m.N, w16_elems_ / m.K));
   const float alpha = 1.f, beta = acc ? 1.f : 0.f;
@@ -815,7 +842,7 @@ void Model::layer_attn(int il, int T, int pos0) {
   cudaStream_t s = stream_;
   const int qw = c.n_head * c.hd * 2, kvw = c.n_kv * c.hd;
   qk::rmsnorm(x_, L.attn_norm, xn_, c.n_embd, T, c.eps, s);
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   float* qg = t0_;
   float* k = t3_;
   float* v = t3_ + (size_t)T * kvw;
@@ -848,7 +875,7 @@ void Model::layer_attn(int il, int T, int pos0) {
                      scale, fa_work_, kvmap(), s);
   }
   qk::gate_sigmoid(o, qg, c.hd, c.n_head, T, s);
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   linear(&L, L.wo, o, T, t4_, c.n_embd, false, s);
   qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
 }
@@ -859,7 +886,7 @@ void Model::layer_gdn(int il, int T) {
   cudaStream_t s = stream_;
   const int C = c.conv_dim();
   qk::rmsnorm(x_, L.attn_norm, xn_, c.n_embd, T, c.eps, s);
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   float* qkv_raw = t0_;
   float* z = t1_;
   float* ab = t4_;  // alpha [T][nv] then beta [T][nv] (t4 is free until the output projection)
@@ -889,7 +916,7 @@ void Model::layer_gdn(int il, int T) {
   qe_debug_dump("attn_output", il, o, T, c.d_inner, s);
   qk::gdn_gated_norm(o, z, c.d_inner, L.ssm_norm, c.nv, c.dv, T, c.eps, s);
   qe_debug_dump("final_output", il, o, T, c.d_inner, s);
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   linear(&L, L.wssm_out, o, T, t4_, c.n_embd, false, s);
   qe_debug_dump("linear_attn_out", il, t4_, T, c.n_embd, s);
   qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
@@ -900,12 +927,12 @@ void Model::layer_ffn(int il, int T) {
   Layer& L = layers_[il];
   cudaStream_t s = stream_;
   qk::rmsnorm(x_, L.post_norm, xn_, c.n_embd, T, c.eps, s);
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   if (!L.ffn_streamed) {
     linear(&L, L.ffn_gate, xn_, T, t0_, c.n_ff, false, s);
     linear(&L, L.ffn_up, xn_, T, t1_, c.n_ff, false, s);
     qk::silu_mul(t0_, t1_, t0_, (int64_t)T * c.n_ff, s);
-    prepared_ = nullptr; prep16_ = nullptr;
+    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
     linear(&L, L.ffn_down, t0_, T, t4_, c.n_embd, false, s);
     qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
     return;
@@ -930,14 +957,14 @@ void Model::layer_ffn(int il, int T) {
     linear(&L, L.gate_c, xn_, T, hc, r, false, s);
     linear(&L, L.up_c, xn_, T, uc, r, false, s);
     qk::silu_mul(hc, uc, hc, (int64_t)T * r, s);
-    prepared_ = nullptr; prep16_ = nullptr;
+    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
     linear(&L, L.down_c, hc, T, t4_, c.n_embd, false, s);
     if (Ng > 0) {
-      prepared_ = nullptr; prep16_ = nullptr;
+      prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
       linear(&L, L.down_g, hg, T, t4_, c.n_embd, true, s);
     }
   } else {
-    prepared_ = nullptr; prep16_ = nullptr;
+    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
     if (Ng > 0) linear(&L, L.down_g, hg, T, t4_, c.n_embd, false, s);
     else CUDA_CHECK(cudaMemsetAsync(t4_, 0, (size_t)T * c.n_embd * 4, s));
   }
@@ -1051,7 +1078,7 @@ void Model::mtp_block(const float* hrows, const int* tokens, int T, int pos0) {
   float* cat = t0_;  // [T][2*n_embd]
   CUDA_CHECK(cudaMemcpy2DAsync(cat, 2 * c.n_embd * 4, e, c.n_embd * 4, c.n_embd * 4, T, cudaMemcpyDeviceToDevice, s));
   CUDA_CHECK(cudaMemcpy2DAsync(cat + c.n_embd, 2 * c.n_embd * 4, hn, c.n_embd * 4, c.n_embd * 4, T, cudaMemcpyDeviceToDevice, s));
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   linear(&L, L.eh_proj, cat, T, x_, c.n_embd, false, s);
   const bool snap_save = snapshot_;
   snapshot_ = false;
@@ -1068,7 +1095,7 @@ int Model::mtp_finish(int n, float* conf, float* logits_host) {
   const Config& c = cfg_;
   // keep the normed MTP output of the last row for chaining
   CUDA_CHECK(cudaMemcpyAsync(mtp_h_, xn_ + (size_t)(n - 1) * c.n_embd, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   const int tail = 320;
   const int head = std::clamp(opt_.mtp_vocab > 0 ? opt_.mtp_vocab : c.n_vocab, 1, c.n_vocab - tail);
   const bool sub = head + tail < c.n_vocab;
@@ -1311,7 +1338,7 @@ void Model::select_ws(bool big) {
   x_ = w.x; xn_ = w.xn; t0_ = w.t0; t1_ = w.t1; t2_ = w.t2; t3_ = w.t3; t4_ = w.t4;
   g_ = w.g; beta_ = w.beta; xq_ = w.xq; xd_ = w.xd; hid_ = w.hid;
   if (big) { a16_ = w.a16; c16_ = w.c16; w16_ = w.w16; fa_work_ = w.fa; }
-  prepared_ = nullptr; prep16_ = nullptr;
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   ws_is_big_ = big;
 }
 
@@ -1474,7 +1501,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     if ((logits || argmax) && r_begin < r_end) {
       for (int r = r_begin; r < r_end; r += qk::kMaxB) {
         const int nb = std::min(qk::kMaxB, r_end - r);
-        prepared_ = nullptr; prep16_ = nullptr;
+        prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
         linear(nullptr, output_, hid_ + (size_t)(r - b0) * c.n_embd, nb, logits_dev_, c.n_vocab, false, stream_);
         if (r + nb == n) {
           qe_debug_dump("result_norm", -1, hid_ + (size_t)(r + nb - 1 - b0) * c.n_embd, 1, c.n_embd, stream_);

@@ -9,8 +9,9 @@ MODEL=${MODEL:-models.gguf}
 N=${N:-16}
 export LD_LIBRARY_PATH=/run/opengl-driver/lib
 fail=0
-gen() { $BIN gen -m "$MODEL" --ids "$1" -n $N -c 8192 "${@:2}" 2>/dev/null | head -1; }
-for p in bench-results/data/story.ids bench-results/data/ja.ids bench-results/data/chunk3.ids; do
+CTX=${CTX:-8192}
+gen() { $BIN gen -m "$MODEL" --ids "$1" -n $N -c $CTX "${@:2}" 2>/dev/null | head -1; }
+for p in bench-results/data/story.ids bench-results/data/ja.ids bench-results/data/chunk3b.ids; do  # chunk3b: chunk3 minus its last 12 tokens (chunk3 ends on a near-tie)
   ref=$(gen "$p" --no-mtp --no-elastic --ubatch 512)
   for cfg in "" "--draft 1" "--draft 2" "--ubatch 512" "--no-elastic" "--no-mtp" "--kv q8" ; do
     out=$(gen "$p" $cfg)

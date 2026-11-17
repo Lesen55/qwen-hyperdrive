@@ -29,7 +29,7 @@ struct EngineOptions {
   int mtp_vocab = 0;           // MTP draft head vocabulary subset (first ids + special tail), 0 = full            // prompt-cache state checkpoints kept in pinned host memory
   int draft_max = 3;           // MTP chained draft length (1..3)
   double cpu_frac = -1;         // fraction of streamed FFN rows computed on the CPU (<0: auto per layer)
-  double pcie_gbps = 34.0;      // effective host->GPU bandwidth assumed by the auto balancer
+  double pcie_gbps = 38.0;      // effective host->GPU bandwidth assumed by the auto balancer
   double dram_gbps = 44.0;      // host DRAM bandwidth shared by CPU kernels and DMA
   bool cpu_r4 = true;           // allow lossless R4 repacking of the CPU part
   bool verbose = false;
@@ -156,6 +156,9 @@ class Model {
   void linear(Layer* L, Mat& m, const float* x, int T, float* y, int ldy, bool acc,
               cudaStream_t s);
   const void* mat_ptr(Layer* L, Mat& m, cudaStream_t s);
+  const float* gqp_ = nullptr;  // activation cached in int8-per-256 form for the GQ GEMM
+  int gqp_K_ = 0, gqp_T_ = 0;
+  bool gqp_xs_ = false, use_gq_ = true;
   void prepare_input(const float* x, int K, int T, cudaStream_t s, int fmt = 0);
   void layer_attn(int il, int T, int pos0);
   void layer_gdn(int il, int T);

@@ -29,6 +29,14 @@ void matvec(uint32_t type, const void* W, size_t row_bytes, int K, int N, const 
 // for t < T (any T), x quantized by quantize_q8_256.  Not for IQ1_M / float weight types.
 void quantize_q8_256(const float* x, int8_t* xq, float* xd, int K, int T, cudaStream_t s);
 bool mmq_supported(uint32_t type);
+// decode-once int8 GEMM for long prefill chunks (types: mmq_supported)
+size_t gq_buffer_bytes(int K, int rows);
+void gq_decode(uint32_t type, const void* W, size_t rb, int K, int N, void* buf, cudaStream_t s);
+bool gq_needs_xsum(uint32_t type);
+bool gq_supported(uint32_t type);
+void gq_xsum(const int8_t* xq, int K, int T, int16_t* xs, cudaStream_t s);
+void gq_gemm(uint32_t type, const void* buf, int K, int N, const int8_t* xq, const float* xd256,
+             const int16_t* xs, int T, float* y, int ldy, bool accumulate, cudaStream_t s);
 // gs = activation scale group: 32 (quantize_q8, more accurate) or 256 (quantize_q8_256, faster)
 void mmq(uint32_t type, const void* W, size_t row_bytes, int K, int N, const int8_t* xq, const float* xd,
          int T, float* y, int ldy, bool accumulate, int gs, cudaStream_t s);
