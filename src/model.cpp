@@ -1,4 +1,6 @@
+#include <sys/stat.h>
 #include "model.h"
+#include "requant.h"
 
 #include <algorithm>
 #include <atomic>
@@ -107,6 +109,54 @@ void Model::load_config() {
   QE_ASSERT(c.hd == 256 && c.dk == 128 && c.conv_k == 4 && c.d_inner == c.nv * c.dv);
   QE_LOG("[model] qwen35: %d layers (+%d MTP), embd %d, ff %d, heads %d/%d x %d, GDN %d/%d x %d, vocab %d\n",
          c.n_layer, c.n_mtp, c.n_embd, c.n_ff, c.n_head, c.n_kv, c.hd, c.nk, c.nv, c.dk, c.n_vocab);
+}
+
+void Model::requant_mtp() {
+  Layer& L = layers_[cfg_.n_layer];
+  std::vector<Mat*> mats;
+  static const bool ffn_only = !getenv("QE_MTP_REQ_ALL");
+  for (Mat* m : {&L.wq, &L.wk, &L.wv, &L.wo, &L.ffn_gate, &L.ffn_up, &L.ffn_down, &L.eh_proj})
+    if (m->valid() && m->type == QT_Q6_K && m->K % 256 == 0 &&
+        (!ffn_only || m == &L.ffn_gate || m == &L.ffn_up || m == &L.ffn_down))
+      mats.push_back(m);
+  if (mats.empty()) return;
+  size_t total = 0, before = 0;
+  for (Mat* m : mats) { total += iq4_xs_row_bytes(m->K) * m->N; before += m->bytes; }
+  // cache keyed by the model file identity
+  struct stat st{};
+  stat(opt_.model_path.c_str(), &st);
+  const char* xdg = getenv("XDG_CACHE_HOME");
+  const std::string dir = xdg && *xdg ? std::string(xdg) + "/qwen-hyperdrive" : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/.cache/qwen-hyperdrive";
+  const std::string path = dir + (ffn_only ? "/mtp-ffn-iq4xs-v1-" : "/mtp-iq4xs-v1-") + std::to_string((long long)st.st_size) + "-" + std::to_string((long long)st.st_mtime) + ".bin";
+  requant_store_.emplace_back(total);
+  uint8_t* buf = requant_store_.back().data();
+  bool cached = false;
+  if (FILE* f = fopen(path.c_str(), "rb")) {
+    cached = fread(buf, 1, total, f) == total && fgetc(f) == EOF;
+    fclose(f);
+  }
+  const double t0 = qe_now();
+  size_t off = 0;
+  for (Mat* m : mats) {
+    const size_t rb = iq4_xs_row_bytes(m->K);
+    if (!cached) requant_rows_iq4_xs(m->type, m->host, m->row_bytes, m->K, m->N, buf + off);
+    m->type = QT_IQ4_XS;
+    m->row_bytes = rb;
+    m->bytes = rb * m->N;
+    m->host = buf + off;
+    off += m->bytes;
+  }
+  if (!cached) {
+    mkdir(dir.c_str(), 0755);
+    const std::string tmp = path + ".tmp";
+    if (FILE* f = fopen(tmp.c_str(), "wb")) {
+      const bool ok = fwrite(buf, 1, total, f) == total;
+      fclose(f);
+      if (ok) rename(tmp.c_str(), path.c_str());
+    }
+  }
+  QE_LOG("[plan] MTP block Q6_K -> IQ4_XS: %.0f -> %.0f MiB (%s, %.1f s)\n", before / (double)MiB, total / (double)MiB,
+         cached ? "cached" : "requantized", qe_now() - t0);
 }
 
 Mat Model::make_mat(const std::string& name, bool required) {
@@ -225,6 +275,9 @@ void Model::plan_and_load() {
     L.ffn_down = make_mat(bn(il, "ffn_down.weight"));
     if (il >= c.n_layer) L.eh_proj = make_mat(bn(il, "nextn.eh_proj.weight"));
   }
+
+  // MTP block: Q6_K -> IQ4_XS (drafts only; ~1/3 fewer bytes per draft step and more VRAM for FFN)
+  if (has_mtp() && !getenv("QE_MTP_Q6")) requant_mtp();
 
   // ---------------- memory plan ----------------
   size_t free_b = 0, total_b = 0;
@@ -1653,6 +1706,11 @@ void Model::rollback(int n_keep) {
 void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax,
                     bool snapshot, bool mtp_prefill) {
   const Config& c = cfg_;
+  static const bool hprof = getenv("QE_HPROF") != nullptr;
+  static double h_launch = 0, h_sync = 0, h_tail = 0, h_n = 0;
+  const double h0 = hprof ? qe_now() : 0;
+  double h1 = 0, h2 = 0, hl = 0;
+  static double h_layers = 0;
   QE_ASSERT(n_logits <= n);
   QE_ASSERT(!snapshot || n <= opt_.draft_max + 1);
   snapshot_ = snapshot && has_mtp() && n > 1;
@@ -1666,7 +1724,27 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     select_ws(false);
     ws_lend();          // decode: lend the idle prefill workspace to FFN weights
   }
-  const bool use_cpu = pool_ && n <= kCpuMaxB;
+  // CPU/GPU split of the streamed FFN layers, chosen online: hybrid (CPU computes its row slice) wins
+  // when PCIe is the bottleneck (long context), GPU-only (whole layers streamed) when the GPU is.
+  // Both are timed with an EMA; the slower one is re-measured for a few passes every 64 passes.
+  bool use_cpu = pool_ && n <= kCpuMaxB;
+  int dm = -1;
+  if (use_cpu) {
+    static const int force = getenv("QE_CPU_MODE") ? atoi(getenv("QE_CPU_MODE")) : -1;
+    if (force == 0 || force == 1) {
+      dm = force;
+    } else {
+      const int best = dm_cnt_[0] < 3 ? 0 : dm_cnt_[1] < 3 ? 1 : (dm_ema_[0] <= dm_ema_[1] ? 0 : 1);
+      if (++dm_pass_ % 128 == 0) dm_explore_ = 3;
+      dm = dm_explore_ > 0 ? 1 - best : best;
+      if (dm_explore_ > 0) dm_explore_--;
+      if (dm != dm_last_) QE_DBG("[auto] decode CPU mode -> %s\n", dm ? "hybrid" : "gpu-only");
+    }
+    use_cpu = dm == 1;
+  }
+  const bool dm_skip = dm != dm_last_;  // the first pass after a switch refills the ring: not timed
+  dm_last_ = dm;
+  const double dm_t0 = dm >= 0 ? qe_now() : 0;
   static const bool gprof = getenv("QE_PROFILE") != nullptr;
   gprof_on_ = gprof && n <= kCpuMaxB;
   if (gprof_on_) { gp_n_ = cp_n_ = 0; cp_bytes_ = 0; CUDA_CHECK(cudaEventRecord(gp_start_, stream_)); }
@@ -1717,6 +1795,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
       if (gprof_on_) CUDA_CHECK(cudaEventRecord(sec_ev(il, 2), stream_));
       dsum("l_out", il, x_, (size_t)T * c.n_embd);
     }
+    if (hprof) hl = qe_now();
     // final norm for all rows (MTP needs every row's hidden state)
     norm_in(output_norm_, hid_, T, false);
     // logits for rows that fall in this chunk
@@ -1775,7 +1854,9 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
         continue;
       }
     }
+    if (hprof) h1 = qe_now();
     CUDA_CHECK(cudaStreamSynchronize(stream_));
+    if (hprof) h2 = qe_now();
     CUDA_CHECK(cudaGetLastError());
     break;
     }  // attempt
@@ -1783,6 +1864,18 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
   }
   if (use_cpu) pool_->wait();
   { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) QE_FATAL("forward: %s", cudaGetErrorString(e)); }
+  if (dm >= 0 && !dm_skip) {
+    const double dt = qe_now() - dm_t0;
+    dm_ema_[dm] = dm_cnt_[dm] ? 0.8 * dm_ema_[dm] + 0.2 * dt : dt;
+    dm_cnt_[dm]++;
+  }
+  if (hprof && n <= qk::kMaxB && h1 > 0) {
+    const double h3 = qe_now();
+    h_launch += h1 - h0; h_sync += h2 - h1; h_tail += h3 - h2; h_layers += hl - h0; h_n += 1;
+    if ((int)h_n % 100 == 0)
+      fprintf(stderr, "[hprof] forward(T<=8): layers enqueued after %.2f ms, head+rest enqueue until %.2f ms, wait GPU %.2f ms, tail %.2f ms\n",
+              h_layers / h_n * 1e3, h_launch / h_n * 1e3, h_sync / h_n * 1e3, h_tail / h_n * 1e3);
+  }
   snap_t_ = -1;
   cap_slot_ = -1;
   if (gprof_on_) {

@@ -142,6 +142,7 @@ class Model {
   // sampling top-K on the GPU: when K > 0, forward()/mtp_* with a host logits pointer only fill
   // topk rows (forward: row j of the requested logits; MTP: row kMaxB) instead of the full rows
   void set_topk(int K) { topk_K_ = K; }
+  void sync() { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
   int topk_K() const { return topk_K_; }
   const int* topk_idx(int row) const { return topk_i_h_ + (size_t)row * kTopKMax; }
   const float* topk_val(int row) const { return topk_v_h_ + (size_t)row * kTopKMax; }
@@ -174,6 +175,8 @@ class Model {
   void* dalloc(size_t bytes);
   double cpu_bw(uint32_t type, bool r4 = false);
   std::vector<std::vector<uint8_t>> r4_store_;
+  std::vector<std::vector<uint8_t>> requant_store_;  // load-time requantized weights (host)
+  void requant_mtp();
   std::map<uint32_t, double> cpu_bw_;
 
   // compute helpers
@@ -231,6 +234,9 @@ class Model {
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
   bool legacy16_ = false;
   bool zc_ = true;
+  // online choice of the decode CPU mode (0 = GPU-only, 1 = hybrid)
+  double dm_ema_[2] = {0, 0};
+  int dm_cnt_[2] = {0, 0}, dm_pass_ = 0, dm_explore_ = 0, dm_last_ = -2;
   bool fuse_ = true;              // decode: fused residual + norm + quantize kernels
   const float* pend_ = nullptr;   // deferred residual (x_ += pend_ in the next norm_in)
   void norm_in(const float* w, float* y, int T, bool quant);

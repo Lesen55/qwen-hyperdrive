@@ -365,6 +365,324 @@ static __device__ __forceinline__ float dot_w32(const W32& w, const int4 a, cons
 }
 
 // =============================================================================================
+// Tensor-core small-batch matvec (B = 2..8 tokens) on quantized weights.
+//   One mma.m16n8k32.s8 = 8 weight rows (B operand, n) x 32 k x up to 8 tokens (A operand, m; rows
+//   8..15 of A are zero).  The 32 k-slots of an mma are permuted so that lane (g, tq) supplies exactly
+//   the 8 weights of chunk tq (weights 8tq..8tq+7 of the 32-group) of row g: every weight is decoded
+//   once, by one lane, with no shuffles; the activation fragment is one 8-byte load per lane.
+//   Scale groups narrower than 32 are handled by masked mmas; the IQ1 offsets (+-1/8) are folded into
+//   the int8 weights (8w +- 1, scale / 8).
+// =============================================================================================
+static __device__ __forceinline__ void mma_tc_k32(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// IQ1 grid bytes {-1, 0, 1} -> 8g + s (s = +-1) via a byte-permute table
+static __device__ __forceinline__ uint32_t iq1_fold(uint32_t g, int s) {
+  const uint32_t t = (uint32_t)(uint8_t)s | ((uint32_t)(uint8_t)(8 + s) << 8) | ((uint32_t)(uint8_t)(-8 + s) << 24);
+  const uint32_t sel = (g & 3) | ((g >> 4) & 0x30) | ((g >> 8) & 0x300) | ((g >> 12) & 0x3000);
+  return __byte_perm(t, 0, sel);
+}
+// signed (v - 32) per byte for v in [0, 63]
+static __device__ __forceinline__ uint32_t sub32_bytes(uint32_t v) {
+  const uint32_t u = v ^ 0x20202020u;
+  const uint32_t m = u & 0x20202020u;
+  return u | (m << 1) | (m << 2);
+}
+
+// Decode chunk l (weights 8l..8l+7) of 32-group ib of super-block b: two int8x4 words and its scale.
+template <int T> struct QChunk { static constexpr bool OK = false; };
+template <> struct QChunk<QT_IQ2_XXS> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint32_t a1 = ld32a2(b + 2 + 8 * ib + 4);
+    const uint64_t g = qtab_dev::iq2xxs_grid[b[2 + 8 * ib + l]];
+    const uint32_t s = iq2_signs8((a1 >> (7 * l)) & 127);
+    w0 = apply_signs4((uint32_t)g, s);
+    w1 = apply_signs4((uint32_t)(g >> 32), s >> 4);
+    sc = h2f(b) * (0.5f + (a1 >> 28)) * 0.25f;
+  }
+};
+template <> struct QChunk<QT_IQ2_XS> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint32_t q = ld16(b + 2 + 2 * (4 * ib + l));
+    const uint64_t g = qtab_dev::iq2xs_grid[q & 511];
+    const uint32_t s = iq2_signs8(q >> 9);
+    w0 = apply_signs4((uint32_t)g, s);
+    w1 = apply_signs4((uint32_t)(g >> 32), s >> 4);
+    sc = h2f(b) * (0.5f + ((b[66 + ib] >> (4 * (l / 2))) & 0xf)) * 0.25f;
+  }
+};
+template <> struct QChunk<QT_IQ2_S> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint32_t qh = b[66 + ib];
+    const uint64_t g = qtab_dev::iq2s_grid[b[2 + 4 * ib + l] | ((qh << (8 - 2 * l)) & 0x300)];
+    const uint32_t s = b[34 + 4 * ib + l];
+    w0 = apply_signs4((uint32_t)g, s);
+    w1 = apply_signs4((uint32_t)(g >> 32), s >> 4);
+    sc = h2f(b) * (0.5f + ((b[74 + ib] >> (4 * (l / 2))) & 0xf)) * 0.25f;
+  }
+};
+template <> struct QChunk<QT_IQ3_XXS> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint8_t* qs = b + 2 + 8 * ib;
+    const uint32_t a = ld32a2(b + 2 + 64 + 4 * ib);
+    const uint32_t s = iq2_signs8((a >> (7 * l)) & 127);
+    w0 = apply_signs4(qtab_dev::iq3xxs_grid[qs[2 * l]], s);
+    w1 = apply_signs4(qtab_dev::iq3xxs_grid[qs[2 * l + 1]], s >> 4);
+    sc = h2f(b) * (0.5f + (a >> 28)) * 0.5f;
+  }
+};
+template <> struct QChunk<QT_IQ3_S> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint8_t* qs = b + 2 + 8 * ib;
+    const uint32_t qh = b[66 + ib];
+    const uint32_t s = b[74 + 4 * ib + l];
+    w0 = apply_signs4(qtab_dev::iq3s_grid[qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256)], s);
+    w1 = apply_signs4(qtab_dev::iq3s_grid[qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)], s >> 4);
+    sc = h2f(b) * (1 + 2 * ((b[106 + ib / 2] >> (4 * (ib & 1))) & 0xf));
+  }
+};
+template <> struct QChunk<QT_IQ1_S> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint32_t qh = ld16(b + 34 + 2 * ib);
+    const int s = (qh & 0x8000) ? -1 : 1;
+    const uint64_t g = qtab_dev::iq1s_grid[b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)];
+    w0 = iq1_fold((uint32_t)g, s);
+    w1 = iq1_fold((uint32_t)(g >> 32), s);
+    sc = h2f(b) * (2 * ((qh >> 12) & 7) + 1) * 0.125f;
+  }
+};
+template <> struct QChunk<QT_IQ1_M> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint16_t* scp = (const uint16_t*)(b + 48);
+    const uint16_t u = (scp[0] >> 12) | ((scp[1] >> 8) & 0x00f0) | ((scp[2] >> 4) & 0x0f00) | (scp[3] & 0xf000);
+    const float d = __half2float(__ushort_as_half(u));
+    const uint32_t h = b[32 + 2 * ib + l / 2];
+    const uint32_t idx = b[4 * ib + l] | ((l & 1) ? ((h << 4) & 0x700) : ((h << 8) & 0x700));
+    const int s = (h & ((l & 1) ? 0x80 : 0x08)) ? -1 : 1;
+    const uint64_t g = qtab_dev::iq1s_grid[idx];
+    w0 = iq1_fold((uint32_t)g, s);
+    w1 = iq1_fold((uint32_t)(g >> 32), s);
+    sc = d * (2 * ((scp[ib / 2] >> (6 * (ib % 2) + (l < 2 ? 0 : 3))) & 0x7) + 1) * 0.125f;
+  }
+};
+template <> struct QChunk<QT_IQ4_XS> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const uint32_t sh = ld16(b + 2);
+    const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+    const uint32_t* tab = (const uint32_t*)qtab_dev::kvalues_iq4nl;
+    const uint32_t t[4] = {tab[0], tab[1], tab[2], tab[3]};
+    const uint8_t* qs = b + 8 + 16 * ib + 8 * (l & 1);
+    const int shift = 4 * (l >> 1);
+    w0 = lut16((ld32a4(qs) >> shift) & 0x0F0F0F0F, t);
+    w1 = lut16((ld32a4(qs + 4) >> shift) & 0x0F0F0F0F, t);
+    sc = h2f(b) * (ls - 32);
+  }
+};
+template <> struct QChunk<QT_Q6_K> {
+  static constexpr bool OK = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int g, int l, uint32_t& w0, uint32_t& w1, float& sc) {
+    const int h = g / 4, r = g % 4;
+    const uint8_t* ql = b + 64 * h + (r & 1) * 32 + 8 * l;
+    const uint8_t* qh = b + 128 + 32 * h + 8 * l;
+    const int lsh = (r >= 2) ? 4 : 0;
+    w0 = sub32_bytes(((ld32a2(ql) >> lsh) & 0x0F0F0F0Fu) | (((ld32a2(qh) >> (2 * r)) & 0x03030303u) << 4));
+    w1 = sub32_bytes(((ld32a2(ql + 4) >> lsh) & 0x0F0F0F0Fu) | (((ld32a2(qh + 4) >> (2 * r)) & 0x03030303u) << 4));
+    sc = h2f(b + 208) * ((const int8_t*)(b + 192 + 8 * h + 2 * r))[l / 2];
+  }
+};
+
+constexpr int TC_WARPS = 8;  // split-K: the warps of a block share a row tile and split the K range
+template <int T, int B, int RT>
+__global__ void __launch_bounds__(TC_WARPS * 32)
+    k_mmv_tc(const uint8_t* __restrict__ W, size_t rb, int K, int N, const int8_t* __restrict__ xq,
+             const float* __restrict__ xd, float* __restrict__ y, int ldy, int acc) {
+  constexpr int SC = QDec<T>::SCALES, BB = QDec<T>::BB, CPS = 4 / SC;  // chunks per scale group
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+  const int rbase = blockIdx.x * 8 * RT;
+  const int nsb = K / 32;
+  const int j0 = warp * nsb / TC_WARPS, j1 = (warp + 1) * nsb / TC_WARPS;
+  const uint8_t* wr[RT];
+#pragma unroll
+  for (int rt = 0; rt < RT; rt++) wr[rt] = W + (size_t)min(rbase + rt * 8 + g, N - 1) * rb;
+  float accv[RT][2];
+#pragma unroll
+  for (int rt = 0; rt < RT; rt++) accv[rt][0] = accv[rt][1] = 0.f;
+  const bool tv = g < B;
+  const int8_t* xp = xq + (size_t)(tv ? g : 0) * K + 8 * tq;
+  const float* xdp = xd + (size_t)(tv ? g : 0) * nsb;
+#pragma unroll 4
+  for (int j = j0; j < j1; j++) {
+    uint32_t a[4] = {0u, 0u, 0u, 0u};
+    float xs = 0.f;
+    if (tv) {
+      const uint2 v = __ldg((const uint2*)(xp + (size_t)j * 32));
+      a[0] = v.x;
+      a[2] = v.y;
+      xs = __ldg(xdp + j);
+    }
+#pragma unroll
+    for (int rt = 0; rt < RT; rt++) {
+      uint32_t w0, w1;
+      float sc;
+      QChunk<T>::dec(wr[rt] + (size_t)(j >> 3) * BB, j & 7, tq, w0, w1, sc);
+#pragma unroll
+      for (int h = 0; h < SC; h++) {
+        const bool mine = SC == 1 || tq / CPS == h;
+        int c[4] = {0, 0, 0, 0};
+        mma_tc_k32(c, a, mine ? w0 : 0u, mine ? w1 : 0u);
+        // C: (token g, weight rows 2tq / 2tq+1); their scales live in lanes 4*row + chunk
+        const float s0 = __shfl_sync(0xffffffffu, sc, 8 * tq + h * CPS);
+        const float s1 = __shfl_sync(0xffffffffu, sc, 8 * tq + 4 + h * CPS);
+        accv[rt][0] += (float)c[0] * s0 * xs;
+        accv[rt][1] += (float)c[1] * s1 * xs;
+      }
+    }
+  }
+  __shared__ float red[TC_WARPS][RT][2][32];
+#pragma unroll
+  for (int rt = 0; rt < RT; rt++) {
+    red[warp][rt][0][lane] = accv[rt][0];
+    red[warp][rt][1][lane] = accv[rt][1];
+  }
+  __syncthreads();
+  if (warp != 0 || !tv) return;
+#pragma unroll
+  for (int rt = 0; rt < RT; rt++) {
+    float v0 = 0.f, v1 = 0.f;
+#pragma unroll
+    for (int w2 = 0; w2 < TC_WARPS; w2++) { v0 += red[w2][rt][0][lane]; v1 += red[w2][rt][1][lane]; }
+    const int r = rbase + rt * 8 + 2 * tq;
+    float* o = y + (size_t)g * ldy + r;
+    if (r < N) o[0] = acc ? o[0] + v0 : v0;
+    if (r + 1 < N) o[1] = acc ? o[1] + v1 : v1;
+  }
+}
+
+// Variant 2: lanes decode whole 32-groups (coalesced row reads, the dp4a kernels' decoders), 4 lanes x
+// 4 consecutive groups per row; a shared-memory 4x4 transpose turns them into per-group fragments.
+template <int T, int B>
+__global__ void __launch_bounds__(TC_WARPS * 32)
+    k_mmv_tc2(const uint8_t* __restrict__ W, size_t rb, int K, int N, const int8_t* __restrict__ xq,
+              const float* __restrict__ xd, float* __restrict__ y, int ldy, int acc) {
+  using D = QDec<T>;
+  constexpr int SC = D::SCALES, CPS = 4 / SC;
+  constexpr bool FOLD = T == QT_IQ1_S || T == QT_IQ1_M;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
+  const int rbase = blockIdx.x * 8;
+  const int nsb = K / 32;
+  // warps take interleaved 4-group strips so a block streams each row front to back
+  __shared__ uint2 smw[TC_WARPS][8][4][4];   // [warp][row][group][chunk]
+  __shared__ float sms[TC_WARPS][8][4][4];
+  __shared__ float red[TC_WARPS][2][32];
+  const uint8_t* wr = W + (size_t)min(rbase + g, N - 1) * rb;
+  float a0 = 0.f, a1 = 0.f;
+  const bool tv = g < B;
+  const int8_t* xp = xq + (size_t)(tv ? g : 0) * K + 8 * tq;
+  const float* xdp = xd + (size_t)(tv ? g : 0) * nsb;
+  for (int j = 4 * warp; j < nsb; j += 4 * TC_WARPS) {
+    const int jg = j + tq;
+    W32 w;
+    if (jg < nsb) {
+      D::dec(wr + (size_t)(jg >> 3) * D::BB, jg & 7, w);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; i++) w.w[i] = 0;
+#pragma unroll
+      for (int l = 0; l < 4; l++) w.sc[l] = w.off[l] = 0.f;
+    }
+#pragma unroll
+    for (int l = 0; l < 4; l++) {
+      uint32_t c0 = (uint32_t)w.w[2 * l], c1 = (uint32_t)w.w[2 * l + 1];
+      float scl = w.sc[l];
+      if constexpr (FOLD) {  // w + off/sc = w +- 1/8: fold into 8w +- 1 with scale / 8
+        const int sg = w.off[l] < 0.f ? -1 : 1;
+        c0 = iq1_fold(c0, sg);
+        c1 = iq1_fold(c1, sg);
+        scl *= 0.125f;
+      }
+      smw[warp][g][tq][l] = make_uint2(c0, c1);
+      sms[warp][g][tq][l] = scl;
+    }
+    __syncwarp();
+#pragma unroll
+    for (int s = 0; s < 4; s++) {
+      if (j + s >= nsb) break;
+      uint32_t a[4] = {0u, 0u, 0u, 0u};
+      float xs = 0.f;
+      if (tv) {
+        const uint2 v = __ldg((const uint2*)(xp + (size_t)(j + s) * 32));
+        a[0] = v.x;
+        a[2] = v.y;
+        xs = __ldg(xdp + j + s);
+      }
+      const uint2 bw = smw[warp][g][s][tq];
+#pragma unroll
+      for (int h = 0; h < SC; h++) {
+        const bool mine = SC == 1 || tq / CPS == h;
+        int c[4] = {0, 0, 0, 0};
+        mma_tc_k32(c, a, mine ? bw.x : 0u, mine ? bw.y : 0u);
+        a0 += (float)c[0] * sms[warp][2 * tq][s][h * CPS] * xs;
+        a1 += (float)c[1] * sms[warp][2 * tq + 1][s][h * CPS] * xs;
+      }
+    }
+    __syncwarp();
+  }
+  red[warp][0][lane] = a0;
+  red[warp][1][lane] = a1;
+  __syncthreads();
+  if (warp != 0 || !tv) return;
+  float v0 = 0.f, v1 = 0.f;
+#pragma unroll
+  for (int w2 = 0; w2 < TC_WARPS; w2++) { v0 += red[w2][0][lane]; v1 += red[w2][1][lane]; }
+  const int r = rbase + 2 * tq;
+  float* o = y + (size_t)g * ldy + r;
+  if (r < N) o[0] = acc ? o[0] + v0 : v0;
+  if (r + 1 < N) o[1] = acc ? o[1] + v1 : v1;
+}
+
+template <int T>
+static bool launch_mmv_tc(const uint8_t* w, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B,
+                          float* y, int ldy, bool acc, cudaStream_t s) {
+  static const int mode = getenv("QE_MMV_TC") ? atoi(getenv("QE_MMV_TC")) : 0;
+  constexpr bool tc2_ok = T != QT_Q2_K && T != QT_Q4_K;  // min terms not foldable
+  if constexpr (tc2_ok) {
+    if (mode == 2 && B >= 2 && B <= 8 && K % 32 == 0) {
+      const int grid = cdiv(N, 8);
+      switch (B) {
+#define CASE(n) case n: k_mmv_tc2<T, n><<<grid, TC_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;
+        CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+      }
+      return true;
+    }
+  }
+  if constexpr (!QChunk<T>::OK) {
+    return false;
+  } else {
+    if (mode != 1 || B < 2 || B > 8 || K % 32) return false;
+    constexpr int RT = 1;
+    const int grid = cdiv(N, 8 * RT);
+    switch (B) {
+#define CASE(n) case n: k_mmv_tc<T, n, RT><<<grid, TC_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;
+      CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+    }
+    return true;
+  }
+}
+
+// =============================================================================================
 // Matrix-vector (small batch) product: one warp per output row.
 // =============================================================================================
 constexpr int MMV_WARPS = 8;
@@ -631,6 +949,7 @@ template <int T>
 static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd,
                          int B, float* y, int ldy, bool acc, cudaStream_t s) {
   const uint8_t* w = (const uint8_t*)W;
+  if (launch_mmv_tc<T>(w, rb, K, N, xq, xd, B, y, ldy, acc, s)) return;
   const dim3 block(MMV_WARPS * 32);
   constexpr bool smem_ok = !(T == QT_IQ1_S || T == QT_IQ1_M || T == QT_IQ2_XXS);
   if (mmv_mode() == 0 && smem_ok && B >= 2 && (size_t)B * K <= 24576) {

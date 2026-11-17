@@ -438,8 +438,12 @@ void Generator::step(std::vector<int>& out) {
   for (int i = 0; i < a; i++) committed().push_back(drafts_[i]);
   st_.t_sample += qe_now() - tv;
   tv = qe_now();
+  static const bool hp = getenv("QE_HPROF") != nullptr;
+  static double hp_rb = 0, hp_d1 = 0, hp_ch = 0, hp_n = 0;
   if (nd > 0) m_.rollback(a + 1);  // commit the accepted prefix of the verify pass
   m_.set_carry_row(a);
+  if (hp) { m_.sync(); hp_rb += qe_now() - tv; }
+  const double hp1 = qe_now();
   // MTP: pairs (h_{pos+i}, x_{pos+i+1}) for i = 0..a  ->  next drafts
   int toks[8];
   for (int i = 0; i < a; i++) toks[i] = drafts_[i];
@@ -450,6 +454,7 @@ void Generator::step(std::vector<int>& out) {
   st_.generated += a + 1;
   float conf = 1.f;
   const int d = m_.mtp_draft(0, toks, a + 1, pos_ - a, g && draft_pmin_ > 0 ? &conf : nullptr, g ? nullptr : mtp_logits_.data());
+  const double hp2 = qe_now();
   drafts_.clear();
   dq_.clear();
   last_ng_ = false;
@@ -489,6 +494,12 @@ void Generator::step(std::vector<int>& out) {
     }
   }
   if (drafts_.empty() && conf >= draft_pmin_) make_drafts(d, !g);
+  if (hp) {
+    hp_d1 += hp2 - hp1; hp_ch += qe_now() - hp2; hp_n += 1;
+    if ((int)hp_n % 100 == 0)
+      fprintf(stderr, "[hprof] step: rollback %.3f ms, mtp first draft %.3f ms, chain %.3f ms (%.2f drafts/step)\n",
+              hp_rb / hp_n * 1e3, hp_d1 / hp_n * 1e3, hp_ch / hp_n * 1e3, (double)st_.drafted / st_.steps);
+  }
   st_.t_mtp += qe_now() - tv;
   st_.t_decode += qe_now() - t0;
 }
