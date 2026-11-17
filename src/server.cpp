@@ -360,6 +360,15 @@ struct Server {
     const int budget = opt.ctx - (int)ids.size() - 2;
     if (max_tokens < 0 || max_tokens > budget) max_tokens = budget;
     if (max_tokens <= 0) max_tokens = 1;
+    // thinking budget: when the reasoning reaches it, the thinking is closed (Qwen's recommended
+    // early-exit phrase + </think>) so an answer is always produced within max_tokens
+    int think_budget = -1;
+    if (chat && thinking) {
+      const Json& kw2 = b["chat_template_kwargs"];
+      const int reserve = std::min(2048, std::max(128, max_tokens / 4));
+      think_budget = (int)b.get_num("thinking_budget", kw2.get_num("thinking_budget", max_tokens - reserve));
+      think_budget = std::clamp(think_budget, 1, std::max(1, max_tokens - 64));
+    }
 
     const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++id_counter);
     const int64_t created = (int64_t)time(nullptr);
@@ -395,6 +404,7 @@ struct Server {
     const char* finish = "length";
     bool alive = true;
     ReqStat rsn;
+    int reused0 = 0;
     rsn.id = id;
     rsn.prompt_n = (int)ids.size();
     {
@@ -406,6 +416,7 @@ struct Server {
     out.push_back(gen->start(ids));
     {
       const auto& st0 = gen->stats();
+      reused0 = gen->reused();
       rsn.cache_n = gen->reused();
       rsn.prompt_n = (int)ids.size() - gen->reused();
       rsn.prefill_s = st0.t_prefill;
@@ -427,6 +438,8 @@ struct Server {
       content += piece_c;
       if (stream && alive && (!piece_r.empty() || !piece_c.empty())) alive = chunk(piece_r, piece_c, nullptr);
     };
+    GenStats pre{};  // stats of the generation segments before a forced end of thinking
+    bool forced = false;
     for (;;) {
       // stop on EOS tokens (do not emit them)
       bool stop = false;
@@ -449,6 +462,23 @@ struct Server {
         }
       }
       if (stop || (int)out.size() >= max_tokens || !alive) break;
+      if (think_budget > 0 && !forced && split.in_think && (int)out.size() >= think_budget) {
+        // close the reasoning: feed the closing text as a prompt continuation (state is reused)
+        forced = true;
+        const std::vector<int> fx =
+            tok->encode("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n");
+        const GenStats sx = gen->stats();
+        pre.steps += sx.steps; pre.drafted += sx.drafted; pre.accepted += sx.accepted; pre.generated += sx.generated;
+        pre.t_prefill += sx.t_prefill; pre.t_decode += sx.t_decode;
+        std::vector<int> cont = ids;
+        cont.insert(cont.end(), out.begin(), out.end());
+        cont.insert(cont.end(), fx.begin(), fx.end());
+        out.insert(out.end(), fx.begin(), fx.end());
+        QE_LOG("[server] %s: thinking budget %d reached, closing the reasoning\n", id.c_str(), think_budget);
+        out.push_back(gen->start(cont));
+        pre.t_decode += gen->stats().t_prefill;  // the forced tokens count as decode time
+        continue;
+      }
       gen->step(out);
       {
         const auto& sx = gen->stats();
@@ -462,16 +492,22 @@ struct Server {
       }
     }
     if (std::string(finish) != "stop") flush(true);
-    const auto& st = gen->stats();
+    GenStats st = gen->stats();
+    if (forced) {
+      st.steps += pre.steps; st.drafted += pre.drafted; st.accepted += pre.accepted;
+      st.generated += pre.generated;
+      st.t_prefill = pre.t_prefill;
+      st.t_decode += pre.t_decode;
+    }
     Json usage = Json::object();
     usage["prompt_tokens"] = (int)ids.size();
     usage["completion_tokens"] = (int)out.size();
     usage["total_tokens"] = (int)(ids.size() + out.size());
     Json timings = Json::object();
-    timings["prompt_n"] = (int)ids.size() - gen->reused();
-    timings["cache_n"] = gen->reused();
+    timings["prompt_n"] = (int)ids.size() - reused0;
+    timings["cache_n"] = reused0;
     timings["prompt_ms"] = st.t_prefill * 1e3;
-    timings["prompt_per_second"] = (ids.size() - gen->reused()) / std::max(st.t_prefill, 1e-9);
+    timings["prompt_per_second"] = (ids.size() - reused0) / std::max(st.t_prefill, 1e-9);
     timings["predicted_n"] = (int)out.size();
     timings["predicted_ms"] = st.t_decode * 1e3;
     timings["predicted_per_second"] = std::max(0, st.generated - 1) / std::max(st.t_decode, 1e-9);
@@ -505,7 +541,7 @@ struct Server {
       }
     }
     QE_LOG("[server] %s: prompt %zu (+%d cached) in %.2fs, gen %zu tok %.2f tok/s, mtp %d/%d, finish=%s\n", id.c_str(),
-           ids.size() - gen->reused(), gen->reused(), st.t_prefill, out.size(),
+           ids.size() - reused0, reused0, st.t_prefill, out.size(),
            std::max(0, st.generated - 1) / std::max(st.t_decode, 1e-9), st.accepted, st.drafted, finish);
     if (stream) {
       if (alive) {
