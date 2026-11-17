@@ -850,7 +850,7 @@ void Model::reset() {
 // next pass, so the copy engine never waits for compute unless the ring is full.
 void Model::issue_copy(int slot, int li) {
   Layer& L = layers_[li];
-  const size_t bytes = stream_full_ ? L.stream_bytes_full : L.stream_bytes_gpu;
+  const size_t bytes = (stream_full_ || !L.hyb_on) ? L.stream_bytes_full : L.stream_bytes_gpu;
   QE_ASSERT(bytes <= slot_bytes_);
   CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, slot_free_[slot], 0));
   if (gprof_on_ && bytes) CUDA_CHECK(cudaEventRecord(cp_ev(), copy_stream_));
@@ -914,7 +914,8 @@ const void* Model::mat_ptr(Layer* L, Mat& m, cudaStream_t s) {
 
 void Model::set_stream_mode(bool full) {
   if (!copy_stream_) return;
-  if (full == stream_full_ && nslots_ > 0) return;
+  if (full == stream_full_ && nslots_ > 0 && !hyb_dirty_) return;
+  hyb_dirty_ = false;
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
   stream_full_ = full;
@@ -925,7 +926,8 @@ void Model::set_stream_mode(bool full) {
   } else {
     size_t mx = 0;
     for (int il = 0; il < cfg_.n_layer; il++)
-      if (layers_[il].ffn_streamed) mx = std::max(mx, layers_[il].stream_bytes_gpu);
+      if (layers_[il].ffn_streamed)
+        mx = std::max(mx, layers_[il].hyb_on ? layers_[il].stream_bytes_gpu : layers_[il].stream_bytes_full);
     mx = (mx + 255) / 256 * 256;
     nslots_ = (int)std::clamp<size_t>(mx ? total / mx : 2, 2, kMaxSlots);
     slot_bytes_ = total / nslots_ / 256 * 256;
@@ -1192,7 +1194,7 @@ void Model::layer_ffn(int il, int T) {
     return;
   }
   const int r = L.cpu_rows, Ng = c.n_ff - r;
-  const bool hybrid = !stream_full_ && r > 0 && !L.borrowed_dev;
+  const bool hybrid = !stream_full_ && r > 0 && !L.borrowed_dev && L.hyb_on;
   if (hybrid) {  // hand the normalized input to the CPU workers
     CUDA_CHECK(cudaMemcpyAsync(hx_in_, xn_, (size_t)T * c.n_embd * 4, cudaMemcpyDeviceToHost, s));
     if (cuStreamWriteValue32((CUstream)s, dflags_, L.job_seq, CU_STREAM_WRITE_VALUE_DEFAULT) != CUDA_SUCCESS)
@@ -1909,17 +1911,40 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
   bool use_cpu = pool_ && n <= kCpuMaxB;
   int dm = -1;
   if (use_cpu) {
+    // level k: k/4 of the hybrid-capable streamed layers keep their CPU row slice (evenly spread),
+    // the rest stream whole layers; the fastest level is kept, its neighbours re-measured now and then
     static const int force = getenv("QE_CPU_MODE") ? atoi(getenv("QE_CPU_MODE")) : -1;
-    if (force == 0 || force == 1) {
-      dm = force;
-    } else {
-      const int best = dm_cnt_[0] < 3 ? 0 : dm_cnt_[1] < 3 ? 1 : (dm_ema_[0] <= dm_ema_[1] ? 0 : 1);
-      if (++dm_pass_ % 128 == 0) dm_explore_ = 3;
-      dm = dm_explore_ > 0 ? 1 - best : best;
+    if (force == 0) dm = 0;
+    else if (force == 1) dm = kDmLevels - 1;
+    else if (force >= 2 && force < 2 + kDmLevels) dm = force - 2;
+    else {
+      int best = -1;
+      for (int k = 0; k < kDmLevels && best < 0; k++)
+        if (dm_cnt_[k] < 3 && (k == 0 || k == kDmLevels - 1 || dm_cnt_[0] >= 3)) best = k;
+      if (best < 0) {
+        best = 0;
+        for (int k = 1; k < kDmLevels; k++)
+          if (dm_cnt_[k] >= 3 && dm_ema_[k] < dm_ema_[best]) best = k;
+      }
+      if (++dm_pass_ % 96 == 0) dm_explore_ = 3, dm_dir_ = -dm_dir_;
+      dm = dm_explore_ > 0 ? std::clamp(best + dm_dir_, 0, kDmLevels - 1) : best;
       if (dm_explore_ > 0) dm_explore_--;
-      if (dm != dm_last_) QE_DBG("[auto] decode CPU mode -> %s\n", dm ? "hybrid" : "gpu-only");
     }
-    use_cpu = dm == 1;
+    if (dm != dm_last_) {
+      int nh = 0, idx = 0;
+      for (int il = 0; il < c.n_layer; il++) nh += layers_[il].ffn_streamed && layers_[il].cpu_rows > 0;
+      const int want = (nh * dm + (kDmLevels - 1) / 2) / (kDmLevels - 1);
+      for (int il = 0; il < c.n_layer; il++) {
+        Layer& L = layers_[il];
+        if (!(L.ffn_streamed && L.cpu_rows > 0)) continue;
+        // evenly spread: layer idx is hybrid iff floor((idx+1)*want/nh) > floor(idx*want/nh)
+        const bool on = nh > 0 && (idx + 1) * want / nh > idx * want / nh;
+        if (on != L.hyb_on) { L.hyb_on = on; hyb_dirty_ = true; }
+        idx++;
+      }
+      QE_DBG("[auto] decode CPU level %d/%d: %d of %d streamed layers hybrid\n", dm, kDmLevels - 1, want, nh);
+    }
+    use_cpu = dm > 0;
   }
   const bool dm_skip = dm != dm_last_;  // the first pass after a switch refills the ring: not timed
   dm_last_ = dm;
@@ -1933,7 +1958,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
   std::vector<std::pair<int, uint32_t>> jobs;
   if (use_cpu) {
     for (int il = 0; il < c.n_layer; il++)
-      if (layers_[il].ffn_streamed && layers_[il].cpu_rows > 0 && !layers_[il].borrowed_dev) {
+      if (layers_[il].ffn_streamed && layers_[il].cpu_rows > 0 && !layers_[il].borrowed_dev && layers_[il].hyb_on) {
         layers_[il].job_seq = ++seq_;
         jobs.emplace_back(il, layers_[il].job_seq);
       }

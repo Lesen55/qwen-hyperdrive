@@ -1061,10 +1061,13 @@ static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* x
     else k_mmv<T, 2, 1><<<cdiv(N, MMV_WARPS), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
     return;
   }
-  if (mmv_r4() && B >= 3 && B <= 4 && T != QT_IQ4_XS) {
-    if (B == 3) k_mmv<T, 3, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
-    else k_mmv<T, 4, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
-    return;
+  static const int r4max = getenv("QE_MMV_R4MAX") ? atoi(getenv("QE_MMV_R4MAX")) : 4;
+  if (mmv_r4() && B >= 3 && B <= r4max && T != QT_IQ4_XS) {
+    switch (B) {
+#define CASE(n) case n: k_mmv<T, n, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return;
+      CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+    }
   }
   const dim3 grid(cdiv(N, MMV_WARPS * 2));
   switch (B) {

@@ -93,6 +93,7 @@ struct Layer {
   uint8_t* borrowed_dev = nullptr;       // full copy of the block living in the KV pool tail (elastic KV)
   int gdn_idx = -1;                      // index among GDN layers (checkpoint layout)
   bool ffn_skip = false;                 // FFN dropped (--skip-ffn)
+  bool hyb_on = true;                    // decode: CPU computes its row slice (else whole layer streamed)
 };
 
 class Model {
@@ -241,8 +242,10 @@ class Model {
   qk::GdnBatch* gdn_tab_ = nullptr;  // per-GDN-layer pointers for the batched rollback
   int n_gdn_tab_ = 0;
   // online choice of the decode CPU mode (0 = GPU-only, 1 = hybrid)
-  double dm_ema_[2] = {0, 0};
-  int dm_cnt_[2] = {0, 0}, dm_pass_ = 0, dm_explore_ = 0, dm_last_ = -2;
+  static constexpr int kDmLevels = 5;
+  double dm_ema_[kDmLevels] = {};
+  int dm_cnt_[kDmLevels] = {}, dm_pass_ = 0, dm_explore_ = 0, dm_last_ = -2, dm_dir_ = 1;
+  bool hyb_dirty_ = false;
   bool fuse_ = true;              // decode: fused residual + norm + quantize kernels
   const float* pend_ = nullptr;   // deferred residual (x_ += pend_ in the next norm_in)
   void norm_in(const float* w, float* y, int T, bool quant);
