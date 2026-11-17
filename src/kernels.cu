@@ -2068,6 +2068,12 @@ static __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uin
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+static __device__ __forceinline__ void mma16816_h(uint32_t* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+               : "+r"(c[0]), "+r"(c[1])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 // 4 transposed 8x8 b16 matrices from shared memory (B fragments of m16n8k16 from row-major [k][n])
 static __device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const void* p) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
@@ -2220,23 +2226,34 @@ __global__ void __launch_bounds__(128, 1)
       l0 += s[nt][0] + s[nt][1];
       l1 += s[nt][2] + s[nt][3];
     }
-    // O += P V
+    // O += P V.  Within the tile (32 positions, P <= 1) the products are accumulated in f16 (2x the
+    // f32-accumulate tensor rate on GeForce Ampere), then added to the f32 accumulators.
+    {
+      uint32_t a[FA_BN / 16][4];
 #pragma unroll
-    for (int j = 0; j < FA_BN / 16; j++) {
-      uint32_t a[4];
-      a[0] = pack_h2(s[2 * j][0], s[2 * j][1]);
-      a[1] = pack_h2(s[2 * j][2], s[2 * j][3]);
-      a[2] = pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]);
-      a[3] = pack_h2(s[2 * j + 1][2], s[2 * j + 1][3]);
+      for (int j = 0; j < FA_BN / 16; j++) {
+        a[j][0] = pack_h2(s[2 * j][0], s[2 * j][1]);
+        a[j][1] = pack_h2(s[2 * j][2], s[2 * j][3]);
+        a[j][2] = pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]);
+        a[j][3] = pack_h2(s[2 * j + 1][2], s[2 * j + 1][3]);
+      }
       // lane -> (matrix, row): positions j*16 + (mi&1)*8 + row, dims base + (mi>>1)*8
       const int mi = lane >> 3, rr = lane & 7;
-      const __half* vrow = Vs + (j * 16 + (mi & 1) * 8 + rr) * FA_QLD + (mi >> 1) * 8;
+      const __half* vrow = Vs + ((mi & 1) * 8 + rr) * FA_QLD + (mi >> 1) * 8;
 #pragma unroll
       for (int dn = 0; dn < 32; dn += 2) {
-        uint32_t b[4];
-        ldsm_x4_t(b, vrow + dn * 8);
-        mma16816(o[dn], a, b[0], b[1]);
-        mma16816(o[dn + 1], a, b[2], b[3]);
+        uint32_t c0[2] = {0u, 0u}, c1[2] = {0u, 0u};
+#pragma unroll
+        for (int j = 0; j < FA_BN / 16; j++) {
+          uint32_t b[4];
+          ldsm_x4_t(b, vrow + j * 16 * FA_QLD + dn * 8);
+          mma16816_h(c0, a[j], b[0], b[1]);
+          mma16816_h(c1, a[j], b[2], b[3]);
+        }
+        const float2 p0 = __half22float2(*(__half2*)&c0[0]), p1 = __half22float2(*(__half2*)&c0[1]);
+        const float2 q0 = __half22float2(*(__half2*)&c1[0]), q1 = __half22float2(*(__half2*)&c1[1]);
+        o[dn][0] += p0.x; o[dn][1] += p0.y; o[dn][2] += p1.x; o[dn][3] += p1.y;
+        o[dn + 1][0] += q0.x; o[dn + 1][1] += q0.y; o[dn + 1][2] += q1.x; o[dn + 1][3] += q1.y;
       }
     }
   }
