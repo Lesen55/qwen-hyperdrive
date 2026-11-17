@@ -129,14 +129,14 @@ struct QDec<QT_IQ2_S> {
   static constexpr bool OFF = false;
   static __device__ __forceinline__ void dec(const uint8_t* b, int ib, W32& o) {
     const float d = h2f(b);
-    const uint8_t* qs = b + 2 + 4 * ib;
-    const uint8_t* signs = b + 2 + 32 + 4 * ib;
+    const uint32_t qs4 = ld32a2(b + 2 + 4 * ib);
+    const uint32_t sg4 = ld32a2(b + 2 + 32 + 4 * ib);
     const uint32_t qh = b[66 + ib];
     const uint32_t scb = b[74 + ib];
 #pragma unroll
     for (int l = 0; l < 4; l++) {
-      const uint64_t g = qtab_dev::iq2s_grid[qs[l] | ((qh << (8 - 2 * l)) & 0x300)];
-      const uint32_t s = signs[l];
+      const uint64_t g = qtab_dev::iq2s_grid[((qs4 >> (8 * l)) & 0xff) | ((qh << (8 - 2 * l)) & 0x300)];
+      const uint32_t s = sg4 >> (8 * l);
       o.w[2 * l] = apply_signs4((uint32_t)g, s);
       o.w[2 * l + 1] = apply_signs4((uint32_t)(g >> 32), s >> 4);
       o.sc[l] = d * (0.5f + ((scb >> (4 * (l / 2))) & 0xf)) * 0.25f;
@@ -168,14 +168,16 @@ struct QDec<QT_IQ3_S> {
   static constexpr bool OFF = false;
   static __device__ __forceinline__ void dec(const uint8_t* b, int ib, W32& o) {
     const float db = h2f(b) * (1 + 2 * ((b[106 + ib / 2] >> (4 * (ib & 1))) & 0xf));
-    const uint8_t* qs = b + 2 + 8 * ib;
+    const uint32_t qa = ld32a2(b + 2 + 8 * ib), qb = ld32a2(b + 2 + 8 * ib + 4);
     const uint32_t qh = b[66 + ib];
-    const uint8_t* signs = b + 74 + 4 * ib;
+    const uint32_t sg4 = ld32a2(b + 74 + 4 * ib);
 #pragma unroll
     for (int l = 0; l < 4; l++) {
-      const uint32_t g1 = qtab_dev::iq3s_grid[qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256)];
-      const uint32_t g2 = qtab_dev::iq3s_grid[qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)];
-      const uint32_t s = signs[l];
+      const uint32_t q2 = l < 2 ? qa : qb;
+      const int sh = 16 * (l & 1);
+      const uint32_t g1 = qtab_dev::iq3s_grid[((q2 >> sh) & 0xff) | ((qh << (8 - 2 * l)) & 256)];
+      const uint32_t g2 = qtab_dev::iq3s_grid[((q2 >> (sh + 8)) & 0xff) | ((qh << (7 - 2 * l)) & 256)];
+      const uint32_t s = sg4 >> (8 * l);
       o.w[2 * l] = apply_signs4(g1, s);
       o.w[2 * l + 1] = apply_signs4(g2, s >> 4);
       o.sc[l] = db;
@@ -191,10 +193,10 @@ struct QDec<QT_IQ1_S> {
     const uint32_t qh = ld16(b + 34 + 2 * ib);
     const float dl = h2f(b) * (2 * ((qh >> 12) & 7) + 1);
     const float delta = (qh & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
-    const uint8_t* qs = b + 2 + 4 * ib;
+    const uint32_t qs4 = ld32a2(b + 2 + 4 * ib);
 #pragma unroll
     for (int l = 0; l < 4; l++) {
-      const uint64_t g = qtab_dev::iq1s_grid[qs[l] | (((qh >> (3 * l)) & 7) << 8)];
+      const uint64_t g = qtab_dev::iq1s_grid[((qs4 >> (8 * l)) & 0xff) | (((qh >> (3 * l)) & 7) << 8)];
       o.w[2 * l] = (int)(uint32_t)g;
       o.w[2 * l + 1] = (int)(uint32_t)(g >> 32);
       o.sc[l] = dl;
@@ -1264,10 +1266,10 @@ template <> struct QInt<QT_IQ1_S> {
   static __device__ __forceinline__ float mfac(const uint8_t* b) { return h2f(b) * IQ1S_DELTA; }
   static __device__ __forceinline__ void dec(const uint8_t* b, int ib, WI& o) {
     const uint32_t qh = ld16(b + 34 + 2 * ib);
-    const uint8_t* qs = b + 2 + 4 * ib;
+    const uint32_t qs4 = ld32a2(b + 2 + 4 * ib);
 #pragma unroll
     for (int l = 0; l < 4; l++) {
-      const uint64_t g = qtab_dev::iq1s_grid[qs[l] | (((qh >> (3 * l)) & 7) << 8)];
+      const uint64_t g = qtab_dev::iq1s_grid[((qs4 >> (8 * l)) & 0xff) | (((qh >> (3 * l)) & 7) << 8)];
       o.w[2 * l] = (int)(uint32_t)g;
       o.w[2 * l + 1] = (int)(uint32_t)(g >> 32);
     }
