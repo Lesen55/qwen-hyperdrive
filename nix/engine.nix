@@ -64,6 +64,7 @@ let
 
     # install the test / benchmark tools too
     postInstall = ''
+      install -Dm755 ${../scripts/vk_device_report.sh} "$out/bin/vk-device-report"
       for t in qe_test_kernels qe_test_cpu qe_bench_attn qe_tokenize qe_dump qe_vk_test; do
         [ -x "$t" ] && install -Dm755 "$t" "$out/bin/$t"
       done
