@@ -4,6 +4,7 @@
 //   GET  /v1/models, /health
 //   GET  /            web UI (chat + live hardware / engine dashboard)
 //   GET  /api/stats   telemetry for the web UI
+//   GET  /api/search?q=...&n=5&fetch=3   web search (DuckDuckGo) + page text for the UI
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -21,6 +22,7 @@
 
 #include "chat.h"
 #include "hwmon.h"
+#include "websearch.h"
 #include "webui_html.h"
 #include "engine.h"
 #include "json.h"
@@ -29,6 +31,7 @@
 namespace {
 
 struct Request {
+  std::string target;
   std::string method, path;
   std::string body;
 };
@@ -58,6 +61,7 @@ bool read_request(int fd, Request& rq) {
   if (sp1 == std::string::npos || sp2 == std::string::npos) return false;
   rq.method = head.substr(0, sp1);
   rq.path = head.substr(sp1 + 1, sp2 - sp1 - 1);
+  rq.target = rq.path;  // with the query string
   const size_t q = rq.path.find('?');
   if (q != std::string::npos) rq.path.resize(q);
   size_t clen = 0;
@@ -112,6 +116,21 @@ struct Server {
   std::atomic<int> id_counter{0};
   int stop_ids[2] = {-1, -1};
   std::string skip_ffn_str;
+  std::mutex search_mu;
+  static std::string query_param(const std::string& path, const std::string& key, const std::string& def = "") {
+    const size_t q = path.find('?');
+    if (q == std::string::npos) return def;
+    size_t p = q + 1;
+    while (p < path.size()) {
+      size_t e = path.find('&', p);
+      if (e == std::string::npos) e = path.size();
+      const size_t eq = path.find('=', p);
+      if (eq != std::string::npos && eq < e && path.compare(p, eq - p, key) == 0 && eq - p == key.size())
+        return url_decode(path.substr(eq + 1, e - eq - 1));
+      p = e + 1;
+    }
+    return def;
+  }
 
   // ---- live engine telemetry (written by the generating thread, read by /api/stats) ----
   struct ReqStat {
@@ -128,6 +147,9 @@ struct Server {
     Model::KvInfo kv;
     int pos = 0;
     uint64_t total_gen = 0, total_prompt = 0, requests = 0;
+    // records and token-weighted averages (prefill: prompts >= 128 new tokens, decode: >= 32 tokens)
+    ReqStat best_prefill, best_decode;
+    double sum_pf_tok = 0, sum_pf_s = 0, sum_dec_tok = 0, sum_dec_s = 0;
   } live;
   const double t_boot = qe_now();
 
@@ -215,6 +237,10 @@ struct Server {
       e["requests"] = (double)live.requests;
       e["total_gen"] = (double)live.total_gen;
       e["total_prompt"] = (double)live.total_prompt;
+      e["best_prefill"] = rs(live.best_prefill);
+      e["best_decode"] = rs(live.best_decode);
+      e["avg_prefill_tps"] = live.sum_pf_s > 0 ? live.sum_pf_tok / live.sum_pf_s : -1.0;
+      e["avg_decode_tps"] = live.sum_dec_s > 0 ? live.sum_dec_tok / live.sum_dec_s : -1.0;
     }
     e["uptime_s"] = qe_now() - t_boot;
     j["engine"] = e;
@@ -258,6 +284,28 @@ struct Server {
       respond(fd, 200, kWebUi, "text/html; charset=utf-8");
     } else if (rq.method == "GET" && rq.path.rfind("/api/stats", 0) == 0) {
       respond(fd, 200, stats_json());
+    } else if (rq.method == "GET" && rq.path.rfind("/api/search", 0) == 0) {
+      const std::string q = query_param(rq.target, "q");
+      if (q.empty() || q.size() > 400) { respond(fd, 400, "{\"error\":{\"message\":\"q required\"}}"); close(fd); return; }
+      const int n = std::clamp(atoi(query_param(rq.target, "n", "6").c_str()), 1, 10);
+      const int nf = std::clamp(atoi(query_param(rq.target, "fetch", "3").c_str()), 0, 5);
+      const int mc = std::clamp(atoi(query_param(rq.target, "chars", "2500").c_str()), 200, 8000);
+      {
+        std::lock_guard<std::mutex> g(search_mu);  // one search at a time (public endpoint)
+        const auto rs = web_search(q, n, nf, (size_t)mc);
+        Json j = Json::object();
+        j["query"] = q;
+        j["results"] = Json::array();
+        for (auto& r : rs) {
+          Json o = Json::object();
+          o["title"] = r.title;
+          o["url"] = r.url;
+          o["snippet"] = r.snippet;
+          o["text"] = r.text;
+          j["results"].push_back(o);
+        }
+        respond(fd, 200, j.dump());
+      }
     } else if (rq.method == "GET" && rq.path == "/v1/models") {
       Json m = Json::object();
       m["id"] = model_name;
@@ -445,6 +493,16 @@ struct Server {
       live.requests++;
       live.total_gen += out.size();
       live.total_prompt += rsn.prompt_n;
+      if (rsn.prompt_n >= 128) {
+        live.sum_pf_tok += rsn.prompt_n;
+        live.sum_pf_s += rsn.prefill_s;
+        if (rsn.prefill_tps > live.best_prefill.prefill_tps) live.best_prefill = rsn;
+      }
+      if (rsn.gen_n >= 32 && rsn.decode_s > 0) {
+        live.sum_dec_tok += rsn.gen_n - 1;
+        live.sum_dec_s += rsn.decode_s;
+        if (rsn.decode_tps > live.best_decode.decode_tps) live.best_decode = rsn;
+      }
     }
     QE_LOG("[server] %s: prompt %zu (+%d cached) in %.2fs, gen %zu tok %.2f tok/s, mtp %d/%d, finish=%s\n", id.c_str(),
            ids.size() - gen->reused(), gen->reused(), st.t_prefill, out.size(),

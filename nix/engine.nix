@@ -6,6 +6,7 @@
   autoAddDriverRunpath,
   writeShellScriptBin,
   symlinkJoin,
+  curl,
 }:
 
 let
@@ -57,6 +58,8 @@ let
 
   # `llm-engine [server args]`: qwen35-server with the model defaulting to the Hugging Face cache copy
   launcher = writeShellScriptBin "llm-engine" ''
+    # curl is used by the web UI's search endpoint
+    export PATH="${curl}/bin:$PATH"
     # Free VRAM held by the hazkey IME server (systemd user unit) while the engine runs, and
     # restore it on exit.  Disable with LLM_ENGINE_STOP_HAZKEY=0.
     restore=0

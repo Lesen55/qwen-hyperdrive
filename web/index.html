@@ -61,6 +61,19 @@ details.think { margin: 4px 0 8px; border-left: 2px solid var(--line); padding-l
 details.think summary { cursor: pointer; font-size: 12px; }
 details.think div { white-space: pre-wrap; font-size: 13px; }
 .mstat { font: 11px var(--mono); color: var(--dim); margin-top: 6px; }
+.status { color: var(--dim); font-size: 13px; }
+.status::before { content: "●"; color: var(--warn); margin-right: 6px; animation: pulse 1s infinite; }
+.sources { margin-top: 8px; font-size: 12.5px; border-top: 1px dashed var(--line); padding-top: 6px; }
+.sources a { color: var(--acc2); text-decoration: none; }
+.sources a:hover { text-decoration: underline; }
+.sources div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sources span { color: var(--dim); }
+a.cite { color: var(--acc2); text-decoration: none; font-size: .85em; vertical-align: super; }
+.msg.user .web { font-size: 11px; color: var(--acc2); margin-top: 4px; }
+.rec { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 8px; }
+.rec div { background: var(--panel2); border-radius: 8px; padding: 6px 8px; }
+.rec .v { font: 700 15px var(--mono); }
+.rec .l { font-size: 11px; color: var(--dim); }
 .composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel); }
 .composer textarea { flex: 1; resize: none; min-height: 44px; max-height: 220px; font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
 .composer textarea:focus { outline: none; border-color: var(--acc2); }
@@ -105,6 +118,7 @@ canvas { width: 100%; height: 70px; display: block; }
       <button id="newBtn">＋ 新しいチャット</button>
       <select id="convSel"></select>
       <label><input type="checkbox" id="think"> 思考 (thinking)</label>
+      <label><input type="checkbox" id="web"> 🌐 Web検索</label>
       <label>温度 <input type="number" id="temp" min="0" max="2" step="0.1" value="0.7" style="width:64px"></label>
       <label>最大 <input type="number" id="maxTok" min="16" max="32768" step="16" value="2048" style="width:84px"></label>
       <button id="delBtn" title="このチャットを削除">🗑</button>
@@ -122,6 +136,12 @@ canvas { width: 100%; height: 70px; display: block; }
         <div><div class="v" id="bDecode">–</div><div class="l">decode tok/s</div></div>
         <div><div class="v" id="bPrefill">–</div><div class="l">prefill tok/s</div></div>
         <div><div class="v" id="bTtft">–</div><div class="l">TTFT</div></div>
+      </div>
+      <div class="rec">
+        <div><div class="v" id="rDec">–</div><div class="l">最速 decode tok/s</div></div>
+        <div><div class="v" id="rPf">–</div><div class="l">最速 prefill tok/s</div></div>
+        <div><div class="v" id="aDec">–</div><div class="l">平均 decode tok/s</div></div>
+        <div><div class="v" id="aPf">–</div><div class="l">平均 prefill tok/s</div></div>
       </div>
       <div class="kv" id="engKv"></div>
       <canvas id="cReq"></canvas>
@@ -217,10 +237,10 @@ function md(src) {
 // ---------------- conversations ----------------
 let convs = ls.get("hd.convs", []);
 let curId = ls.get("hd.cur", null);
-const settings = ls.get("hd.settings", { think: false, temp: 0.7, maxTok: 2048 });
-$("think").checked = settings.think; $("temp").value = settings.temp; $("maxTok").value = settings.maxTok;
-for (const id of ["think", "temp", "maxTok"]) $(id).onchange = () => {
-  settings.think = $("think").checked; settings.temp = +$("temp").value; settings.maxTok = +$("maxTok").value;
+const settings = Object.assign({ think: false, web: false, temp: 0.7, maxTok: 2048 }, ls.get("hd.settings", {}));
+$("think").checked = settings.think; $("web").checked = settings.web; $("temp").value = settings.temp; $("maxTok").value = settings.maxTok;
+for (const id of ["think", "web", "temp", "maxTok"]) $(id).onchange = () => {
+  settings.think = $("think").checked; settings.web = $("web").checked; settings.temp = +$("temp").value; settings.maxTok = +$("maxTok").value;
   ls.set("hd.settings", settings);
 };
 function save() { ls.set("hd.convs", convs.slice(-50)); ls.set("hd.cur", curId); }
@@ -246,9 +266,24 @@ function msgEl(m) {
   }
   const b = document.createElement("div");
   b.className = "body";
-  if (m.role === "user") b.textContent = m.content; else b.innerHTML = md(m.content || "");
+  if (m.role === "user") b.textContent = m.content; else b.innerHTML = cite(md(m.content || ""), m.sources);
   d.appendChild(b);
+  if (m.role === "user" && m.query) { const w = document.createElement("div"); w.className = "web"; w.textContent = "🌐 検索: " + m.query; d.appendChild(w); }
+  if (m.sources && m.sources.length) d.appendChild(sourcesEl(m.sources));
   if (m.stat) { const s = document.createElement("div"); s.className = "mstat"; s.textContent = m.stat; d.appendChild(s); }
+  return d;
+}
+function cite(html, src) {
+  if (!src || !src.length) return html;
+  return html.replace(/\[(\d{1,2})\]/g, (all, n) => {
+    const s = src[+n - 1];
+    return s ? `<a class="cite" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.title)}">[${n}]</a>` : all;
+  });
+}
+function sourcesEl(src) {
+  const d = document.createElement("div");
+  d.className = "sources";
+  d.innerHTML = "<span>出典</span>" + src.map((s, i) => `<div>[${i + 1}] <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title || s.url)}</a> <span>${esc(new URL(s.url).hostname)}</span></div>`).join("");
   return d;
 }
 function renderMsgs() {
@@ -278,6 +313,7 @@ async function send() {
   c.msgs.push({ role: "user", content: text });
   if (c.title === "新しいチャット") c.title = text.slice(0, 40);
   input.value = ""; input.style.height = "auto";
+  const um = c.msgs[c.msgs.length - 1];
   const am = { role: "assistant", content: "", reasoning: "" };
   c.msgs.push(am);
   save(); renderAll();
@@ -287,10 +323,21 @@ async function send() {
   let thinkDiv = null;
   ctrl = new AbortController();
   $("sendBtn").textContent = "停止";
+  if (settings.web) {
+    try {
+      await webContext(c, um, am, body, ctrl.signal);
+      save();
+      const ub = el.previousSibling;
+      if (ub && um.query) { const w = document.createElement("div"); w.className = "web"; w.textContent = "🌐 検索: " + um.query; ub.appendChild(w); }
+    } catch (e) {
+      if (e.name === "AbortError") { ctrl = null; $("sendBtn").textContent = "送信"; am.stat = "（停止しました）"; save(); renderMsgs(); return; }
+      body.innerHTML = `<div class="status">検索に失敗しました（${esc(e.message)}）。検索なしで回答します…</div>`;
+    }
+  }
   const t0 = performance.now();
   let tFirst = 0;
   const req = {
-    messages: c.msgs.slice(0, -1).map((m) => ({ role: m.role, content: m.content })),
+    messages: c.msgs.slice(0, -1).map((m) => ({ role: m.role, content: m.send || m.content })),
     stream: true, temperature: settings.temp, max_tokens: settings.maxTok,
     chat_template_kwargs: { enable_thinking: settings.think },
   };
@@ -309,7 +356,7 @@ async function send() {
       thinkDiv.querySelector("summary").textContent = am.content ? `思考 (${am.reasoning.length} 文字)` : "思考中…";
       if (am.content && thinkDiv.open && !thinkDiv.dataset.user) thinkDiv.open = false;
     }
-    body.innerHTML = md(am.content);
+    body.innerHTML = am.content ? cite(md(am.content), am.sources) : body.innerHTML;
     const near = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
     if (near) box.scrollTop = box.scrollHeight;
   };
@@ -351,8 +398,42 @@ async function send() {
     ctrl = null;
     $("sendBtn").textContent = "送信";
     if (!am.reasoning) delete am.reasoning;
+    if (!am.sources) delete am.sources;
     save(); renderMsgs();
   }
+}
+
+// ---------------- web search ----------------
+async function webContext(c, um, am, body, signal) {
+  const status = (t) => { body.innerHTML = `<div class="status">${esc(t)}</div>`; };
+  let query = um.content.replace(/\s+/g, " ").slice(0, 200);
+  const prev = c.msgs.slice(0, -2);
+  if (prev.length) {  // follow-up: let the model turn the conversation into a search query
+    status("検索クエリを作成中…");
+    const hist = prev.slice(-6).map((m) => (m.role === "user" ? "ユーザー: " : "アシスタント: ") + m.content.slice(0, 600)).join("\n");
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" }, signal,
+      body: JSON.stringify({
+        messages: [{ role: "user", content: `次の会話の最後の質問に答えるためのWeb検索クエリを1つ、検索語だけで1行に出力してください。\n\n${hist}\nユーザー: ${um.content.slice(0, 800)}` }],
+        max_tokens: 40, temperature: 0, chat_template_kwargs: { enable_thinking: false },
+      }),
+    });
+    const j = await r.json();
+    const q = (j.choices && j.choices[0].message.content || "").split("\n")[0].replace(/^["'「]|["'」]$/g, "").trim();
+    if (q) query = q.slice(0, 200);
+  }
+  status(`🔎 検索中: ${query}`);
+  const r = await fetch(`/api/search?q=${encodeURIComponent(query)}&n=6&fetch=3&chars=2500`, { signal });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  const res = (j.results || []).filter((x) => x.url);
+  um.query = query;
+  if (!res.length) { status("検索結果がありませんでした。知識だけで回答します…"); return; }
+  am.sources = res.map((x) => ({ title: x.title, url: x.url }));
+  const today = new Date().toISOString().slice(0, 10);
+  const ctx = res.map((x, i) => `[${i + 1}] ${x.title}\nURL: ${x.url}\n抜粋: ${x.snippet}` + (x.text ? `\n本文: ${x.text}` : "")).join("\n\n");
+  um.send = `【Web検索結果】(${today} 検索語: ${query})\n${ctx}\n\n上の検索結果を参考に回答してください。根拠にした結果は [1] のように番号で示してください。検索結果が質問と関係ない場合はそう述べ、自分の知識で答えてください。\n\n質問: ${um.content}`;
+  status(`${res.length} 件の結果を読み込みました。回答を生成中…`);
 }
 
 // ---------------- dashboard ----------------
@@ -420,6 +501,12 @@ async function poll() {
   $("bPrefill").textContent = ref && ref.prompt_n ? fmt(ref.prefill_tps, 0) : "–";
   $("bTtft").textContent = ref && ref.ttft_ms ? (ref.ttft_ms >= 1000 ? fmt(ref.ttft_ms / 1000, 2) + "s" : fmt(ref.ttft_ms, 0) + "ms") : "–";
   $("engUptime").textContent = "uptime " + dur(e.uptime_s);
+  $("rDec").textContent = e.best_decode && e.best_decode.decode_tps > 0 ? fmt(e.best_decode.decode_tps, 1) : "–";
+  $("rPf").textContent = e.best_prefill && e.best_prefill.prefill_tps > 0 ? fmt(e.best_prefill.prefill_tps, 0) : "–";
+  $("rDec").title = e.best_decode ? `${e.best_decode.id}: ${e.best_decode.gen_n} tok` : "";
+  $("rPf").title = e.best_prefill ? `${e.best_prefill.id}: ${e.best_prefill.prompt_n} tok` : "";
+  $("aDec").textContent = fmt(e.avg_decode_tps, 1);
+  $("aPf").textContent = fmt(e.avg_prefill_tps, 0);
   const acc = ref && ref.drafted ? (100 * ref.accepted) / ref.drafted : -1;
   const tps = ref && ref.steps ? (ref.gen_n - 1) / ref.steps : -1;
   $("engKv").innerHTML = kvHtml([
