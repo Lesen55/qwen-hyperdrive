@@ -60,6 +60,13 @@ int main(int argc, char** argv) {
     else if (a == "--no-elastic") opt.elastic_kv = false;
     else if (a == "--reserve") reserve = std::stoi(next());
     else if (a == "--draft") opt.draft_max = std::stoi(next());
+    else if (a == "--cache-keep") opt.cache_keep = std::stoi(next());
+    else if (a == "--cache-blocks") opt.cache_blocks = std::stoi(next());
+    else if (a == "--cache-host-mb") opt.cache_host_mb = std::stoi(next());
+    else if (a == "--skip-ffn") {
+      const std::string v = next();
+      for (size_t i = 0; i < v.size();) { opt.skip_ffn.push_back(std::stoi(v.substr(i))); i = v.find(',', i); if (i == std::string::npos) break; i++; }
+    }
     else if (a == "--vram-reserve") opt.vram_reserve_mb = std::stoul(next());
     else if (a == "--spec-relax") spec_relax = std::stof(next());
     else if (a == "--mtp-vocab") opt.mtp_vocab = std::stoi(next());

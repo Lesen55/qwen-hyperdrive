@@ -26,6 +26,10 @@ struct EngineOptions {
   bool use_mtp = true;
   bool elastic_kv = true;      // lend unused KV pool space to FFN weights
   int ck_slots = 8;
+  std::vector<int> skip_ffn;
+  int cache_keep = 1;          // inactive conversations kept in VRAM (if within cache_blocks)
+  int cache_blocks = 0;        // ... resident in VRAM with at most this many KV blocks (others: host RAM)
+  int cache_host_mb = 6144;    // host RAM for offloaded KV of inactive conversations (LRU beyond)   // lossy: layers whose FFN block is dropped (saves their PCIe/VRAM bytes)
   int mtp_vocab = 0;           // MTP draft head vocabulary subset (first ids + special tail), 0 = full            // prompt-cache state checkpoints kept in pinned host memory
   int draft_max = 3;           // MTP chained draft length (1..3)
   double cpu_frac = -1;         // fraction of streamed FFN rows computed on the CPU (<0: auto per layer)
@@ -88,6 +92,7 @@ struct Layer {
   const uint8_t* stream_host = nullptr;  // pinned host block
   uint8_t* borrowed_dev = nullptr;       // full copy of the block living in the KV pool tail (elastic KV)
   int gdn_idx = -1;                      // index among GDN layers (checkpoint layout)
+  bool ffn_skip = false;                 // FFN dropped (--skip-ffn)
 };
 
 class Model {
@@ -131,6 +136,8 @@ class Model {
   void ck_restore(int slot);     // host slot -> current state
   // capture a checkpoint of the state after the first `pos` tokens during the next forward()
   void set_capture(int pos, int slot) { cap_pos_ = pos; cap_slot_ = slot; }
+  void draft_vocab_add(const int* ids, int n);
+  void trim_cache();  // drop old cached sequences beyond the budget and compact the KV pool  // tokens the MTP draft head may propose
   // Elastic KV: reserve KV space for `npos` positions and lend the rest of the KV pool to
   // streamed FFN layers (evicted automatically if the context later grows).
   void prepare_context(int npos);
@@ -183,8 +190,12 @@ class Model {
   std::vector<int> borrowed_;
   struct SeqInfo {
     std::vector<int> blocks;  // logical -> physical KV block
+    std::vector<std::vector<uint8_t>> host;  // offloaded KV blocks (inactive conversation)
     uint64_t used = 0;
   };
+  size_t host_kv_bytes_ = 0;
+  void seq_offload(int id);
+  void seq_restore(int id);
   std::map<int, SeqInfo> seqs_;
   int cur_seq_ = -1, next_seq_ = 1;
   uint64_t clock_ = 0;
@@ -202,6 +213,12 @@ class Model {
   int n_gdn_ = 0;
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
   bool legacy16_ = false;
+  static constexpr int kDraftVocabCap = 131072;
+  std::vector<int> dv_host_;
+  std::vector<uint8_t> dv_has_;
+  std::vector<float> dv_tmp_;
+  int* dv_dev_ = nullptr;
+  bool dv_dirty_ = false;
   float* state_bk_host_ = nullptr;  // pinned backup of the GDN states for the fp16-GEMM guard
   void ensure_kv(int npos);
   void refresh_streamed();

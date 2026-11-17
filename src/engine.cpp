@@ -203,6 +203,7 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
       }
   }
   reused_ = p0;
+  m_.draft_vocab_add(prompt.data(), n);
   m_.prepare_context(n + reserve);
   const double t_prep = qe_now();
   history_ = prompt;
@@ -339,6 +340,7 @@ void Generator::step(std::vector<int>& out) {
     Dist p;
     for (;;) {
       sampler_.dist(logits_.data() + (size_t)a * V, V, history_, p);
+      for (auto& [id, pv] : p) m_.draft_vocab_add(&id, 1);  // learn the vocabulary in use
       if (a == nd) { s = sampler_.draw(p); break; }
       const int x = drafts_[a];
       const float px = prob_of(p, x), qx = prob_of(dq_[a], x);
@@ -381,6 +383,7 @@ void Generator::step(std::vector<int>& out) {
   toks[a] = s;
   pos_ += a + 1;
   last_ = s;
+  m_.draft_vocab_add(&s, 1);
   st_.generated += a + 1;
   float conf = 1.f;
   const int d = m_.mtp_draft(0, toks, a + 1, pos_ - a, g && draft_pmin_ > 0 ? &conf : nullptr, g ? nullptr : mtp_logits_.data());

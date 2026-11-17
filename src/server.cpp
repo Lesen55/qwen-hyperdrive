@@ -342,6 +342,13 @@ int main(int argc, char** argv) {
     else if (a == "--no-mtp") srv.opt.use_mtp = false;
     else if (a == "-v" || a == "--verbose") srv.opt.verbose = true;
     else if (a == "--spec-relax") srv.spec_relax = std::stof(next());
+    else if (a == "--cache-keep") srv.opt.cache_keep = std::stoi(next());
+    else if (a == "--cache-blocks") srv.opt.cache_blocks = std::stoi(next());
+    else if (a == "--cache-host-mb") srv.opt.cache_host_mb = std::stoi(next());
+    else if (a == "--skip-ffn") {
+      const std::string v = next();
+      for (size_t i = 0; i < v.size();) { srv.opt.skip_ffn.push_back(std::stoi(v.substr(i))); i = v.find(',', i); if (i == std::string::npos) break; i++; }
+    }
     else if (a == "--no-elastic") srv.opt.elastic_kv = false;
     else if (a == "-h" || a == "--help") {
       printf("usage: qwen35-server -m model.gguf [--host 127.0.0.1] [--port 8080] [-c 131072] [--kv q4|q8|f16]\n"

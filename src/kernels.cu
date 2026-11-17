@@ -619,6 +619,39 @@ static void launch_mmv_float(const void* W, size_t rb, int K, int N, const float
   }
 }
 
+// Gathered single-row matvec: y[i] = W[rows[i]] . x  (draft head over a vocabulary subset)
+template <int T>
+__global__ void __launch_bounds__(MMV_WARPS * 32)
+    k_mmv_rows(const uint8_t* __restrict__ W, size_t rb, int K, const int* __restrict__ rows, int N,
+               const int8_t* __restrict__ xq, const float* __restrict__ xd, float* __restrict__ y) {
+  using D = QDec<T>;
+  const int i = blockIdx.x * MMV_WARPS + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (i >= N) return;
+  const uint8_t* wr = W + (size_t)__ldg(rows + i) * rb;
+  const int nsb = K / 32;
+  float sum = 0.f;
+  for (int g = lane; g < nsb; g += 32) {
+    W32 w;
+    D::dec(wr + (size_t)(g >> 3) * D::BB, g & 7, w);
+    const int4* xp = (const int4*)(xq + (size_t)g * 32);
+    sum += dot_w32<D::OFF, D::SCALES>(w, __ldg(xp), __ldg(xp + 1)) * __ldg(xd + g);
+  }
+  sum = warp_sum(sum);
+  if (lane == 0) y[i] = sum;
+}
+void matvec_rows(uint32_t type, const void* W, size_t rb, int K, const int* rows, int N, const int8_t* xq,
+                 const float* xd, float* y, cudaStream_t s) {
+  const uint8_t* w = (const uint8_t*)W;
+  switch (type) {
+#define T(t) case t: k_mmv_rows<t><<<cdiv(N, MMV_WARPS), MMV_WARPS * 32, 0, s>>>(w, rb, K, rows, N, xq, xd, y); break;
+    T(QT_Q2_K) T(QT_Q4_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS)
+#undef T
+    default: QE_FATAL("matvec_rows: unsupported type %u", type);
+  }
+}
+
 void matvec(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq,
             const float* xd, const float* xf, int B, float* y, int ldy, bool acc, cudaStream_t s) {
   switch (type) {

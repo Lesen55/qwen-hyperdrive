@@ -59,6 +59,8 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 | `--no-elastic` | | 未使用 KV プールの FFN 層への貸し出しを無効化 |
 | `-v` | | 詳細ログ（キャッシュ・貸し出し・TTFT 内訳） |
 | `--vram-reserve` | 64 | 空けておく VRAM (MiB) |
+| `--skip-ffn i,j,..` | | 指定層の FFN を丸ごと省く（非可逆）。PCIe 転送量が 1 層あたり約 64 MB 減る。PPL 影響の小さい順は `bench-results/SKIP_FFN_PPL.txt`（例: 29,10 で PPL +0.3% / +8%、29,10,17,16 で +1.3% / +13%） |
+| `--cache-keep` / `--cache-host-mb` | 1 / 6144 | 非アクティブな会話の KV は VRAM から host RAM へ退避（VRAM は FFN 層の貸し出しに戻す）。戻ると書き戻してキャッシュ再開 |
 | `--spec-relax λ` | 1 | 投機デコードの採択を min(1, λp/q) に緩める（λ>1 で速くなる代わりに分布がわずかに MTP 側へ偏る。λ=4 で約 +13%） |
 
 開発: `nix develop` → `cmake -S . -B build -G Ninja && ninja -C build`。

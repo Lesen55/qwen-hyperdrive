@@ -293,9 +293,13 @@ void Model::plan_and_load() {
   }
   for (int il = nL - 1; il >= c.n_layer; il--)  // MTP FFN is used every draft step: keep resident
     for (Mat* m : {&layers_[il].ffn_gate, &layers_[il].ffn_up, &layers_[il].ffn_down}) prio.push_back(m);
+  // lossy option: FFN blocks of the listed layers are dropped entirely (never loaded or streamed)
+  for (int il : opt_.skip_ffn)
+    if (il >= 0 && il < c.n_layer) layers_[il].ffn_skip = true;
   // reserve streaming double-buffer (largest per-layer FFN group) before deciding residency
   size_t max_ffn_layer = 0, tot_ffn = 0;
   for (int il = 0; il < c.n_layer; il++) {
+    if (layers_[il].ffn_skip) continue;
     const size_t lb = layers_[il].ffn_gate.bytes + layers_[il].ffn_up.bytes + layers_[il].ffn_down.bytes;
     max_ffn_layer = std::max(max_ffn_layer, lb);
     tot_ffn += lb;
@@ -318,12 +322,16 @@ void Model::plan_and_load() {
       const Layer& L = layers_[il];
       return (int64_t)(L.ffn_gate.bytes + L.ffn_up.bytes + L.ffn_down.bytes);
     };
+    std::vector<int> live;  // layers that have an FFN
+    for (int il = 0; il < c.n_layer; il++)
+      if (!layers_[il].ffn_skip) live.push_back(il);
+    const int nlive = (int)live.size();
     std::vector<int> pick;
-    for (int k = c.n_layer; k >= 1; k--) {
+    for (int k = nlive; k >= 1; k--) {
       std::vector<int> cand;
       int64_t sum = 0;
       for (int i = 0; i < k; i++) {
-        const int il = std::min(c.n_layer - 1, (int)((i + 0.5) * c.n_layer / k));
+        const int il = live[std::min(nlive - 1, (int)((i + 0.5) * nlive / k))];
         if (!cand.empty() && cand.back() == il) continue;
         cand.push_back(il);
         sum += lbytes(il);
@@ -334,6 +342,7 @@ void Model::plan_and_load() {
     for (int il : pick) res[il] = 1;
     for (int il = 0; il < c.n_layer; il++) {
       Layer& L = layers_[il];
+      if (L.ffn_skip) continue;
       if (res[il]) {
         for (Mat* m : {&L.ffn_gate, &L.ffn_up, &L.ffn_down}) resident.push_back(m);
         n_res_ffn++;
@@ -585,6 +594,7 @@ void Model::plan_and_load() {
   attn_work_ = (float*)dalloc(attn_work_bytes_);
   t5_ = (float*)dalloc((size_t)kCpuMaxB * c.n_embd * 4);
   logits_dev_ = (float*)dalloc((size_t)qk::kMaxB * c.n_vocab * 4);
+  if (has_mtp() && opt_.mtp_vocab > 0) dv_dev_ = (int*)dalloc((size_t)kDraftVocabCap * 4);
   hcarry_ = (float*)dalloc((size_t)c.n_embd * 4);
   argmax_dev_ = (int*)dalloc(64 * 4);
   mtp_h_ = (float*)dalloc((size_t)c.n_embd * 4);
@@ -942,6 +952,7 @@ void Model::layer_ffn(int il, int T) {
   const Config& c = cfg_;
   Layer& L = layers_[il];
   cudaStream_t s = stream_;
+  if (L.ffn_skip) return;  // dropped by --skip-ffn (lossy)
   qk::rmsnorm(x_, L.post_norm, xn_, c.n_embd, T, c.eps, s);
   prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   if (!L.ffn_streamed) {
@@ -1107,33 +1118,52 @@ void Model::mtp_block(const float* hrows, const int* tokens, int T, int pos0) {
 // MTP draft head.  Drafts only need the likely tokens, so the logits are computed over a vocabulary
 // subset: the first `mtp_vocab` ids (BPE ids are roughly frequency ordered) plus the special-token
 // tail.  The draft distribution is defined on that subset, which keeps speculative sampling exact.
+// MTP draft head.  With a draft vocabulary (opt.mtp_vocab > 0) the logits are computed only for the
+// first mtp_vocab ids, the special-token tail and every token seen in the conversation (gathered rows
+// of the output head: ~1/8 of the bytes).  Drafts outside the subset are simply never proposed;
+// verification still uses the full head, so this only affects the acceptance rate.
+void Model::draft_vocab_add(const int* ids, int n) {
+  const Config& c = cfg_;
+  if (opt_.mtp_vocab <= 0) return;
+  if (dv_has_.empty()) {
+    dv_has_.assign(c.n_vocab, 0);
+    const int head = std::min(opt_.mtp_vocab, c.n_vocab);
+    for (int i = 0; i < head; i++) { dv_has_[i] = 1; dv_host_.push_back(i); }
+    for (int i = std::max(head, c.n_vocab - 320); i < c.n_vocab; i++) { dv_has_[i] = 1; dv_host_.push_back(i); }
+    dv_dirty_ = true;
+  }
+  for (int i = 0; i < n; i++) {
+    const int t = ids[i];
+    if (t < 0 || t >= c.n_vocab || dv_has_[t] || (int)dv_host_.size() >= kDraftVocabCap) continue;
+    dv_has_[t] = 1;
+    dv_host_.push_back(t);
+    dv_dirty_ = true;
+  }
+}
+
 int Model::mtp_finish(int n, float* conf, float* logits_host) {
   const Config& c = cfg_;
   // keep the normed MTP output of the last row for chaining
   CUDA_CHECK(cudaMemcpyAsync(mtp_h_, xn_ + (size_t)(n - 1) * c.n_embd, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
   prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
-  const int tail = 320;
-  const int head = std::clamp(opt_.mtp_vocab > 0 ? opt_.mtp_vocab : c.n_vocab, 1, c.n_vocab - tail);
-  const bool sub = head + tail < c.n_vocab;
   const float* hrow = xn_ + (size_t)(n - 1) * c.n_embd;
-  int nl = c.n_vocab;
+  const bool sub = !dv_host_.empty() && output_.dev;
+  const int nl = sub ? (int)dv_host_.size() : c.n_vocab;
   if (sub) {
-    Mat a = output_, b = output_;
-    a.N = head;
-    b.N = tail;
-    b.dev = (uint8_t*)output_.dev + (size_t)(c.n_vocab - tail) * output_.row_bytes;
-    linear(nullptr, a, hrow, 1, logits_dev_, head, false, stream_);
-    linear(nullptr, b, hrow, 1, logits_dev_ + head, tail, false, stream_);
-    nl = head + tail;
+    if (dv_dirty_) {
+      CUDA_CHECK(cudaMemcpyAsync(dv_dev_, dv_host_.data(), dv_host_.size() * 4, cudaMemcpyHostToDevice, stream_));
+      dv_dirty_ = false;
+    }
+    prepare_input(hrow, c.n_embd, 1, stream_);
+    qk::matvec_rows(output_.type, output_.dev, output_.row_bytes, c.n_embd, dv_dev_, nl, xq_, xd_, logits_dev_, stream_);
   } else {
     linear(nullptr, output_, hrow, 1, logits_dev_, c.n_vocab, false, stream_);
   }
   int d = 0;
   if (logits_host) {
     if (sub) {
-      CUDA_CHECK(cudaMemcpyAsync(logits_host, logits_dev_, (size_t)head * 4, cudaMemcpyDeviceToHost, stream_));
-      CUDA_CHECK(cudaMemcpyAsync(logits_host + (c.n_vocab - tail), logits_dev_ + head, (size_t)tail * 4, cudaMemcpyDeviceToHost, stream_));
-      std::fill(logits_host + head, logits_host + (c.n_vocab - tail), -INFINITY);
+      dv_tmp_.resize(nl);
+      CUDA_CHECK(cudaMemcpyAsync(dv_tmp_.data(), logits_dev_, (size_t)nl * 4, cudaMemcpyDeviceToHost, stream_));
     } else {
       CUDA_CHECK(cudaMemcpyAsync(logits_host, logits_dev_, (size_t)c.n_vocab * 4, cudaMemcpyDeviceToHost, stream_));
     }
@@ -1146,7 +1176,13 @@ int Model::mtp_finish(int n, float* conf, float* logits_host) {
   }
   CUDA_CHECK(cudaMemcpyAsync(&d, argmax_dev_, 4, cudaMemcpyDeviceToHost, stream_));
   CUDA_CHECK(cudaStreamSynchronize(stream_));
-  if (sub && d >= head) d = c.n_vocab - tail + (d - head);
+  if (sub) {
+    if (logits_host) {
+      std::fill(logits_host, logits_host + c.n_vocab, -INFINITY);
+      for (int i = 0; i < nl; i++) logits_host[dv_host_[i]] = dv_tmp_[i];
+    }
+    d = dv_host_[d];
+  }
   return d;
 }
 
@@ -1227,7 +1263,7 @@ int Model::alloc_block() {
     int victim = -1;
     uint64_t best = UINT64_MAX;
     for (auto& [id, si] : seqs_)
-      if (id != cur_seq_ && si.used < best) { best = si.used; victim = id; }
+      if (id != cur_seq_ && !si.blocks.empty() && si.used < best) { best = si.used; victim = id; }
     if (victim < 0) QE_FATAL("KV pool exhausted");
     QE_DBG("[kv] evicting cached sequence %d (%zu blocks)\n", victim, seqs_[victim].blocks.size());
     seq_drop(victim);
@@ -1262,13 +1298,45 @@ void Model::seq_select(int id) {
   if (id == cur_seq_) return;
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   cur_seq_ = id;
+  if (!seqs_[id].host.empty()) seq_restore(id);
   upload_btab();
+}
+
+// Inactive conversations keep their KV in host RAM instead of VRAM (where the space is lent to FFN
+// weights and speeds up every token); switching back copies it in again (~25 GB/s).
+void Model::seq_offload(int id) {
+  SeqInfo& si = seqs_[id];
+  if (si.blocks.empty()) return;
+  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  for (int b : si.blocks) {
+    si.host.emplace_back(kv_block_bytes_);
+    CUDA_CHECK(cudaMemcpy(si.host.back().data(), kv_pool_ + (size_t)b * kv_block_bytes_, kv_block_bytes_, cudaMemcpyDeviceToHost));
+    blk_owner_[b] = -1;
+    host_kv_bytes_ += kv_block_bytes_;
+  }
+  QE_DBG("[kv] offloaded sequence %d (%zu blocks) to host RAM\n", id, si.blocks.size());
+  si.blocks.clear();
+}
+
+void Model::seq_restore(int id) {
+  SeqInfo& si = seqs_[id];
+  QE_ASSERT(id == cur_seq_);
+  std::vector<std::vector<uint8_t>> host = std::move(si.host);
+  si.host.clear();
+  for (auto& h : host) {
+    const int b = alloc_block();
+    CUDA_CHECK(cudaMemcpy(kv_pool_ + (size_t)b * kv_block_bytes_, h.data(), kv_block_bytes_, cudaMemcpyHostToDevice));
+    si.blocks.push_back(b);
+    host_kv_bytes_ -= kv_block_bytes_;
+  }
+  QE_DBG("[kv] restored sequence %d (%zu blocks) from host RAM\n", id, si.blocks.size());
 }
 
 void Model::seq_drop(int id) {
   auto it = seqs_.find(id);
   if (it == seqs_.end()) return;
   for (int b : it->second.blocks) blk_owner_[b] = -1;
+  host_kv_bytes_ -= it->second.host.size() * kv_block_bytes_;
   seqs_.erase(it);
   if (cur_seq_ == id) cur_seq_ = -1;
 }
@@ -1301,9 +1369,62 @@ void Model::ck_restore(int slot) {
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
+// Cached (not current) sequences hold KV blocks that could otherwise hold lent FFN weights, which
+// speed up every decoded token.  Keep only the most recently used few (bounded in blocks) and pack
+// all live blocks to the bottom of the pool so the freed space can be lent again.
+void Model::trim_cache() {
+  std::vector<std::pair<uint64_t, int>> others;
+  for (auto& [id, si] : seqs_)
+    if (id != cur_seq_) others.emplace_back(si.used, id);
+  std::sort(others.rbegin(), others.rend());
+  int kept = 0;
+  size_t kept_blocks = 0;
+  for (auto [u, id] : others) {
+    SeqInfo& si = seqs_[id];
+    const size_t nb = si.blocks.size();
+    if (nb == 0) continue;
+    if (kept < opt_.cache_keep && kept_blocks + nb <= (size_t)opt_.cache_blocks) {
+      kept++;
+      kept_blocks += nb;
+    } else {
+      seq_offload(id);
+    }
+  }
+  // host budget: drop the least recently used offloaded conversations
+  for (auto it = others.rbegin(); it != others.rend() && host_kv_bytes_ > (size_t)opt_.cache_host_mb * MiB; ++it) {
+    if (!seqs_.count(it->second) || seqs_[it->second].host.empty()) continue;
+    QE_DBG("[kv] dropping cached sequence %d (host budget)\n", it->second);
+    seq_drop(it->second);
+  }
+  // compaction: move the highest used block into the lowest free one until no gap remains
+  bool moved = false;
+  for (;;) {
+    int lo = -1, hi = -1;
+    for (int b = 0; b < n_kv_blocks_; b++)
+      if (blk_owner_[b] < 0) { lo = b; break; }
+    for (int b = n_kv_blocks_ - 1; b >= 0; b--)
+      if (blk_owner_[b] >= 0) { hi = b; break; }
+    if (lo < 0 || hi < 0 || lo > hi) break;
+    const int owner = blk_owner_[hi];
+    auto& bl = seqs_[owner].blocks;
+    for (auto& x : bl)
+      if (x == hi) x = lo;
+    CUDA_CHECK(cudaMemcpyAsync(kv_pool_ + (size_t)lo * kv_block_bytes_, kv_pool_ + (size_t)hi * kv_block_bytes_,
+                               kv_block_bytes_, cudaMemcpyDeviceToDevice, stream_));
+    blk_owner_[lo] = owner;
+    blk_owner_[hi] = -1;
+    moved = true;
+  }
+  if (moved) {
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    upload_btab();
+  }
+}
+
 void Model::prepare_context(int npos) {
   npos = std::min(npos, opt_.ctx);
   ws_reclaim();  // re-plan lending after the KV borrow (decode will lend the workspace again)
+  if (opt_.elastic_kv) trim_cache();
   ensure_kv(npos);
   if (!opt_.elastic_kv) return;
   const size_t need = (size_t)(max_used_block() + 1) * kv_block_bytes_;
