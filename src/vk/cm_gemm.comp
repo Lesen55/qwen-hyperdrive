@@ -1,8 +1,12 @@
-// Prefill GEMM on matrix hardware (VK_KHR_cooperative_matrix, 16x16x16 f16 -> f32):
-// C[t][n] = sum_k X16[t][k] W16[n][k] with A = X16 (row-major, rows padded to 64 with zeros) and
-// B = W16 read as K x N column-major.  Workgroup tile 64 tokens x 128 rows = four 32x64 blocks; each
-// subgroup takes blocks gl_SubgroupID, +gl_NumSubgroups, ... (any subgroup size works) and keeps 2x4
-// accumulators (2 A + 4 B fragment loads per 8 MMAs).  The tile goes through shared memory so partial tiles are stored with bounds checks.
+// variants: cm_gemm_16x16x16:CM_M=16,CM_N=16,CM_K=16 cm_gemm_16x8x16:CM_M=16,CM_N=8,CM_K=16 cm_gemm_16x8x8:CM_M=16,CM_N=8,CM_K=8 cm_gemm_8x16x16:CM_M=8,CM_N=16,CM_K=16 cm_gemm_8x8x16:CM_M=8,CM_N=8,CM_K=16 cm_gemm_8x8x8:CM_M=8,CM_N=8,CM_K=8
+// Prefill GEMM on matrix hardware (VK_KHR_cooperative_matrix, f16 x f16 -> f32, M x N x K per MMA):
+// C[t][n] = sum_k X16[t][k] W16[n][k], A = X16 (tokens x k, row-major, rows padded with zeros),
+// B = W16 read as k x rows column-major.  Shape variants for each vendor's matrix unit: 16x16x16
+// (NVIDIA tensor cores, AMD RDNA3 WMMA), 8x16x16 (Intel Xe2 / Xe-HPG XMX via DPAS), 8x8x* (Mesa
+// lavapipe, small units).  Each subgroup computes a (2M tokens) x (4N rows) block with 2x4
+// accumulators; a workgroup tile is 2x2 blocks (4M x 8N), taken by subgroups gl_SubgroupID,
+// +gl_NumSubgroups, ... so any subgroup size works.  The tile goes through shared memory so partial
+// tiles are stored with bounds checks (and split-K slices without accumulation).
 #version 450
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
@@ -11,36 +15,42 @@
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer H16 { float16_t d[]; };
 layout(local_size_x = 128) in;
 layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
-shared float Cs[64 * 128];  // 32 KiB
-#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define CBT (2u * CM_M)
+#define CBR (4u * CM_N)
+#define CTT (2u * CBT)
+#define CTR (2u * CBR)
+shared float Cs[CTT * CTR];
+#define ACC coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator>
 void main() {
   H16 W = H16(pc.w);
   H16 X = H16(pc.x);
   F32 y = F32(pc.y);
-  const uint r0 = gl_WorkGroupID.x * 128u, c0 = gl_WorkGroupID.y * 64u;
-  const uint nk = pc.K / 16u;
-  const uint ks = gl_WorkGroupID.z * pc.kg, ke = min(nk, ks + pc.kg);  // kg: 16-wide k steps per slice
+  const uint r0 = gl_WorkGroupID.x * CTR, c0 = gl_WorkGroupID.y * CTT;
+  const uint nk = pc.K / CM_K;
+  const uint ks = gl_WorkGroupID.z * pc.kg, ke = min(nk, ks + pc.kg);  // kg: k steps per split slice
   for (uint b = gl_SubgroupID; b < 4u; b += gl_NumSubgroups) {
-    const uint bt = (b / 2u) * 32u, br = (b % 2u) * 64u;
+    const uint bt = (b / 2u) * CBT, br = (b % 2u) * CBR;
     ACC c[2][4];
     for (uint i = 0u; i < 2u; i++) for (uint j = 0u; j < 4u; j++) c[i][j] = ACC(0.0);
     const uint xa = (c0 + bt) * pc.K, wb = (r0 + br) * pc.K;
     for (uint k = ks; k < ke; k++) {
-      coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[2];
-      coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bm[4];
-      for (uint i = 0u; i < 2u; i++) coopMatLoad(a[i], X.d, xa + 16u * i * pc.K + k * 16u, pc.K, gl_CooperativeMatrixLayoutRowMajor);
-      for (uint j = 0u; j < 4u; j++) coopMatLoad(bm[j], W.d, wb + 16u * j * pc.K + k * 16u, pc.K, gl_CooperativeMatrixLayoutColumnMajor);
+      coopmat<float16_t, gl_ScopeSubgroup, CM_M, CM_K, gl_MatrixUseA> a[2];
+      coopmat<float16_t, gl_ScopeSubgroup, CM_K, CM_N, gl_MatrixUseB> bm[4];
+      for (uint i = 0u; i < 2u; i++)
+        coopMatLoad(a[i], X.d, xa + CM_M * i * pc.K + k * CM_K, pc.K, gl_CooperativeMatrixLayoutRowMajor);
+      for (uint j = 0u; j < 4u; j++)
+        coopMatLoad(bm[j], W.d, wb + CM_N * j * pc.K + k * CM_K, pc.K, gl_CooperativeMatrixLayoutColumnMajor);
       for (uint i = 0u; i < 2u; i++) for (uint j = 0u; j < 4u; j++) c[i][j] = coopMatMulAdd(a[i], bm[j], c[i][j]);
     }
     for (uint i = 0u; i < 2u; i++)
       for (uint j = 0u; j < 4u; j++)
-        coopMatStore(c[i][j], Cs, (bt + 16u * i) * 128u + br + 16u * j, 128u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(c[i][j], Cs, (bt + CM_M * i) * CTR + br + CM_N * j, CTR, gl_CooperativeMatrixLayoutRowMajor);
   }
   barrier();
   const bool split = gl_NumWorkGroups.z > 1u;
   const uint yoff = gl_WorkGroupID.z * pc.T * pc.ldy;
-  for (uint e = gl_LocalInvocationID.x; e < 64u * 128u; e += 128u) {
-    const uint t = c0 + e / 128u, n = r0 + e % 128u;
+  for (uint e = gl_LocalInvocationID.x; e < CTT * CTR; e += 128u) {
+    const uint t = c0 + e / CTR, n = r0 + e % CTR;
     if (t >= pc.T || n >= pc.N) continue;
     const uint o = t * pc.ldy + n;
     const float v = Cs[e];

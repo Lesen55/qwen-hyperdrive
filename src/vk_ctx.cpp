@@ -61,13 +61,40 @@ VkCtx::VkCtx() {
   }
   pdev_ = devs[pick];
 
+  uint32_t ne0 = 0;
+  vkEnumerateDeviceExtensionProperties(pdev_, nullptr, &ne0, nullptr);
+  std::vector<VkExtensionProperties> exts0(ne0);
+  vkEnumerateDeviceExtensionProperties(pdev_, nullptr, &ne0, exts0.data());
+  auto has_ext = [&](const char* n) {
+    for (auto& e : exts0)
+      if (!strcmp(e.extensionName, n)) return true;
+    return false;
+  };
   VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
   VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+  VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sgc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT};
+  VkPhysicalDeviceShaderCorePropertiesAMD amd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_AMD};
+  VkPhysicalDeviceShaderSMBuiltinsPropertiesNV nvsm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV};
   sg.pNext = &drv;
+  void** tail = &drv.pNext;
+  const bool sgc_ext = has_ext(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+  if (sgc_ext) { *tail = &sgc; tail = &sgc.pNext; }
+  if (has_ext(VK_AMD_SHADER_CORE_PROPERTIES_EXTENSION_NAME)) { *tail = &amd; tail = &amd.pNext; }
+  if (has_ext(VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME)) { *tail = &nvsm; tail = &nvsm.pNext; }
   VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
   p2.pNext = &sg;
   vkGetPhysicalDeviceProperties2(pdev_, &p2);
   device_name = p2.properties.deviceName;
+  vendor_id = p2.properties.vendorID;
+  device_id = p2.properties.deviceID;
+  driver_version = p2.properties.driverVersion;
+  if (amd.sType && amd.shaderEngineCount)
+    compute_units = amd.shaderEngineCount * amd.shaderArraysPerEngineCount * amd.computeUnitsPerShaderArray;
+  if (nvsm.shaderSMCount) compute_units = nvsm.shaderSMCount;
+  if (sgc_ext && (sgc.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+    sg_min = sgc.minSubgroupSize;
+    sg_max = sgc.maxSubgroupSize;
+  }
   driver_name = drv.driverName;
   integrated = p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
   subgroup_size = sg.subgroupSize;
@@ -123,13 +150,25 @@ VkCtx::VkCtx() {
       std::vector<VkCooperativeMatrixPropertiesKHR> cp(nc, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
       fn(pdev_, &nc, cp.data());
       for (auto& c : cp)
-        if (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 && c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-            c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
-            c.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && c.scope == VK_SCOPE_SUBGROUP_KHR)
-          coopmat = true;
+        QE_DBG("[vk] coopmat %ux%ux%u A%d B%d C%d R%d scope %d\n", c.MSize, c.NSize, c.KSize, (int)c.AType, (int)c.BType,
+               (int)c.CType, (int)c.ResultType, (int)c.scope);
+      for (auto& c : cp)
+        if (c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+            c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && c.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+            c.scope == VK_SCOPE_SUBGROUP_KHR)
+          cm_shapes.push_back({c.MSize, c.NSize, c.KSize});
+      coopmat = !cm_shapes.empty();
     }
   }
   if (coopmat) en.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+  VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
+  if (sg_min) {
+    VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    q.pNext = &sgcf;
+    vkGetPhysicalDeviceFeatures2(pdev_, &q);
+    sg_control = sgcf.subgroupSizeControl;
+    if (sg_control) en.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+  }
 
   VkPhysicalDeviceVulkan12Features on12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
   on12.bufferDeviceAddress = VK_TRUE;
@@ -137,6 +176,8 @@ VkCtx::VkCtx() {
   VkPhysicalDeviceCooperativeMatrixFeaturesKHR oncm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
   VkPhysicalDeviceFeatures2 on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
   on.pNext = &on12;
+  VkPhysicalDeviceSubgroupSizeControlFeaturesEXT onsg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT};
+  onsg.subgroupSizeControl = VK_TRUE;
   if (coopmat) {
     on12.shaderFloat16 = VK_TRUE;
     on12.vulkanMemoryModel = VK_TRUE;
@@ -144,6 +185,10 @@ VkCtx::VkCtx() {
     oncm.cooperativeMatrix = VK_TRUE;
     on12.pNext = &on11;
     on11.pNext = &oncm;
+  }
+  if (sg_control) {
+    onsg.pNext = on12.pNext;
+    on12.pNext = &onsg;
   }
   const float prio = 1.f;
   VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -166,6 +211,12 @@ VkCtx::VkCtx() {
       vram_heap_ = (int)i;
     }
 
+  for (uint32_t i = 0; i < mprops_.memoryTypeCount; i++) {
+    const auto f = mprops_.memoryTypes[i].propertyFlags;
+    if ((int)mprops_.memoryTypes[i].heapIndex == vram_heap_ && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+        (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+      rebar = true;
+  }
   VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   pci.queueFamilyIndex = qfam_;
@@ -271,7 +322,12 @@ VBuf VkCtx::alloc(size_t bytes, Mem kind, bool strict) {
     return vkAllocateMemory(dev_, &ai, nullptr, &b.mem) == VK_SUCCESS;
   };
   bool ok = false;
-  if (kind == Mem::Device) {
+  if (kind == Mem::DeviceMapped) {
+    const int t = rebar ? mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | hv, 0) : -1;
+    if (t >= 0 && (integrated || req.size <= vram_free() + (64u << 20)) && try_alloc(t)) ok = true;
+    kind = Mem::Device;
+  }
+  if (!ok && kind == Mem::Device) {
     const int t = mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
     ok = (integrated || req.size <= vram_free() + (64u << 20)) && try_alloc(t);
     if (ok) b.device_local = true;
@@ -307,8 +363,12 @@ void VkCtx::free(VBuf& b) {
 
 void VkCtx::warm_pipelines() {
   const double t0 = qe_now();
-  for (const auto& e : kSpv)
-    if (coopmat || strncmp(e.name, "cm_", 3)) pipeline(e.name);
+  for (const auto& e : kSpv) {
+    unsigned M, N, K;
+    if (sscanf(e.name, "cm_gemm_%ux%ux%u", &M, &N, &K) == 3 && !has_cm(M, N, K)) continue;
+    if (!strncmp(e.name, "mv_", 3) || !strncmp(e.name, "cm_", 3)) continue;  // tuned variants: created on use
+    pipeline(e.name);
+  }
   if (!cache_path_.empty()) {
     size_t n = 0;
     vkGetPipelineCacheData(dev_, cache_, &n, nullptr);
@@ -333,8 +393,15 @@ bool VkCtx::has_pipeline(const char* name) const {
   return false;
 }
 
-VkPipeline VkCtx::pipeline(const char* name) {
-  auto it = pipes_.find(name);
+bool VkCtx::has_cm(uint32_t M, uint32_t N, uint32_t K) const {
+  for (auto& c : cm_shapes)
+    if (c.M == M && c.N == N && c.K == K) return true;
+  return false;
+}
+
+VkPipeline VkCtx::pipeline(const char* name, const PipeOpt& opt) {
+  auto key = std::make_pair(std::string(name), opt);
+  auto it = pipes_.find(key);
   if (it != pipes_.end()) return it->second;
   const SpvEntry* sp = nullptr;
   for (const auto& e : kSpv)
@@ -351,10 +418,29 @@ VkPipeline VkCtx::pipeline(const char* name) {
   pci.stage.module = mod;
   pci.stage.pName = "main";
   pci.layout = layout_;
+  uint32_t sv[2];
+  VkSpecializationMapEntry me[2];
+  VkSpecializationInfo si{};
+  for (int i = 0; i < 2; i++) {
+    const int v = i ? opt.spec1 : opt.spec0;
+    if (v < 0) continue;
+    me[si.mapEntryCount] = {(uint32_t)i, si.mapEntryCount * 4u, 4};
+    sv[si.mapEntryCount++] = (uint32_t)v;
+  }
+  si.pMapEntries = me;
+  si.dataSize = si.mapEntryCount * 4u;
+  si.pData = sv;
+  if (si.mapEntryCount) pci.stage.pSpecializationInfo = &si;
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rs{
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+  if (opt.subgroup && sg_control && opt.subgroup >= sg_min && opt.subgroup <= sg_max) {
+    rs.requiredSubgroupSize = opt.subgroup;
+    pci.stage.pNext = &rs;
+  }
   VkPipeline p;
   VK_CHECK(vkCreateComputePipelines(dev_, cache_, 1, &pci, nullptr, &p));
   vkDestroyShaderModule(dev_, mod, nullptr);
-  pipes_[name] = p;
+  pipes_[key] = p;
   return p;
 }
 
@@ -379,10 +465,10 @@ void VkCtx::barrier() {
 }
 
 void VkCtx::dispatch(const char* name, const void* pc, uint32_t pc_size, uint32_t gx, uint32_t gy, uint32_t gz,
-                     bool bar) {
+                     bool bar, const PipeOpt& opt) {
   QE_ASSERT(recording_ && pc_size <= kPushBytes);
   if (!gx || !gy || !gz) return;
-  vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(name));
+  vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(name, opt));
   vkCmdPushConstants(cb_, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_size, pc);
   const bool prof = qpool_ && q_names_.size() < 4095;
   if (prof) vkCmdWriteTimestamp(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool_, 2 * (uint32_t)q_names_.size());

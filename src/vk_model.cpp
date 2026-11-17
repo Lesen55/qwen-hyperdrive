@@ -1,5 +1,9 @@
 #include "vk_model.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -12,7 +16,6 @@
 namespace {
 
 // push-constant blocks (must match the shaders; 64-bit addresses are uvec2 in GLSL)
-struct MvPC { uint64_t w, x, y, tab; uint32_t K, N, T, rb, ldx, ldy, acc, wide, kg; };
 struct NormPC { uint64_t x, res, w, y; uint32_t n; float eps; };
 struct HeadNormPC { uint64_t x, w; uint32_t hd, nh, hs, ts, mode; float eps; };
 struct RopePC { uint64_t x, cs; uint32_t nh, hs, ts, T, half; };
@@ -78,15 +81,48 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   const Config& c = cfg_;
   if (c.n_head / c.n_kv > 32) QE_FATAL("vulkan backend: GQA group of %d heads > 32", c.n_head / c.n_kv);
   vk_ = std::make_unique<VkCtx>();
-  QE_LOG("[hw] Vulkan device %s (%s), subgroup %u, VRAM %.1f GiB%s\n", vk_->device_name.c_str(),
-         vk_->driver_name.c_str(), vk_->subgroup_size, vk_->vram_total() / 1073741824.0,
-         vk_->integrated ? " (integrated: shared memory)" : "");
-  kv_q8_ = opt.kv_type != 0;
-  if (opt.kv_type == 2 || opt.kv_type == 3) QE_LOG("[plan] vulkan: KV cache q4/q3 not implemented, using q8\n");
-  kv_row_bytes_ = kv_q8_ ? (size_t)c.hd + c.hd / 8 : (size_t)c.hd * 2;
-  ub_ = std::clamp(opt.ubatch, 64, 512);
-  mv_max_t_ = getenv("QE_VK_MV_MAXT") ? atoi(getenv("QE_VK_MV_MAXT")) : 8;
   const size_t MiB = 1 << 20;
+  arch_ = arch_profile(*vk_);
+  // workgroups to keep in flight (split-K GEMM, split attention): ~6 per CU / SM when the driver
+  // reports the count (RDNA3 7900 XTX: 96 CUs), a small iGPU (Arc 130V: 8 Xe cores) needs few
+  wg_target_ = vk_->compute_units ? std::max(128u, 6 * vk_->compute_units) : vk_->integrated ? 128u : 512u;
+  QE_LOG("[hw] Vulkan device %s (%s), profile %s, subgroup %u%s, %s %.1f GiB%s, %s%s\n", vk_->device_name.c_str(),
+         vk_->driver_name.c_str(), arch_.c_str(), vk_->subgroup_size,
+         vk_->sg_control ? (" (" + std::to_string(vk_->sg_min) + "-" + std::to_string(vk_->sg_max) + ")").c_str() : "",
+         vk_->integrated ? "shared system memory" : "VRAM", vk_->vram_total() / 1073741824.0,
+         vk_->compute_units ? (", " + std::to_string(vk_->compute_units) + " CUs").c_str() : "",
+         vk_->rebar ? "resizable BAR / mapped VRAM, " : "",
+         vk_->coopmat ? "cooperative matrices" : "no cooperative matrices");
+  ub_ = std::clamp(opt.ubatch, 64, 512);
+  // weights this backend will place on the GPU (trunk layers, output head; not token_embd / MTP)
+  size_t wbytes = 0, ffn_bytes = 0;
+  for (const auto& t : gguf_->tensors()) {
+    int il = -1;
+    if (sscanf(t.name.c_str(), "blk.%d.", &il) == 1 && il >= c.n_layer) continue;
+    if (t.name == "token_embd.weight" && gguf_->tensor("output.weight")) continue;
+    const bool ffn = t.name.find(".ffn_") != std::string::npos;
+    if (ffn && std::find(opt.skip_ffn.begin(), opt.skip_ffn.end(), il) != opt.skip_ffn.end()) continue;
+    wbytes += t.nbytes;
+    if (ffn) ffn_bytes += t.nbytes;
+  }
+  // memory kept free: on an iGPU the "VRAM" is the system RAM the OS and the server also need
+  // (Arc 130V with 32 GB: >= 4 GiB); on a dGPU only a little headroom
+  reserve_ = (size_t)opt.vram_reserve_mb * MiB +
+             (vk_->integrated ? std::max<size_t>(4096 * MiB, vk_->vram_total() / 8) : 256 * MiB);
+  const int n_attn_l = [&] { int n = 0; for (int il = 0; il < c.n_layer; il++) n += c.is_attn(il); return n; }();
+  // KV format: f16 / q8 as asked; q4 / q3 (CUDA formats) -> f16 when VRAM easily holds weights + f16
+  // KV (e.g. 24 GB RX 7900 XTX: fewer dequant ops in attention, exact), else q8 (half the bytes; an
+  // iGPU is bandwidth-bound, so q8 there)
+  int kvt = opt.kv_type;
+  if (kvt >= 2) {
+    const size_t f16_kv = (size_t)opt.ctx * n_attn_l * 2 * c.n_kv * c.hd * 2;
+    kvt = (!vk_->integrated && wbytes + f16_kv + reserve_ + 1024 * MiB < vk_->vram_free()) ? 0 : 1;
+    QE_LOG("[plan] KV cache q4/q3 are CUDA formats: using %s\n", kvt == 0 ? "f16 (fits in VRAM)" : "q8");
+  }
+  kv_q8_ = kvt != 0;
+  kv_row_bytes_ = kv_q8_ ? (size_t)c.hd + c.hd / 8 : (size_t)c.hd * 2;
+  drop_pages_ = vk_->integrated || getenv("QE_VK_DROP_PAGES");
+  if (drop_pages_) model_fd_ = open(opt.model_path.c_str(), O_RDONLY);
 
   // ---- activations, state, small tensors (always device-local)
   const int E = c.n_embd, C = c.conv_dim(), qw = 2 * c.n_head * c.hd, kvw = c.n_kv * c.hd;
@@ -105,8 +141,7 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   part_ = dev((size_t)kMaxSplit * kMaxTok * c.n_head * (c.hd + 2));
   argmax_ = dev(kLogitRows);
   ksplit_ = dev(8u << 20);  // 32 MiB split-K scratch
-  use_w16_ = !(getenv("QE_VK_GEMM") && !strcmp(getenv("QE_VK_GEMM"), "fused"));
-  if (use_w16_) {  // f16 copy of the largest layer matrix (two-stage prefill GEMM)
+  {  // f16 copy of the largest layer matrix (two-stage prefill GEMM)
     size_t mx = 0;
     for (int il = 0; il < c.n_layer; il++) {
       const bool at = c.is_attn(il);
@@ -119,10 +154,8 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
     }
     w16_ = vk_->alloc(mx, Mem::Device, true);
     if (vk_->coopmat) {
-      int kmax = std::max({c.n_embd, c.n_ff, c.d_inner, c.n_head * c.hd});
+      const int kmax = std::max({c.n_embd, c.n_ff, c.d_inner, c.n_head * c.hd});
       x16_ = vk_->alloc((size_t)ub_ * kmax * 2, Mem::Device, true);
-      use_cm_ = cm_selftest();
-      QE_LOG("[hw] Vulkan cooperative matrices (16x16x16 f16): %s\n", use_cm_ ? "on" : "self-test failed, off");
     }
   }
   emb_h_ = vk_->alloc(U * E * 4, Mem::Host);
@@ -194,12 +227,13 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   {
     const int n_attn = (int)std::count_if(layers_.begin(), layers_.end(), [](const VLayer& L) { return L.attn; });
     const size_t per_pos = (size_t)n_attn * 2 * c.n_kv * kv_row_bytes_;
-    const size_t reserve = (size_t)opt.vram_reserve_mb * MiB + 256 * MiB;
-    const size_t avail = vk_->vram_free() > reserve ? vk_->vram_free() - reserve : 0;
+    // iGPU: the FFN weights still to come have no system-RAM fallback (it is the same memory)
+    const size_t keep = reserve_ + (vk_->integrated ? ffn_bytes : 0);
+    const size_t avail = vk_->vram_free() > keep ? vk_->vram_free() - keep : 0;
     ctx_len_ = opt.ctx;
-    if ((size_t)ctx_len_ * per_pos > avail && !vk_->integrated) {
+    if ((size_t)ctx_len_ * per_pos > avail) {
       const int fit = (int)std::max<size_t>(avail / per_pos / 1024 * 1024, 4096);
-      QE_LOG("[plan] KV cache for %d positions (%.0f MiB) does not fit in VRAM: context %d\n", ctx_len_,
+      QE_LOG("[plan] KV cache for %d positions (%.0f MiB) does not fit in GPU memory: context %d\n", ctx_len_,
              ctx_len_ * per_pos / (double)MiB, std::min(fit, ctx_len_));
       ctx_len_ = std::min(fit, ctx_len_);
     }
@@ -235,13 +269,41 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   if (host_ffn)
     QE_LOG("[plan] %.0f MiB of FFN weights read from system RAM over PCIe each token (decode will be slower)\n",
            host_ffn / (double)MiB);
+  if (model_fd_ >= 0) { close(model_fd_); model_fd_ = -1; }
   vk_->warm_pipelines();
+  autotune();
+  if (const char* g = getenv("QE_VK_GEMM")) tune_.gemm = g;  // fused | gemm16 | cm_gemm_MxNxK
   reset();
   QE_LOG("[plan] loaded in %.1f s\n", qe_now() - t_start);
 }
 
 VkModel::~VkModel() {
   vk_.reset();  // device teardown frees every allocation
+}
+
+// iGPU: once a tensor is in GPU memory (= system RAM), drop the model file's page-cache copy of it so
+// the weights are not held twice (32 GB Arc 130V laptops); token_embd stays mapped for embedding
+void VkModel::release_pages(const void* p, size_t n) {
+  if (model_fd_ < 0 || !n) return;
+  const uintptr_t pg = 4096, a = ((uintptr_t)p + pg - 1) & ~(pg - 1), e = ((uintptr_t)p + n) & ~(pg - 1);
+  if (e > a) madvise((void*)a, e - a, MADV_DONTNEED);
+  posix_fadvise(model_fd_, (off_t)((const uint8_t*)p - gguf_->base()), (off_t)n, POSIX_FADV_DONTNEED);
+}
+
+// architecture profile (logged; the per-device numbers come from the autotuner)
+std::string VkModel::arch_profile(const VkCtx& v) {
+  const std::string& n = v.device_name;
+  switch (v.vendor_id) {
+    case 0x1002:  // AMD: Navi 3x (RDNA3) device ids 0x7440-0x74ff, also matched by name
+      if ((v.device_id >= 0x7440 && v.device_id <= 0x74ff) || n.find("RX 7") != std::string::npos) return "amd-rdna3";
+      return "amd";
+    case 0x8086:  // Intel: Lunar Lake Xe2 iGPUs (Arc 130V / 140V), Battlemage (B5xx) dGPUs, Alchemist
+      if (v.device_id == 0x6420 || v.device_id == 0x64a0 || v.device_id == 0x64b0) return "intel-xe2-lunarlake";
+      if ((v.device_id & 0xfff0) == 0xe200) return "intel-xe2-battlemage";
+      return v.integrated ? "intel-igpu" : "intel-arc";
+    case 0x10de: return "nvidia";
+    default: return v.device_name.find("llvmpipe") != std::string::npos ? "cpu-lavapipe" : "generic";
+  }
 }
 
 void VkModel::upload(const VBuf& dst, const void* src, size_t n) {
@@ -267,10 +329,14 @@ VkModel::VMat VkModel::load_mat(const std::string& name, bool prefer_device) {
   if (m.K % 256) QE_FATAL("vulkan backend: %s row length %d is not a multiple of 256", name.c_str(), m.K);
   if (m.rb % 4) QE_FATAL("vulkan backend: %s rows are not 4-byte aligned", name.c_str());
   const size_t bytes = m.rb * m.N;
-  const size_t reserve = ((size_t)opt_.vram_reserve_mb << 20) + (128u << 20);
-  const bool fits = vk_->integrated || vk_->vram_free() > bytes + reserve;
-  m.buf = vk_->alloc(bytes, prefer_device && fits ? Mem::Device : Mem::Host);
+  const bool fits = vk_->vram_free() > bytes + reserve_;
+  if (!fits && vk_->integrated)
+    QE_FATAL("not enough memory for %s (%.0f MiB free after the %.0f MiB reserve): use a smaller model or context",
+             name.c_str(), (vk_->vram_free() > reserve_ ? vk_->vram_free() - reserve_ : 0) / 1048576.0, reserve_ / 1048576.0);
+  // mapped device memory (ReBAR dGPU, any iGPU): the upload is a memcpy, no staging copy
+  m.buf = vk_->alloc(bytes, prefer_device && fits ? Mem::DeviceMapped : Mem::Host);
   upload(m.buf, t.data, bytes);
+  release_pages(t.data, bytes);
   return m;
 }
 
@@ -278,47 +344,177 @@ VBuf VkModel::load_f32(const std::string& name) {
   const GGUFTensor& t = gguf_->need(name);
   std::vector<float> v(t.nelems());
   dequant_row_ref(t.type, t.data, t.nelems(), v.data());
-  VBuf b = vk_->alloc(v.size() * 4, Mem::Device, true);
+  VBuf b = vk_->alloc(v.size() * 4, Mem::DeviceMapped, true);
   upload(b, v.data(), v.size() * 4);
   return b;
 }
 
-// run one GEMM through the cooperative-matrix path and the scalar f16 path and compare
-bool VkModel::cm_selftest() {
-  const int K = 512, N = 128, T = 70;
-  std::vector<uint16_t> w((size_t)N * K);
-  std::vector<float> x((size_t)T * K), wf((size_t)N * K);
+// one GEMM through a cooperative-matrix variant vs an fp64 host reference (wrong layouts / driver bugs
+// show up as large errors; the variant is then not used)
+bool VkModel::cm_selftest(const std::string& pipe, uint32_t M, uint32_t N) {
+  const int K = 512, NR = 128, T = 70;
+  if (NR % (8 * N)) return false;
+  std::vector<uint16_t> w((size_t)NR * K);
+  std::vector<float> x((size_t)T * K), wf((size_t)NR * K);
   uint32_t s = 12345;
   auto rnd = [&] { s = s * 1664525u + 1013904223u; return ((s >> 9) & 0xffff) / 32768.f - 1.f; };
   for (size_t i = 0; i < w.size(); i++) { w[i] = f2h(rnd()); wf[i] = qe_h2f(w[i]); }
   for (auto& v : x) v = rnd();
   VBuf bw = vk_->alloc(w.size() * 2, Mem::Host), bx = vk_->alloc(x.size() * 4, Mem::Host);
-  VBuf by = vk_->alloc((size_t)T * N * 4, Mem::Host);
+  VBuf by = vk_->alloc((size_t)T * NR * 4, Mem::Host);
   memcpy(bw.map, w.data(), w.size() * 2);
   memcpy(bx.map, x.data(), x.size() * 4);
-  // shaped like the f16 scratch path: W already f16, so call cm_gemm directly after to_f16
   vk_->begin();
   const uint32_t tp = (T + 63) / 64 * 64;
   ElemPC ep{bx.addr, x16_.addr, 0, 0, 0, 0, (uint32_t)(tp * K / 2), (uint32_t)(T * K / 2), 0};
   uint32_t ex, ey;
   grid1d(ep.n, ex, ey);
   vk_->dispatch("to_f16", &ep, sizeof ep, ex, ey);
-  MvPC pc{bw.addr, x16_.addr, by.addr, tab_.addr, (uint32_t)K, (uint32_t)N, (uint32_t)T, 0, (uint32_t)K, (uint32_t)N, 0, 0,
-          (uint32_t)(K / 16)};
-  vk_->dispatch("cm_gemm", &pc, sizeof pc, N / 128, tp / 64, 1);
+  unsigned m_ = M, n_ = N, k_ = 0;
+  sscanf(pipe.c_str(), "cm_gemm_%ux%ux%u", &m_, &n_, &k_);
+  MvPC pc{bw.addr, x16_.addr, by.addr, tab_.addr, (uint32_t)K, (uint32_t)NR, (uint32_t)T, 0, (uint32_t)K, (uint32_t)NR,
+          0, 0, (uint32_t)(K / k_)};
+  vk_->dispatch(pipe.c_str(), &pc, sizeof pc, NR / (8 * N), (T + 4 * M - 1) / (4 * M), 1);
   vk_->submit();
   double e = 0, rms = 0;
   for (int t = 0; t < T; t++)
-    for (int n = 0; n < N; n++) {
+    for (int n = 0; n < NR; n++) {
       double r = 0;
       for (int k = 0; k < K; k++) r += (double)wf[(size_t)n * K + k] * qe_h2f(f2h(x[(size_t)t * K + k]));
       rms += r * r;
-      e = std::max(e, std::fabs(((float*)by.map)[(size_t)t * N + n] - r));
+      e = std::max(e, std::fabs(((float*)by.map)[(size_t)t * NR + n] - r));
     }
-  rms = std::sqrt(rms / (T * N));
+  rms = std::sqrt(rms / (T * NR));
   vk_->free(bw); vk_->free(bx); vk_->free(by);
-  QE_DBG("[vk] cooperative-matrix self-test: max err / rms = %.2e\n", e / rms);
-  return std::isfinite(e) && e / rms < 1e-3;
+  const bool ok = std::isfinite(e) && e / rms < 1e-3;
+  QE_DBG("[tune] %s self-test: max err / rms = %.2e %s\n", pipe.c_str(), e / rms, ok ? "ok" : "FAILED");
+  return ok;
+}
+
+// wall time of one recorded sequence (min over reps, after a warm-up run)
+double VkModel::bench(const std::function<void()>& rec, int reps) {
+  double best = 1e30;
+  for (int r = 0; r <= reps; r++) {
+    vk_->begin();
+    rec();
+    const double t0 = qe_now();
+    vk_->submit();
+    if (r) best = std::min(best, qe_now() - t0);
+  }
+  return best;
+}
+
+// Per-device tuning, measured on this GPU with this model's matrices and cached per
+// (vendor, device, driver, matrix shape): matvec workgroup shape and subgroup size for decode,
+// the prefill GEMM method (cooperative-matrix shape / scalar f16 / fused).
+void VkModel::autotune() {
+  const Config& c = cfg_;
+  const VLayer* L0 = nullptr;
+  for (auto& L : layers_)
+    if (L.ffn_gate.valid() && L.ffn_gate.buf.device_local && L.ffn_down.buf.device_local) { L0 = &L; break; }
+  const VMat* mats[2] = {L0 ? &L0->ffn_gate : &output_, L0 ? &L0->ffn_down : &output_};
+  char key[256];
+  snprintf(key, sizeof key, "vk-tune-v1-%x-%x-%x-%s%dx%d-%s%dx%d-ub%d", vk_->vendor_id, vk_->device_id,
+           vk_->driver_version, type_tag(mats[0]->type), mats[0]->N, mats[0]->K, type_tag(mats[1]->type), mats[1]->N,
+           mats[1]->K, ub_);
+  const char* home = getenv("HOME");
+  const std::string path = home ? std::string(home) + "/.cache/qwen-hyperdrive/" + key + ".txt" : "";
+  // cooperative-matrix shapes this device offers (preferred order per vendor: Intel XMX is 8 x 16 x 16)
+  std::vector<std::string> cms;
+  {
+    std::vector<std::array<uint32_t, 3>> pref = {{16, 16, 16}, {16, 8, 16}, {8, 16, 16}, {16, 8, 8}, {8, 8, 16}, {8, 8, 8}};
+    if (vk_->vendor_id == 0x8086) pref = {{8, 16, 16}, {8, 8, 16}, {16, 16, 16}, {16, 8, 16}, {16, 8, 8}, {8, 8, 8}};
+    for (auto& p : pref)
+      if (vk_->coopmat && x16_.buf && vk_->has_cm(p[0], p[1], p[2])) {
+        char nm[64];
+        snprintf(nm, sizeof nm, "cm_gemm_%ux%ux%u", p[0], p[1], p[2]);
+        if (vk_->has_pipeline(nm)) cms.push_back(nm);
+      }
+  }
+  if (const char* f = getenv("QE_VK_TUNE")) {  // "teams,rows,subgroup,gemm"
+    char g[64] = "";
+    sscanf(f, "%d,%d,%u,%63s", &tune_.mv_teams, &tune_.mv_r, &tune_.mv_sg, g);
+    if (*g) tune_.gemm = g;
+    QE_LOG("[tune] forced: matvec %d teams x %d rows, subgroup %u; prefill GEMM %s\n", tune_.mv_teams, tune_.mv_r,
+           tune_.mv_sg, tune_.gemm.c_str());
+    return;
+  }
+  if (!path.empty() && !getenv("QE_VK_RETUNE")) {
+    if (FILE* f = fopen(path.c_str(), "r")) {
+      char g[64] = "";
+      Tune t;
+      const int n = fscanf(f, "%d %d %u %63s", &t.mv_teams, &t.mv_r, &t.mv_sg, g);
+      fclose(f);
+      t.gemm = g;
+      const bool cm_ok = t.gemm.rfind("cm_", 0) != 0 || std::find(cms.begin(), cms.end(), t.gemm) != cms.end();
+      if (n == 4 && t.mv_teams > 0 && t.mv_r > 0 && cm_ok) {
+        tune_ = t;
+        QE_LOG("[tune] cached: matvec %d teams x %d rows, subgroup %s; prefill GEMM %s\n", tune_.mv_teams, tune_.mv_r,
+               tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default", tune_.gemm.c_str());
+        return;
+      }
+    }
+  }
+  const double t_start = qe_now();
+  // ---- decode matvec
+  std::vector<uint32_t> sgs = {0};
+  std::vector<uint32_t> want;
+  if (vk_->vendor_id == 0x1002) want = {32, 64};       // RDNA: wave32 / wave64
+  else if (vk_->vendor_id == 0x8086) want = {16, 32};  // Xe: SIMD16 / SIMD32 (SIMD8 is too narrow here)
+  for (uint32_t w : want)
+    if (vk_->sg_control && w >= vk_->sg_min && w <= vk_->sg_max) sgs.push_back(w);
+  const int shapes[][2] = {{4, 4}, {2, 4}, {4, 2}, {8, 2}, {8, 1}, {2, 8}, {4, 1}};
+  double best = 1e30;
+  Tune bt = tune_;
+  for (uint32_t sg : sgs)
+    for (auto& sh : shapes) {
+      tune_.mv_teams = sh[0];
+      tune_.mv_r = sh[1];
+      tune_.mv_sg = sg;
+      const double t = bench([&] {
+        for (int i = 0; i < 8; i++)
+          for (const VMat* m : mats) {
+            MvPC pc{m->buf.addr, m == mats[0] ? xn_.addr : t1_.addr, t0_.addr, tab_.addr, (uint32_t)m->K,
+                    (uint32_t)m->N, 1, (uint32_t)m->rb, (uint32_t)m->K, (uint32_t)m->N, 0, 0, (uint32_t)(m->K / 32)};
+            matvec(*m, pc, true);
+          }
+      }, 3);
+      QE_DBG("[tune] matvec %d teams x %d rows, subgroup %u: %.1f us\n", sh[0], sh[1], sg, t / 16 * 1e6);
+      if (t < best * 0.98) { best = t; bt = tune_; }
+    }
+  tune_ = bt;
+  const double mv_us = best / 16 * 1e6;
+  // ---- prefill GEMM
+  std::vector<std::string> methods = {"fused", "gemm16"};
+  for (auto& nm : cms) {
+    unsigned M, N, K;
+    sscanf(nm.c_str(), "cm_gemm_%ux%ux%u", &M, &N, &K);
+    if (cm_selftest(nm, M, N)) methods.push_back(nm);
+  }
+  best = 1e30;
+  std::string bg = "gemm16";
+  for (auto& meth : methods) {
+    const double t = bench([&] {
+      for (const VMat* m : mats) {
+        MvPC pc{m->buf.addr, m == mats[0] ? xn_.addr : t1_.addr, t0_.addr, tab_.addr, (uint32_t)m->K, (uint32_t)m->N,
+                (uint32_t)ub_, (uint32_t)m->rb, (uint32_t)m->K, (uint32_t)m->N, 0, 0, (uint32_t)(m->K / 32)};
+        gemm(*m, pc, meth, true);
+      }
+    }, 2);
+    QE_DBG("[tune] prefill GEMM %s: %.2f ms\n", meth.c_str(), t * 1e3);
+    if (t < best * 0.98) { best = t; bg = meth; }
+  }
+  tune_.gemm = bg;
+  QE_LOG("[tune] measured in %.1f s: matvec %d teams x %d rows, subgroup %s (%.0f us/matrix); prefill GEMM %s (%.1f ms per %d-token pair)\n",
+         qe_now() - t_start, tune_.mv_teams, tune_.mv_r, tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default",
+         mv_us, tune_.gemm.c_str(), best * 1e3, ub_);
+  if (!path.empty()) {
+    (void)!system(("mkdir -p '" + path.substr(0, path.rfind('/')) + "'").c_str());
+    if (FILE* f = fopen(path.c_str(), "w")) {
+      fprintf(f, "%d %d %u %s\n", tune_.mv_teams, tune_.mv_r, tune_.mv_sg, tune_.gemm.c_str());
+      fclose(f);
+    }
+  }
 }
 
 void VkModel::reset() {
@@ -359,87 +555,90 @@ KvInfo VkModel::kv_info() const {
 }
 
 // y[T][N] (+)= W x[T][K]
+void VkModel::matvec(const VMat& m, const MvPC& pc0, bool bar) {
+  MvPC pc = pc0;
+  pc.wide = m.N < 2048;  // few rows: one row per workgroup so the GPU is filled
+  const uint32_t rows = (uint32_t)(tune_.mv_teams * tune_.mv_r);
+  uint32_t gx, gy;
+  grid_wg(pc.wide ? m.N : (m.N + rows - 1) / rows, gx, gy);
+  PipeOpt po;
+  po.spec0 = tune_.mv_r;
+  po.spec1 = 32 * tune_.mv_teams;
+  po.subgroup = tune_.mv_sg;
+  vk_->dispatch((std::string("mv_") + type_tag(m.type)).c_str(), &pc, sizeof pc, gx, gy, 1, bar, po);
+}
+
+// y[T][N] (+)= W x[T][K]
 void VkModel::linear(const VMat& m, VkDeviceAddress x, int T, VkDeviceAddress y, bool acc, bool bar) {
   MvPC pc{m.buf.addr, x, y, tab_.addr, (uint32_t)m.K, (uint32_t)m.N, (uint32_t)T, (uint32_t)m.rb, (uint32_t)m.K,
           (uint32_t)m.N, acc ? 1u : 0u, 0u, (uint32_t)(m.K / 32)};
+  if (T <= kMaxTok) { matvec(m, pc, bar); return; }
+  gemm(m, pc, tune_.gemm, bar);
+}
+
+// prefill GEMM by method: "fused" (dequantize inside the tiles), "gemm16" (coalesced dequant to f16,
+// scalar f16 GEMM) or "cm_gemm_MxNxK" (dequant to f16, cooperative-matrix GEMM)
+void VkModel::gemm(const VMat& m, MvPC pc, const std::string& method, bool bar) {
+  const int T = (int)pc.T;
+  const VkDeviceAddress x = pc.x, y = pc.y;
+  const bool acc = pc.acc != 0;
   const std::string tag = type_tag(m.type);
-  if (T <= kMaxTok) {
-    uint32_t gx, gy;
-    pc.wide = m.N < 2048;  // few rows: one row per workgroup so the GPU is filled
-    grid_wg(pc.wide ? m.N : (m.N + 15) / 16, gx, gy);
-    vk_->dispatch(("mv_" + tag).c_str(), &pc, sizeof pc, gx, gy, 1, bar);  // 16 rows per workgroup
-  } else if (T <= mv_max_t_) {
-    // short prompts: 8-token matvec slices beat a mostly empty 64-token GEMM tile
-    uint32_t gx, gy;
-    pc.wide = m.N < 2048;
-    grid_wg(pc.wide ? m.N : (m.N + 15) / 16, gx, gy);
-    for (int t0 = 0; t0 < T; t0 += kMaxTok) {
-      MvPC p2 = pc;
-      p2.T = (uint32_t)std::min(kMaxTok, T - t0);
-      p2.x = x + (size_t)t0 * m.K * 4;
-      p2.y = y + (size_t)t0 * m.N * 4;
-      vk_->dispatch(("mv_" + tag).c_str(), &p2, sizeof p2, gx, gy, 1, bar && t0 + kMaxTok >= T);
-    }
-  } else {
-    // two-stage (coalesced dequant to f16 once, then an f16 GEMM) unless the matrix is too big for
-    // the scratch (the output head, which only ever sees <= 16 rows) or QE_VK_GEMM=fused
-    const bool two = use_w16_ && (size_t)m.N * m.K * 2 <= w16_.size;
-    if (two) {
-      MvPC dq = pc;
-      dq.y = w16_.addr;
-      uint32_t dx, dy;
-      const uint64_t groups = (uint64_t)m.N * (m.K / 32);
-      dx = (uint32_t)std::min<uint64_t>((groups + 63) / 64, 65535);
-      dy = (uint32_t)(((groups + 63) / 64 + 65534) / 65535);
-      vk_->dispatch(("dq16_" + tag).c_str(), &dq, sizeof dq, dx, dy);
-      pc.w = w16_.addr;
-    }
-    if (two && use_cm_ && m.N % 128 == 0) {  // matrix hardware: activations to f16 (rows padded to 64)
-      const uint32_t tp = (T + 63) / 64 * 64;
-      ElemPC ep{x, x16_.addr, 0, 0, 0, 0, (uint32_t)((size_t)tp * m.K / 2), (uint32_t)((size_t)T * m.K / 2), 0};
-      uint32_t ex, ey;
-      grid1d(ep.n, ex, ey);
-      vk_->dispatch("to_f16", &ep, sizeof ep, ex, ey);
-      pc.x = x16_.addr;
-      const uint32_t gx = m.N / 128, gy = tp / 64, nk = m.K / 16;
-      uint32_t ks = 1;
-      while (gx * gy * ks * 2 <= 512 && nk / (ks * 2) >= 16 && (size_t)ks * 2 * T * m.N * 4 <= ksplit_.size) ks *= 2;
-      pc.kg = (nk + ks - 1) / ks;
-      ks = (nk + pc.kg - 1) / pc.kg;
-      if (ks == 1) {
-        vk_->dispatch("cm_gemm", &pc, sizeof pc, gx, gy, 1, true);
-      } else {
-        MvPC p2 = pc;
-        p2.y = ksplit_.addr;
-        vk_->dispatch("cm_gemm", &p2, sizeof p2, gx, gy, ks);
-        ElemPC ep2{ksplit_.addr, y, 0, 0, 0, 0, (uint32_t)(T * m.N), ks, acc ? 1u : 0u};
-        grid1d(ep2.n, ex, ey);
-        vk_->dispatch("ksum", &ep2, sizeof ep2, ex, ey, 1, true);
-      }
-      return;
-    }
-    const char* gemm = two ? "gemm16" : nullptr;
-    const std::string fused = "mm_" + tag;
-    if (!gemm) gemm = fused.c_str();
-    const uint32_t gx = (m.N + 63) / 64, gy = (T + 63) / 64, ng = m.K / 32;
-    // split K until ~512 workgroups are in flight (keeps >= 8 groups per slice, scratch-bounded)
-    uint32_t ks = 1;
-    while (gx * gy * ks * 2 <= 512 && ng / (ks * 2) >= 8 && (size_t)ks * 2 * T * m.N * 4 <= ksplit_.size) ks *= 2;
-    if (two) bar = true;  // the f16 scratch is reused by the next projection
-    if (ks == 1) {
-      vk_->dispatch(gemm, &pc, sizeof pc, gx, gy, 1, bar);
-    } else {
-      pc.kg = (ng / ks + 1) & ~1u;  // even: the fused shader steps two groups at a time
-      ks = (ng + pc.kg - 1) / pc.kg;
-      MvPC p2 = pc;
-      p2.y = ksplit_.addr;
-      vk_->dispatch(gemm, &p2, sizeof p2, gx, gy, ks);
-      ElemPC ep{ksplit_.addr, y, 0, 0, 0, 0, (uint32_t)(T * m.N), ks, acc ? 1u : 0u};
-      uint32_t ex, ey;
-      grid1d(ep.n, ex, ey);
-      vk_->dispatch("ksum", &ep, sizeof ep, ex, ey, 1, bar);
-    }
+  const bool two = method != "fused" && (size_t)m.N * m.K * 2 <= w16_.size;  // output head: fused
+  unsigned M = 0, N = 0, K = 0;
+  const bool cm = two && sscanf(method.c_str(), "cm_gemm_%ux%ux%u", &M, &N, &K) == 3 && m.N % (8 * N) == 0 &&
+                  x16_.buf;
+  if (two) {
+    MvPC dq = pc;
+    dq.y = w16_.addr;
+    const uint64_t groups = (uint64_t)m.N * (m.K / 32);
+    const uint32_t dx = (uint32_t)std::min<uint64_t>((groups + 63) / 64, 65535);
+    const uint32_t dy = (uint32_t)(((groups + 63) / 64 + 65534) / 65535);
+    vk_->dispatch(("dq16_" + tag).c_str(), &dq, sizeof dq, dx, dy);
+    pc.w = w16_.addr;
+    bar = true;  // the f16 scratch is reused by the next projection
   }
+  uint32_t gx, gy, nsteps, min_steps, align;
+  std::string pipe;
+  if (cm) {  // activations to f16, rows padded to 64 (a multiple of every tile height 4M)
+    const uint32_t tp = (T + 63) / 64 * 64;
+    ElemPC ep{x, x16_.addr, 0, 0, 0, 0, (uint32_t)((size_t)tp * m.K / 2), (uint32_t)((size_t)T * m.K / 2), 0};
+    uint32_t ex, ey;
+    grid1d(ep.n, ex, ey);
+    vk_->dispatch("to_f16", &ep, sizeof ep, ex, ey);
+    pc.x = x16_.addr;
+    gx = m.N / (8 * N);
+    gy = (T + 4 * M - 1) / (4 * M);
+    nsteps = m.K / K;
+    min_steps = 256 / K;
+    align = 1;
+    pipe = method;
+  } else {
+    gx = (m.N + 63) / 64;
+    gy = (T + 63) / 64;
+    nsteps = m.K / 32;
+    min_steps = 8;
+    align = two ? 1 : 2;  // the fused shader steps two groups at a time
+    pipe = two ? "gemm16" : "mm_" + tag;
+  }
+  // split K while the tile grid alone leaves the GPU idle (scratch-bounded)
+  uint32_t ks = 1;
+  while (gx * gy * ks * 2 <= wg_target_ && nsteps / (ks * 2) >= min_steps &&
+         (size_t)ks * 2 * T * m.N * 4 <= ksplit_.size)
+    ks *= 2;
+  if (ks == 1) {
+    pc.kg = nsteps;
+    vk_->dispatch(pipe.c_str(), &pc, sizeof pc, gx, gy, 1, bar);
+    return;
+  }
+  pc.kg = (nsteps / ks + align - 1) / align * align;
+  ks = (nsteps + pc.kg - 1) / pc.kg;
+  MvPC p2 = pc;
+  p2.y = ksplit_.addr;
+  vk_->dispatch(pipe.c_str(), &p2, sizeof p2, gx, gy, ks);
+  ElemPC ep{ksplit_.addr, y, 0, 0, 0, 0, (uint32_t)(T * m.N), ks, acc ? 1u : 0u};
+  uint32_t ex, ey;
+  grid1d(ep.n, ex, ey);
+  vk_->dispatch("ksum", &ep, sizeof ep, ex, ey, 1, bar);
 }
 
 // xn = rmsnorm(x += pending residual) * w
@@ -486,7 +685,8 @@ void VkModel::layer_attn(VLayer& L, int T, int pos0) {
     const uint32_t L_keys = (uint32_t)(pos0 + T);
     uint32_t nsplit = 1, chunk = L_keys;
     if (T <= kMaxTok) {  // decode: split the keys so every compute unit has work
-      nsplit = std::clamp<uint32_t>((L_keys + 255) / 256, 1, kMaxSplit);
+      const uint32_t want = std::max<uint32_t>(1, wg_target_ / (c.n_kv * ((T + TB - 1) / TB)));
+      nsplit = std::clamp<uint32_t>(std::min(want, (L_keys + 63) / 64), 1, kMaxSplit);
       chunk = ((L_keys + nsplit - 1) / nsplit + 31) / 32 * 32;
       nsplit = (L_keys + chunk - 1) / chunk;
     }

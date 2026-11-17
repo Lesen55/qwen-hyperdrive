@@ -8,7 +8,20 @@
 #include <string>
 #include <vector>
 
-enum class Mem { Device, Host, Readback };  // Host: system RAM the GPU reads (PCIe); Readback: cached
+// Host: system RAM the GPU reads (PCIe); Readback: cached; DeviceMapped: device-local and CPU-writable
+// (resizable BAR on discrete GPUs, all memory on integrated ones) -> uploads are a plain memcpy
+enum class Mem { Device, Host, Readback, DeviceMapped };
+
+// per-pipeline options: specialization constants 0 / 1 (-1 = shader default) and a required subgroup
+// size (0 = driver's choice; ignored without VK_EXT_subgroup_size_control)
+struct PipeOpt {
+  int spec0 = -1, spec1 = -1;
+  uint32_t subgroup = 0;
+  bool operator<(const PipeOpt& o) const {
+    return spec0 != o.spec0 ? spec0 < o.spec0 : spec1 != o.spec1 ? spec1 < o.spec1 : subgroup < o.subgroup;
+  }
+};
+struct CmShape { uint32_t M, N, K; };
 
 struct VBuf {
   VkBuffer buf = VK_NULL_HANDLE;
@@ -38,7 +51,7 @@ class VkCtx {
   // dispatch + a full compute/transfer memory barrier after it (barrier=false: the next dispatch is
   // independent, e.g. the q/k/v projections reading the same input)
   void dispatch(const char* pipe, const void* pc, uint32_t pc_size, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1,
-                bool barrier = true);
+                bool barrier = true, const PipeOpt& opt = PipeOpt{});
   void barrier();
   void copy(const VBuf& src, size_t src_off, const VBuf& dst, size_t dst_off, size_t n);
   void fill(const VBuf& dst, size_t off, size_t n, uint32_t value = 0);
@@ -51,10 +64,17 @@ class VkCtx {
   std::string driver_name;
   uint32_t subgroup_size = 0;
   bool integrated = false;
-  bool coopmat = false;  // VK_KHR_cooperative_matrix with 16x16x16 f16 x f16 -> f32 (subgroup scope)
+  bool coopmat = false;           // VK_KHR_cooperative_matrix, f16 x f16 -> f32 at subgroup scope
+  std::vector<CmShape> cm_shapes;  // ... in these M x N x K shapes
+  bool sg_control = false;        // VK_EXT_subgroup_size_control for compute
+  uint32_t sg_min = 0, sg_max = 0;
+  uint32_t vendor_id = 0, device_id = 0, driver_version = 0;
+  uint32_t compute_units = 0;     // CUs (AMD) / SMs (NVIDIA) when the driver tells, else 0
+  bool rebar = false;             // a CPU-mappable device-local type spans the VRAM heap
+  bool has_cm(uint32_t M, uint32_t N, uint32_t K) const;
 
  private:
-  VkPipeline pipeline(const char* name);
+  VkPipeline pipeline(const char* name, const PipeOpt& opt = PipeOpt{});
   int mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) const;
 
   VkInstance inst_ = VK_NULL_HANDLE;
@@ -68,7 +88,7 @@ class VkCtx {
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
   VkPipelineCache cache_ = VK_NULL_HANDLE;
   std::string cache_path_;  // on-disk pipeline cache (per device + driver version)
-  std::map<std::string, VkPipeline> pipes_;
+  std::map<std::pair<std::string, PipeOpt>, VkPipeline> pipes_;
   VkPhysicalDeviceMemoryProperties mprops_{};
   bool budget_ext_ = false;
   int vram_heap_ = -1;

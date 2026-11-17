@@ -2,11 +2,17 @@
 // formats and are dequantized inside the shaders; what does not fit in VRAM is read by the GPU from
 // system RAM.  No MTP drafting (plain decoding); single KV sequence with recurrent-state checkpoints.
 #pragma once
+#include <array>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "imodel.h"
 #include "vk_ctx.h"
+
+// push constants of the matvec / GEMM / dequant shaders (64-bit addresses are uvec2 in GLSL)
+struct MvPC { uint64_t w, x, y, tab; uint32_t K, N, T, rb, ldx, ldy, acc, wide, kg; };
 
 class VkModel : public IModel {
  public:
@@ -55,6 +61,24 @@ class VkModel : public IModel {
   VBuf load_f32(const std::string& name);
   void upload(const VBuf& dst, const void* src, size_t n);
   void linear(const VMat& m, VkDeviceAddress x, int T, VkDeviceAddress y, bool acc = false, bool bar = true);  // bar: barrier after
+  void matvec(const VMat& m, const MvPC& pc, bool bar);
+  void gemm(const VMat& m, MvPC pc, const std::string& method, bool bar);
+  double bench(const std::function<void()>& rec, int reps);
+  void autotune();
+  bool cm_selftest(const std::string& pipe, uint32_t M, uint32_t N);
+  void release_pages(const void* p, size_t n);
+  static std::string arch_profile(const VkCtx& v);
+  struct Tune {
+    int mv_teams = 4, mv_r = 4;  // decode matvec: 32-lane teams per workgroup x rows per team
+    uint32_t mv_sg = 0;          // required subgroup size (0: driver default)
+    std::string gemm = "gemm16"; // prefill: fused | gemm16 | cm_gemm_MxNxK
+  };
+  Tune tune_;
+  std::string arch_;
+  uint32_t wg_target_ = 512;
+  size_t reserve_ = 0;
+  bool drop_pages_ = false;
+  int model_fd_ = -1;
   void norm_in(const VBuf& w, int T);
   void layer_attn(VLayer& L, int T, int pos0);
   void layer_gdn(VLayer& L, int T);
@@ -69,14 +93,12 @@ class VkModel : public IModel {
   std::vector<VLayer> layers_;
   VMat output_, tok_embd_;
   VBuf output_norm_, tab_;
-  int ub_ = 512, ctx_len_ = 0, mv_max_t_ = 8;
+  int ub_ = 512, ctx_len_ = 0;
   bool kv_q8_ = true;
   size_t kv_row_bytes_ = 0;  // bytes per (position, kv head)
   // activations
   VBuf x_, xn_, t0_, t1_, t2_, t3_, t4_, g_, beta_, logits_, part_, argmax_, ksplit_, w16_;
-  bool use_w16_ = true, use_cm_ = false;
   VBuf x16_;
-  bool cm_selftest();
   VBuf emb_h_, rope_h_, logits_h_, argmax_h_, staging_;
   VBuf ssm_, conv_;
   size_t ssm_bytes_ = 0, conv_bytes_ = 0;
