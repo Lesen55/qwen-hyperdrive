@@ -343,6 +343,8 @@ void Generator::update_policy(int nd, int a, double dt) {
   // periodic re-measurement of the neighbouring lengths (cycling through all lengths costs too much
   // once long chains are allowed)
   if (!explore && st_.steps % 32 == 0) best = std::clamp(best + ((st_.steps / 32) % 2 ? 1 : -1), 1, maxd);
+  static const bool fixed = getenv("QE_FIXED_DRAFT") != nullptr;  // tests: no timing-dependent choice
+  if (fixed) best = maxd;
   want_drafts_ = best;
 }
 

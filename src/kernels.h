@@ -29,6 +29,7 @@ void matvec(uint32_t type, const void* W, size_t row_bytes, int K, int N, const 
 // for t < T (any T), x quantized by quantize_q8_256.  Not for IQ1_M / float weight types.
 void quantize_q8_256(const float* x, int8_t* xq, float* xd, int K, int T, cudaStream_t s);
 bool mmq_supported(uint32_t type);
+void set_num_sms(int n);  // device SM count (launch heuristics)
 void matvec_rows(uint32_t type, const void* W, size_t rb, int K, const int* rows, int N, const int8_t* xq,
                  const float* xd, float* y, cudaStream_t s);
 // decode-once int8 GEMM for long prefill chunks (types: mmq_supported)

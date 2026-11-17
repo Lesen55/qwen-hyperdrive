@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 86-real)
+  # local builds: the GPU in this machine; the Nix package builds every supported generation
+  set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 project(qwen35_engine LANGUAGES C CXX CUDA)
 

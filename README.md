@@ -1,4 +1,4 @@
-# qwen-hyperdrive — Qwen3.8-27B (qwen35) 専用 128K コンテキスト推論エンジン
+# qwen-hyperdrive — Qwen3.5 / 3.8 系（qwen35）向け 128K コンテキスト推論エンジン
 
 ## 俺が良い感じにローカルLLM動かしたかったからOpus 5.5 Xhighに書かせたエンジン、普通に早くてビビってる今
 
@@ -39,6 +39,18 @@
 - 起動ラッパー `llm-engine` は `~/.config/llm-engine/tunnel-token`（Cloudflare トンネルのトークン）があればサーバーと一緒に `cloudflared tunnel run` を起動・停止します（`LLM_ENGINE_TUNNEL=0` で無効）。
 - 起動ラッパー `llm-engine` は動作中だけ hazkey-server（IME、約 0.8 GB VRAM）を止め、終了時に戻します（`LLM_ENGINE_STOP_HAZKEY=0` で無効）。
 
+## 対応範囲
+
+| | 対応 |
+|---|---|
+| モデル | GGUF の `qwen35` アーキテクチャ（Qwen3.5 / 3.6 / 3.8 系の DeltaNet + ゲート付き注意のハイブリッド。サイズ・層数・ヘッド数は GGUF から読む。注意ヘッド次元 256、DeltaNet 状態 128 が前提）。MTP（NextN）層があれば自己投機デコードに使い、なければ自動で通常デコード |
+| 量子化 | IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / BF16 / F16 / F32（Q4_K_M・Q5_K_M・Q8_0・IQ 系の混在 GGUF をそのまま読める） |
+| GPU | NVIDIA Ampere 以降（compute 8.0 以上: RTX 30 / 40 系、A100、H100 など）。Nix パッケージは sm_80 / 86 / 89 / 90 の機械語と PTX を同梱。VRAM 容量に合わせて常駐・ストリーミング・KV を自動配置 |
+| CPU | x86-64-v3（AVX2 / FMA / F16C / BMI2）。物理コア数・PCIe 帯域・DRAM 帯域は起動時に実測して CPU/GPU 分担に使う（`-t` / `--pcie-gbps` で上書き可） |
+
+検証済み: Huihui-Qwen3.8-27B IQ3_XXS-mtp（10 GB に収まらないためストリーミング + CPU 併用）、Qwen3.5-9B Q4_K_M MTP（全層 VRAM 常駐）。
+Qwen3.5-9B Q4_K_M（RTX 3080）: 短い文脈のデコード 141〜259 tok/s、32K プリフィル 9.7 秒（3376 tok/s）。
+
 ## 使い方
 
 ```sh
@@ -71,8 +83,8 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 | `-c` | 131072 | 最大コンテキスト長 |
 | `--kv q4\|q3\|q8\|f16` | q4 | KV キャッシュ形式（アダマール回転付き。q3 は Lloyd-Max 3bit、長文脈デコード約 5% 高速・PPL +1.8%） |
 | `--cpu-frac auto\|0..1` | auto | ストリーミング層の FFN のうち CPU で計算する割合（auto = 層ごとに量子化型別の実測 CPU 速度と PCIe 帯域で均衡） |
-| `--pcie-gbps` | 38 | auto 均衡で仮定する実効 PCIe 帯域 |
-| `-t` | 6 | CPU ワーカースレッド（物理コアに固定） |
+| `--pcie-gbps` | 実測 × 1.5 | auto 均衡で仮定する実効 PCIe 帯域（起動時に計測） |
+| `-t` | 物理コア数 | CPU ワーカースレッド（物理コアに固定） |
 | `--no-mtp` | | MTP 自己投機デコードを無効化 |
 | `--ubatch` | 2048 | プリフィルのチャンク長 |
 | `--no-elastic` | | 未使用 KV プールの FFN 層への貸し出しを無効化 |

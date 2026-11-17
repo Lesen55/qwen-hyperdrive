@@ -19,8 +19,8 @@
         config = {
           allowUnfree = true;
           cudaSupport = true;
-          # RTX 3080 = GA102 = sm_86.
-          cudaCapabilities = [ "8.6" ];
+          # Ampere and newer (int8 mma.sync m16n8k32 and cp.async need sm_80+)
+          cudaCapabilities = [ "8.0" "8.6" "8.9" "9.0" ];
           cudaForwardCompat = false;
         };
       };

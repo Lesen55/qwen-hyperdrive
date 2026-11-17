@@ -1,3 +1,5 @@
+#include <set>
+#include <thread>
 #include <sys/stat.h>
 #include "model.h"
 #include "requant.h"
@@ -69,11 +71,93 @@ Model::Model(const EngineOptions& opt) : opt_(opt) {
     cudaGetLastError();
   }
   CUDA_CHECK(cudaSetDevice(0));
+  {
+    cudaDeviceProp p{};
+    CUDA_CHECK(cudaGetDeviceProperties(&p, 0));
+    if (p.major < 8)
+      QE_FATAL("GPU %s (compute capability %d.%d) is not supported: needs Ampere (8.0) or newer", p.name, p.major, p.minor);
+    qk::set_num_sms(p.multiProcessorCount);
+    QE_LOG("[hw] GPU %s, compute %d.%d, %d SMs, %.1f GiB VRAM\n", p.name, p.major, p.minor, p.multiProcessorCount,
+           p.totalGlobalMem / (1024.0 * 1024 * 1024));
+  }
+  calibrate_host();
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   CUBLAS_CHECK(cublasCreate(&cublas_));
   CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
   CUBLAS_CHECK(cublasSetMathMode(cublas_, CUBLAS_DEFAULT_MATH));
   plan_and_load();
+}
+
+// Host-side machine parameters the planner uses: physical cores, PCIe host->device bandwidth and DRAM
+// read bandwidth, measured at start-up unless given explicitly (they decide the CPU/GPU split).
+static int physical_cores() {
+  std::set<std::pair<int, int>> cores;
+  for (int cpu = 0; cpu < 1024; cpu++) {
+    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+    FILE* f1 = fopen((base + "core_id").c_str(), "r");
+    if (!f1) break;
+    int core = -1, pkg = 0;
+    if (fscanf(f1, "%d", &core) != 1) core = cpu;
+    fclose(f1);
+    if (FILE* f2 = fopen((base + "physical_package_id").c_str(), "r")) {
+      if (fscanf(f2, "%d", &pkg) != 1) pkg = 0;
+      fclose(f2);
+    }
+    cores.insert({pkg, core});
+  }
+  return cores.empty() ? (int)std::thread::hardware_concurrency() : (int)cores.size();
+}
+
+void Model::calibrate_host() {
+  if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c") ||
+      !__builtin_cpu_supports("bmi2"))
+    QE_FATAL("CPU without AVX2/FMA/F16C/BMI2 (x86-64-v3) is not supported");
+  if (opt_.cpu_threads <= 0) opt_.cpu_threads = std::clamp(physical_cores(), 1, 32);
+  if (opt_.pcie_gbps <= 0) {
+    const size_t n = 256ull << 20;
+    void* h = nullptr;
+    void* d = nullptr;
+    double gbps = 25.0;
+    if (cudaHostAlloc(&h, n, cudaHostAllocDefault) == cudaSuccess && cudaMalloc(&d, n) == cudaSuccess) {
+      memset(h, 1, n);
+      cudaMemcpy(d, h, n, cudaMemcpyHostToDevice);
+      double best = 1e9;
+      for (int i = 0; i < 3; i++) {
+        const double t0 = qe_now();
+        cudaMemcpy(d, h, n, cudaMemcpyHostToDevice);
+        best = std::min(best, qe_now() - t0);
+      }
+      gbps = n / best / 1e9;
+    }
+    if (d) cudaFree(d);
+    if (h) cudaFreeHost(h);
+    cudaGetLastError();
+    // the balancer was tuned with 1.5x the raw copy rate (the copies overlap compute imperfectly)
+    opt_.pcie_gbps = gbps * 1.5;
+    measured_pcie_ = gbps;
+  }
+  if (opt_.dram_gbps <= 0) {
+    const size_t n = 512ull << 20, nt = std::max(1, opt_.cpu_threads);
+    std::vector<uint64_t> buf(n / 8, 1);
+    std::vector<uint64_t> sums(nt);
+    double best = 1e9;
+    for (int rep = 0; rep < 3; rep++) {
+      const double t0 = qe_now();
+      std::vector<std::thread> th;
+      for (size_t t = 0; t < nt; t++)
+        th.emplace_back([&, t] {
+          const size_t a = buf.size() * t / nt, b = buf.size() * (t + 1) / nt;
+          uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+          for (size_t i = a; i + 3 < b; i += 4) { s0 += buf[i]; s1 += buf[i + 1]; s2 += buf[i + 2]; s3 += buf[i + 3]; }
+          sums[t] = s0 + s1 + s2 + s3;
+        });
+      for (auto& x : th) x.join();
+      best = std::min(best, qe_now() - t0);
+    }
+    opt_.dram_gbps = n / best / 1e9;
+  }
+  QE_LOG("[hw] CPU %d threads, PCIe H2D %.1f GB/s (balancer %.1f), DRAM read %.1f GB/s\n", opt_.cpu_threads,
+         measured_pcie_ > 0 ? measured_pcie_ : opt_.pcie_gbps, opt_.pcie_gbps, opt_.dram_gbps);
 }
 
 Model::~Model() {
@@ -106,7 +190,9 @@ void Model::load_config() {
   c.d_inner = (int)g.get_int(a + "ssm.inner_size", 6144);
   c.attn_interval = (int)g.get_int(a + "full_attention_interval", 4);
   c.n_vocab = (int)g.need("token_embd.weight").ne[1];
-  QE_ASSERT(c.hd == 256 && c.dk == 128 && c.conv_k == 4 && c.d_inner == c.nv * c.dv);
+  if (c.hd != 256 || c.dk != 128 || c.conv_k != 4 || c.d_inner != c.nv * c.dv || c.n_head % c.n_kv || c.nv % c.nk)
+    QE_FATAL("unsupported qwen35 dimensions: attention head %d (need 256), GDN state %d (need 128), conv %d (need 4), "
+             "heads %d/%d, GDN heads %d/%d", c.hd, c.dk, c.conv_k, c.n_head, c.n_kv, c.nk, c.nv);
   QE_LOG("[model] qwen35: %d layers (+%d MTP), embd %d, ff %d, heads %d/%d x %d, GDN %d/%d x %d, vocab %d\n",
          c.n_layer, c.n_mtp, c.n_embd, c.n_ff, c.n_head, c.n_kv, c.hd, c.nk, c.nv, c.dk, c.n_vocab);
 }

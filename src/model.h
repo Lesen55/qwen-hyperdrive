@@ -22,7 +22,7 @@ struct EngineOptions {
   int ubatch = 2048;           // prefill chunk (its workspace is lent to FFN weights while decoding)
   size_t vram_reserve_mb = 64;   // keep this much VRAM free (all big buffers are allocated up front)
   int64_t vram_budget_mb = -1;  // override total VRAM the engine may use (-1 = auto)
-  int cpu_threads = 6;
+  int cpu_threads = -1;        // -1: physical cores
   bool use_mtp = true;
   bool elastic_kv = true;      // lend unused KV pool space to FFN weights
   int ck_slots = 8;
@@ -33,8 +33,8 @@ struct EngineOptions {
   int mtp_vocab = 32768;       // MTP draft head vocabulary: first ids + scripts in use + seen tokens (0 = full)            // prompt-cache state checkpoints kept in pinned host memory
   int draft_max = 7;           // max drafts per verify pass (n-gram drafts; MTP chains are capped separately)
   double cpu_frac = -1;         // fraction of streamed FFN rows computed on the CPU (<0: auto per layer)
-  double pcie_gbps = 38.0;      // effective host->GPU bandwidth assumed by the auto balancer
-  double dram_gbps = 44.0;      // host DRAM bandwidth shared by CPU kernels and DMA
+  double pcie_gbps = -1;        // host->GPU bandwidth assumed by the auto balancer (-1: measured at start-up)
+  double dram_gbps = -1;        // host DRAM bandwidth shared by CPU kernels and DMA (-1: measured)
   bool cpu_r4 = true;           // allow lossless R4 repacking of the CPU part
   bool verbose = false;
 };
@@ -234,6 +234,8 @@ class Model {
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
   bool legacy16_ = false;
   bool zc_ = true;
+  double measured_pcie_ = 0;
+  void calibrate_host();
   bool state16_ = false;  // GDN recurrent state stored as fp16
   size_t state_bytes() const { return (size_t)cfg_.nv * cfg_.dv * cfg_.dk * (state16_ ? 2 : 4); }
   qk::GdnBatch* gdn_tab_ = nullptr;  // per-GDN-layer pointers for the batched rollback

@@ -40,7 +40,8 @@ let
 
     cmakeFlags = [
       (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
-      (lib.cmakeFeature "CMAKE_CUDA_ARCHITECTURES" "86-real")
+      # A100 / RTX 30 / RTX 40 / H100 machine code, plus PTX for newer GPUs
+      (lib.cmakeFeature "CMAKE_CUDA_ARCHITECTURES" "80-real;86-real;89-real;90")
     ];
 
     # install the test / benchmark tools too
@@ -94,10 +95,28 @@ let
     trap cleanup EXIT
 
     model="''${LLM_ENGINE_MODEL:-}"
-    if [ -z "$model" ]; then
+    has_m=0
+    case " $* " in *" -m "*|*" --model "*) has_m=1 ;; esac
+    if [ -z "$model" ] && [ "$has_m" = 0 ]; then
+      # default: the Qwen3.8-27B IQ3_XXS-mtp build; otherwise the only qwen35-family GGUF in the HF cache
       for f in "$HOME"/.cache/huggingface/hub/models--huihui-ai--Huihui-Qwen3.8-27B-abliterated-GGUF/snapshots/*/*IQ3_XXS*mtp*.gguf; do
         [ -e "$f" ] && model="$f" && break
       done
+      if [ -z "$model" ]; then
+        cands=()
+        for f in "$HOME"/.cache/huggingface/hub/models--*/snapshots/*/*.gguf; do
+          [ -e "$f" ] || continue
+          case "$(basename "$f")" in mmproj*) continue ;; esac
+          case "$f" in *Qwen3.5*|*Qwen3.6*|*Qwen3.8*|*qwen3.5*|*qwen3.6*|*qwen3.8*) cands+=("$f") ;; esac
+        done
+        if [ "''${#cands[@]}" = 1 ]; then
+          model="''${cands[0]}"
+        elif [ "''${#cands[@]}" -gt 1 ]; then
+          echo "llm-engine: several candidate models found; pass -m <file.gguf> or set LLM_ENGINE_MODEL:" >&2
+          printf '  %s\n' "''${cands[@]}" >&2
+          exit 1
+        fi
+      fi
     fi
     args=("$@")
     case " $* " in

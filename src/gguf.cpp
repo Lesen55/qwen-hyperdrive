@@ -35,6 +35,7 @@ const QTypeInfo& qtype_info(uint32_t t) {
 bool qtype_supported(uint32_t t) {
   switch (t) {
     case QT_F32: case QT_F16: case QT_BF16: case QT_Q2_K: case QT_Q4_K: case QT_Q6_K:
+    case QT_Q3_K: case QT_Q5_K: case QT_Q8_0:
     case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S: case QT_IQ3_XXS: case QT_IQ3_S:
     case QT_IQ1_S: case QT_IQ1_M: case QT_IQ4_XS:
       return true;

@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
   bool all_ok = true;
   for (auto [type, t] : pick) {
     const int K = (int)t->ne[0];
-    const int N = 256;  // test the first 256 rows
+    const int N = (int)std::min<int64_t>(256, t->rows());  // test the first 256 rows
     const size_t rb = qtype_row_bytes(type, K);
     // host reference
     std::vector<float> W((size_t)N * K);

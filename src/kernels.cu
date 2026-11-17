@@ -298,6 +298,74 @@ struct QDec<QT_Q4_K> {
   }
 };
 template <>
+struct QDec<QT_Q5_K> {
+  static constexpr int SCALES = 1;
+  static constexpr int BB = 176;
+  static constexpr bool OFF = true;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int g, W32& o) {
+    uint8_t sc, m;
+    q4k_scale_min(g, b + 4, sc, m);
+    const float d = h2f(b) * sc, mn = -h2f(b + 2) * m;
+    const uint8_t* q = b + 48 + (g / 2) * 32;
+    const uint8_t* qh = b + 16;
+    const int sh = 4 * (g & 1);
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+      o.w[i] = (int)(((ld32a4(q + 4 * i) >> sh) & 0x0F0F0F0Fu) | (((ld32a4(qh + 4 * i) >> g) & 0x01010101u) << 4));
+#pragma unroll
+    for (int l = 0; l < 4; l++) { o.sc[l] = d; o.off[l] = mn; }
+  }
+};
+// Q3_K helpers: the two signed sub-scales (-32..31) of group g, and 2-bit + high-bit -> int8 (-4..3)
+static __device__ __forceinline__ void q3k_scale_pair(const uint8_t* s12, int g, int& s0, int& s1) {
+  const uint32_t a0 = ld32a2(s12), a1 = ld32a2(s12 + 4), tmp = ld32a2(s12 + 8);
+  const uint32_t k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
+  const int w = g / 2;  // aux word holding scales 2g, 2g+1
+  uint32_t aux;
+  if (w == 0) aux = (a0 & k2) | (((tmp >> 0) & k1) << 4);
+  else if (w == 1) aux = (a1 & k2) | (((tmp >> 2) & k1) << 4);
+  else if (w == 2) aux = ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+  else aux = ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+  const int sh = 16 * (g & 1);
+  s0 = (int)((aux >> sh) & 0xff) - 32;
+  s1 = (int)((aux >> (sh + 8)) & 0xff) - 32;
+}
+static __device__ __forceinline__ uint32_t q3k_vals(uint32_t q, uint32_t hm, int shift, int g) {
+  const uint32_t v = ((q >> shift) & 0x03030303u) | (((hm >> g) & 0x01010101u) << 2);  // 0..7
+  return (v & 0x03030303u) | ((((~v) >> 2) & 0x01010101u) * 0xFCu);              // v - 4
+}
+template <>
+struct QDec<QT_Q3_K> {
+  static constexpr int SCALES = 2;
+  static constexpr int BB = 110;
+  static constexpr bool OFF = false;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int g, W32& o) {
+    int s0, s1;
+    q3k_scale_pair(b + 96, g, s0, s1);
+    const float d = h2f(b + 108);
+    const uint8_t* q = b + 32 + 32 * (g / 4);
+    const int shift = 2 * (g % 4);
+#pragma unroll
+    for (int i = 0; i < 8; i++) o.w[i] = (int)q3k_vals(ld32a2(q + 4 * i), ld32a2(b + 4 * i), shift, g);
+    o.sc[0] = o.sc[1] = d * s0;
+    o.sc[2] = o.sc[3] = d * s1;
+  }
+};
+template <>
+struct QDec<QT_Q8_0> {
+  static constexpr int SCALES = 1;
+  static constexpr int BB = 272;  // 8 blocks of 32
+  static constexpr bool OFF = false;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int g, W32& o) {
+    const uint8_t* blk = b + 34 * g;
+    const float d = h2f(blk);
+#pragma unroll
+    for (int i = 0; i < 8; i++) o.w[i] = (int)ld32a2(blk + 2 + 4 * i);
+#pragma unroll
+    for (int l = 0; l < 4; l++) o.sc[l] = d;
+  }
+};
+template <>
 struct QDec<QT_Q6_K> {
   static constexpr int SCALES = 2;  // distinct scale groups per 32 weights
   static constexpr int BB = 210;
@@ -657,7 +725,7 @@ template <int T>
 static bool launch_mmv_tc(const uint8_t* w, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B,
                           float* y, int ldy, bool acc, cudaStream_t s) {
   static const int mode = getenv("QE_MMV_TC") ? atoi(getenv("QE_MMV_TC")) : 0;
-  constexpr bool tc2_ok = T != QT_Q2_K && T != QT_Q4_K;  // min terms not foldable
+  constexpr bool tc2_ok = T != QT_Q2_K && T != QT_Q4_K && T != QT_Q5_K;  // min terms not foldable
   if constexpr (tc2_ok) {
     if (mode == 2 && B >= 2 && B <= 8 && K % 32 == 0) {
       const int grid = cdiv(N, 8);
@@ -1053,7 +1121,7 @@ void matvec_rows(uint32_t type, const void* W, size_t rb, int K, const int* rows
   const uint8_t* w = (const uint8_t*)W;
   switch (type) {
 #define T(t) case t: k_mmv_rows<t><<<cdiv(N, MMV_WARPS), MMV_WARPS * 32, 0, s>>>(w, rb, K, rows, N, xq, xd, y); break;
-    T(QT_Q2_K) T(QT_Q4_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_Q8_0) T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
     T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS)
 #undef T
     default: QE_FATAL("matvec_rows: unsupported type %u", type);
@@ -1067,7 +1135,7 @@ void matvec(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t*
     case QT_F16: launch_mmv_float<QT_F16>(W, rb, K, N, xf, B, y, ldy, acc, s); break;
     case QT_BF16: launch_mmv_float<QT_BF16>(W, rb, K, N, xf, B, y, ldy, acc, s); break;
 #define T(t) case t: launch_mmv_t<t>(W, rb, K, N, xq, xd, B, y, ldy, acc, s); break;
-    T(QT_Q2_K) T(QT_Q4_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_Q8_0) T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
     T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS)
 #undef T
     default: QE_FATAL("matvec: unsupported type %u", type);
@@ -1241,6 +1309,34 @@ template <> struct QInt<QT_Q4_K> {
     for (int i = 0; i < 8; i++) o.w[i] = (int)((ld32a4(q + 4 * i) >> sh) & 0x0F0F0F0Fu);
     o.s[0] = sc;
     o.m[0] = m;
+  }
+};
+template <> struct QInt<QT_Q5_K> {
+  static constexpr int SC = 1; static constexpr bool MIN = true;
+  static __device__ __forceinline__ float fac(const uint8_t* b) { return h2f(b); }
+  static __device__ __forceinline__ float mfac(const uint8_t* b) { return -h2f(b + 2); }
+  static __device__ __forceinline__ void dec(const uint8_t* b, int g, WI& o) {
+    uint8_t sc, m;
+    q4k_scale_min(g, b + 4, sc, m);
+    const uint8_t* q = b + 48 + (g / 2) * 32;
+    const int sh = 4 * (g & 1);
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+      o.w[i] = (int)(((ld32a4(q + 4 * i) >> sh) & 0x0F0F0F0Fu) | (((ld32a4(b + 16 + 4 * i) >> g) & 0x01010101u) << 4));
+    o.s[0] = sc;
+    o.m[0] = m;
+  }
+};
+template <> struct QInt<QT_Q3_K> {
+  static constexpr int SC = 2; static constexpr bool MIN = false;
+  static __device__ __forceinline__ float fac(const uint8_t* b) { return h2f(b + 108); }
+  static __device__ __forceinline__ float mfac(const uint8_t*) { return 0.f; }
+  static __device__ __forceinline__ void dec(const uint8_t* b, int g, WI& o) {
+    q3k_scale_pair(b + 96, g, o.s[0], o.s[1]);
+    const uint8_t* q = b + 32 + 32 * (g / 4);
+    const int shift = 2 * (g % 4);
+#pragma unroll
+    for (int i = 0; i < 8; i++) o.w[i] = (int)q3k_vals(ld32a2(q + 4 * i), ld32a2(b + 4 * i), shift, g);
   }
 };
 template <> struct QInt<QT_Q6_K> {
@@ -1770,7 +1866,7 @@ void gq_decode(uint32_t type, const void* W, size_t rb, int K, int N, void* buf,
   const uint8_t* w = (const uint8_t*)W;
   switch (type) {
 #define T(t) case t: k_gq_decode<t><<<blocks, 256, 0, s>>>(w, rb, K, N, w8, s8, m8, fac, mfac); break;
-    T(QT_Q2_K) T(QT_Q4_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
     T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ4_XS)
 #undef T
     default: QE_FATAL("gq_decode: unsupported type %u", type);
@@ -1782,7 +1878,7 @@ void gq_xsum(const int8_t* xq, int K, int T, int16_t* xs, cudaStream_t s) {
   k_gq_xsum<<<(int)((n + 255) / 256), 256, 0, s>>>(xq, K, T, xs);
 }
 
-bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K; }  // IQ1_S: min folded
+bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K || type == QT_Q5_K; }  // IQ1_S: min folded
 bool gq_supported(uint32_t type) {
   static const bool all = getenv("QE_GQ_MIN") && atoi(getenv("QE_GQ_MIN")) != 0;  // MIN types: +0.4% PPL so far
   return mmq_supported(type) && (all || !gq_needs_xsum(type));
@@ -1796,7 +1892,7 @@ void gq_gemm(uint32_t type, const void* buf, int K, int N, const int8_t* xq, con
   const int8_t* m8 = s8 + al((size_t)N * (K / 16));
   const float* fac = (const float*)(m8 + al((size_t)N * (K / 16)));
   const float* mfac = (const float*)((const uint8_t*)fac + al((size_t)N * (K / 256) * 4));
-  const bool sc2 = type == QT_Q2_K || type == QT_Q6_K || type == QT_IQ2_XS || type == QT_IQ2_S;
+  const bool sc2 = type == QT_Q2_K || type == QT_Q3_K || type == QT_Q6_K || type == QT_IQ2_XS || type == QT_IQ2_S;
   const bool mn = gq_needs_xsum(type);
 #define L(a, b, mt)                                                                                    \
   {                                                                                                   \
@@ -1898,7 +1994,7 @@ void matvec_float_pair(uint32_t type, const void* W1, const void* W2, size_t rb,
 
 bool mmq_supported(uint32_t type) {
   switch (type) {
-    case QT_Q2_K: case QT_Q4_K: case QT_Q6_K: case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S:
+    case QT_Q2_K: case QT_Q3_K: case QT_Q4_K: case QT_Q5_K: case QT_Q6_K: case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S:
     case QT_IQ3_XXS: case QT_IQ3_S: case QT_IQ1_S: case QT_IQ4_XS:
       return true;
     default:
@@ -1911,7 +2007,7 @@ void mmq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq
   switch (type) {
 #define T(t) case t: if (gs == 32) launch_mmq_t<t, 32>(W, rb, K, N, xq, xd, Tt, y, ldy, acc, s); \
                      else launch_mmq_t<t, 256>(W, rb, K, N, xq, xd, Tt, y, ldy, acc, s); break;
-    T(QT_Q2_K) T(QT_Q4_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS) T(QT_IQ3_S)
+    T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS) T(QT_IQ3_S)
     T(QT_IQ1_S) T(QT_IQ4_XS)
 #undef T
     default: QE_FATAL("mmq: unsupported type %u", type);
@@ -1988,7 +2084,7 @@ void dequant_f16(uint32_t type, const void* W, size_t rb, int K, int N, __half* 
     case QT_F16: k_dequant_f16_float<QT_F16><<<cdiv((int64_t)N * K, 256), 256, 0, s>>>(w, rb, K, N, dst); break;
     case QT_BF16: k_dequant_f16_float<QT_BF16><<<cdiv((int64_t)N * K, 256), 256, 0, s>>>(w, rb, K, N, dst); break;
 #define T(t) case t: k_dequant_f16<t><<<cdiv(n32, 128), 128, 0, s>>>(w, rb, K, N, dst); break;
-    T(QT_Q2_K) T(QT_Q4_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_Q8_0) T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
     T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS)
 #undef T
     default: QE_FATAL("dequant_f16: unsupported type %u", type);
@@ -3355,10 +3451,12 @@ __global__ void __launch_bounds__(128, 1)
   }
 }
 
+static int g_num_sms = 68;
+void set_num_sms(int n) { g_num_sms = n > 0 ? n : 68; }
 static int mma_split(int L, int nkv) {
   // largest split (multiple of the tile, divides KV_BLOCK) that still gives >= ~2 CTAs per SM
   int split = 2048;
-  while (split > 256 && (long long)nkv * ((L + split - 1) / split) < 136) split /= 2;
+  while (split > 256 && (long long)nkv * ((L + split - 1) / split) < 2 * g_num_sms) split /= 2;
   return split;
 }
 size_t attn_decode_work_bytes_auto(int max_ctx, int nh, int nkv, int hd, int tokens) {

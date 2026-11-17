@@ -37,6 +37,9 @@ namespace qtab_dev {
 
 struct blk_q2_K { uint8_t scales[16]; uint8_t qs[64]; uint16_t d, dmin; };
 struct blk_q4_K { uint16_t d, dmin; uint8_t scales[12]; uint8_t qs[128]; };
+struct blk_q5_K { uint16_t d, dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; };
+struct blk_q3_K { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; uint16_t d; };
+struct blk_q8_0 { uint16_t d; int8_t qs[32]; };
 struct blk_q6_K { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; };
 struct blk_iq2_xxs { uint16_t d; uint16_t qs[32]; };
 struct blk_iq2_xs { uint16_t d; uint16_t qs[32]; uint8_t scales[8]; };
@@ -129,6 +132,49 @@ template <> QE_HD void dequant32<12>(const uint8_t* p, int g, float* y) {  // Q4
   const float d = qe_h2f(x->d) * sc, mn = qe_h2f(x->dmin) * m;
   const uint8_t* q = x->qs + (g / 2) * 32;
   for (int l = 0; l < 32; l++) y[l] = d * ((g & 1) ? (q[l] >> 4) : (q[l] & 0xF)) - mn;
+}
+template <> QE_HD void dequant32<13>(const uint8_t* p, int g, float* y) {  // Q5_K
+  const blk_q5_K* x = (const blk_q5_K*)p;
+  uint8_t sc, m;
+  q4k_scale_min(g, x->scales, sc, m);
+  const float d = qe_h2f(x->d) * sc, mn = qe_h2f(x->dmin) * m;
+  const uint8_t* q = x->qs + (g / 2) * 32;
+  for (int l = 0; l < 32; l++) {
+    const int lo = (g & 1) ? (q[l] >> 4) : (q[l] & 0xF);
+    y[l] = d * (lo + 16 * ((x->qh[l] >> g) & 1)) - mn;
+  }
+}
+// Q3_K: 16 signed 6-bit sub-scales packed in 12 bytes (ggml layout)
+QE_HD void q3k_scales(const uint8_t* s12, int8_t* out) {
+  uint32_t aux[4];
+  memcpy(aux, s12, 12);
+  const uint32_t tmp = aux[2], k1 = 0x03030303, k2 = 0x0f0f0f0f;
+  aux[2] = ((aux[0] >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+  aux[3] = ((aux[1] >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+  aux[0] = (aux[0] & k2) | (((tmp >> 0) & k1) << 4);
+  aux[1] = (aux[1] & k2) | (((tmp >> 2) & k1) << 4);
+  memcpy(out, aux, 16);
+}
+template <> QE_HD void dequant32<11>(const uint8_t* p, int g, float* y) {  // Q3_K
+  const blk_q3_K* x = (const blk_q3_K*)p;
+  int8_t sc[16];
+  q3k_scales(x->scales, sc);
+  const float d = qe_h2f(x->d);
+  const uint8_t* q = x->qs + 32 * (g / 4);
+  const int shift = 2 * (g % 4);
+  for (int h = 0; h < 2; h++) {
+    const float dl = d * (sc[2 * g + h] - 32);
+    for (int l = 0; l < 16; l++) {
+      const int i = 16 * h + l;
+      y[i] = dl * (((q[i] >> shift) & 3) - ((x->hmask[i] >> g) & 1 ? 0 : 4));
+    }
+  }
+}
+// Q8_0: 32-element blocks; a "super block" here is 8 consecutive blocks (272 bytes)
+template <> QE_HD void dequant32<8>(const uint8_t* p, int g, float* y) {  // Q8_0
+  const blk_q8_0* x = (const blk_q8_0*)(p + 34 * g);
+  const float d = qe_h2f(x->d);
+  for (int l = 0; l < 32; l++) y[l] = d * x->qs[l];
 }
 template <> QE_HD void dequant32<14>(const uint8_t* p, int g, float* y) {  // Q6_K
   const blk_q6_K* x = (const blk_q6_K*)p;
@@ -262,7 +308,10 @@ inline void dequant_row_ref(uint32_t type, const uint8_t* row, int64_t n, float*
   int bb;
   void (*f)(const uint8_t*, int, float*);
   switch (type) {
+    case 8: f = dequant32<8>; bb = 272; break;
     case 10: f = dequant32<10>; bb = 84; break;
+    case 11: f = dequant32<11>; bb = 110; break;
+    case 13: f = dequant32<13>; bb = 176; break;
     case 12: f = dequant32<12>; bb = 144; break;
     case 14: f = dequant32<14>; bb = 210; break;
     case 16: f = dequant32<16>; bb = 66; break;
