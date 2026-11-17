@@ -291,13 +291,14 @@ void Model::plan_and_load() {
   kv_block_bytes_ = (size_t)n_attn * 2 * c.n_kv * qk::KV_BLOCK * recb;
   const size_t kv_bytes = (size_t)n_kv_blocks_ * kv_block_bytes_;
   const int n_gdn = nL - n_attn;
-  size_t ssm_bytes = (size_t)n_gdn * ((size_t)c.nv * c.dv * c.dk * 4 + 3 * (size_t)c.conv_dim() * 4);
+  state16_ = !getenv("QE_STATE16") || atoi(getenv("QE_STATE16")) != 0;  // fp16 state by default (PPL +0.06% in decode)
+  size_t ssm_bytes = (size_t)n_gdn * (state_bytes() + 3 * (size_t)c.conv_dim() * 4);
   if (has_mtp()) {
     opt_.draft_max = std::clamp(opt_.draft_max, 1, qk::kMaxB - 1);
     // saved recurrence inputs of the verified tokens (the accepted prefix is recomputed in place after
     // verification, so no second copy of the state is needed); legacy fp16-GEMM mode keeps a backup
     legacy16_ = getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 1;
-    ssm_bytes += (size_t)n_gdn * ((legacy16_ ? (size_t)c.nv * c.dv * c.dk * 4 : 0) + (3 + qk::kMaxB) * (size_t)c.conv_dim() * 4 +
+    ssm_bytes += (size_t)n_gdn * ((legacy16_ ? state_bytes() : 0) + (3 + qk::kMaxB) * (size_t)c.conv_dim() * 4 +
                                   (size_t)(opt_.draft_max + 1) * (c.conv_dim() + 2 * c.nv) * 4);
   }
   Tmax_ = opt_.ubatch;
@@ -586,10 +587,10 @@ void Model::plan_and_load() {
       L.ssm_a = upload_f32(bn(il, "ssm_a"));
       L.ssm_norm = upload_f32(bn(il, "ssm_norm.weight"));
       L.conv_state = (float*)dalloc(3 * (size_t)c.conv_dim() * 4);
-      L.ssm_state = (float*)dalloc((size_t)c.nv * c.dv * c.dk * 4);
+      L.ssm_state = (float*)dalloc(state_bytes());
       L.gdn_idx = n_gdn_++;
       if (has_mtp()) {
-        if (legacy16_) L.ssm_alt = (float*)dalloc((size_t)c.nv * c.dv * c.dk * 4);
+        if (legacy16_) L.ssm_alt = (float*)dalloc(state_bytes());
         L.sv_qkv = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.conv_dim() * 4);
         L.sv_g = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.nv * 4);
         L.sv_beta = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.nv * 4);
@@ -648,7 +649,7 @@ void Model::plan_and_load() {
   // backed up to pinned host memory before each chunk and restored if a GEMM overflowed
   gemm16_ = !(getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 0);
   if (gemm16_ && has_mtp() && !legacy16_) {
-    const size_t sb = (size_t)n_gdn_ * c.nv * c.dv * c.dk * 4;
+    const size_t sb = (size_t)n_gdn_ * state_bytes();
     if (cudaHostAlloc((void**)&state_bk_host_, sb, cudaHostAllocDefault) != cudaSuccess) gemm16_ = false;
     else host_allocs_.push_back(state_bk_host_);
   }
@@ -751,7 +752,7 @@ void Model::reset() {
   const Config& c = cfg_;
   for (auto& L : layers_) {
     if (L.conv_state) CUDA_CHECK(cudaMemsetAsync(L.conv_state, 0, 3 * (size_t)c.conv_dim() * 4, stream_));
-    if (L.ssm_state) CUDA_CHECK(cudaMemsetAsync(L.ssm_state, 0, (size_t)c.nv * c.dv * c.dk * 4, stream_));
+    if (L.ssm_state) CUDA_CHECK(cudaMemsetAsync(L.ssm_state, 0, state_bytes(), stream_));
   }
   CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
@@ -1069,7 +1070,7 @@ void Model::layer_gdn(int il, int T) {
     ProfScope psr(7, s);
     // verify pass: the state is only read; rollback() recomputes the accepted prefix in place
     qk::gdn_recurrence(qkv, C, gg, bb, L.ssm_state, snap ? nullptr : L.ssm_state, o, c.nk, c.nv, c.dk, T, s,
-                       -1, ck_state);
+                       -1, ck_state, state16_);
   }
   qe_debug_dump("attn_output", il, o, T, c.d_inner, s);
   const bool gq8 = fuse_ && T <= qk::kMaxB && c.dv % 32 == 0;
@@ -1563,17 +1564,15 @@ void Model::seq_drop(int id) {
   if (cur_seq_ == id) cur_seq_ = -1;
 }
 
-size_t Model::ck_state_off(int gi) const { return (size_t)gi * cfg_.nv * cfg_.dv * cfg_.dk * 4; }
-size_t Model::ck_conv_off(int gi) const {
-  return (size_t)n_gdn_ * cfg_.nv * cfg_.dv * cfg_.dk * 4 + (size_t)gi * 3 * cfg_.conv_dim() * 4;
-}
+size_t Model::ck_state_off(int gi) const { return (size_t)gi * state_bytes(); }
+size_t Model::ck_conv_off(int gi) const { return (size_t)n_gdn_ * state_bytes() + (size_t)gi * 3 * cfg_.conv_dim() * 4; }
 size_t Model::ck_carry_off() const { return ck_conv_off(n_gdn_); }
 
 void Model::ck_save_live(int slot) {
   const Config& c = cfg_;
   for (auto& L : layers_) {
     if (L.gdn_idx < 0) continue;
-    CUDA_CHECK(cudaMemcpyAsync(ck_host_[slot] + ck_state_off(L.gdn_idx), L.ssm_state, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(ck_host_[slot] + ck_state_off(L.gdn_idx), L.ssm_state, state_bytes(), cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaMemcpyAsync(ck_host_[slot] + ck_conv_off(L.gdn_idx), L.conv_state, 3 * (size_t)c.conv_dim() * 4, cudaMemcpyDeviceToHost, stream_));
   }
   CUDA_CHECK(cudaMemcpyAsync(ck_host_[slot] + ck_carry_off(), hcarry_, (size_t)c.n_embd * 4, cudaMemcpyDeviceToHost, stream_));
@@ -1584,7 +1583,7 @@ void Model::ck_restore(int slot) {
   const Config& c = cfg_;
   for (auto& L : layers_) {
     if (L.gdn_idx < 0) continue;
-    CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, ck_host_[slot] + ck_state_off(L.gdn_idx), (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, ck_host_[slot] + ck_state_off(L.gdn_idx), state_bytes(), cudaMemcpyHostToDevice, stream_));
     CUDA_CHECK(cudaMemcpyAsync(L.conv_state, ck_host_[slot] + ck_conv_off(L.gdn_idx), 3 * (size_t)c.conv_dim() * 4, cudaMemcpyHostToDevice, stream_));
   }
   CUDA_CHECK(cudaMemcpyAsync(hcarry_, ck_host_[slot] + ck_carry_off(), (size_t)c.n_embd * 4, cudaMemcpyHostToDevice, stream_));
@@ -1783,13 +1782,14 @@ void Model::rollback(int n_keep) {
   const Config& c = cfg_;
   QE_ASSERT(snap_valid_ && n_keep >= 1 && n_keep <= snap_T_);
   if (gdn_tab_) {  // one launch for all layers (state traffic at full bandwidth instead of 96 small launches)
-    qk::gdn_rollback_batched(gdn_tab_, n_gdn_tab_, c.conv_dim(), c.nk, c.nv, c.dk, n_keep, c.conv_dim(), n_keep < snap_T_, stream_);
+    qk::gdn_rollback_batched(gdn_tab_, n_gdn_tab_, c.conv_dim(), c.nk, c.nv, c.dk, n_keep, c.conv_dim(), n_keep < snap_T_, stream_,
+                             state16_);
   } else {
     for (auto& L : layers_) {
       if (!L.sv_qkv) continue;
       // advance the (untouched) pre-pass state by the accepted tokens, in place
       qk::gdn_recurrence(L.sv_qkv, c.conv_dim(), L.sv_g, L.sv_beta, L.ssm_state, L.ssm_state, nullptr, c.nk, c.nv,
-                         c.dk, n_keep, stream_);
+                         c.dk, n_keep, stream_, -1, nullptr, state16_);
       if (n_keep < snap_T_) qk::ssm_conv_rollback(L.conv_state, L.conv_hist, c.conv_dim(), n_keep, stream_);
     }
   }
@@ -1865,8 +1865,8 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     if (g16) {
       for (auto& L : layers_) {
         if (!L.conv_hist) continue;
-        if (L.ssm_alt) CUDA_CHECK(cudaMemcpyAsync(L.ssm_alt, L.ssm_state, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToDevice, stream_));
-        else CUDA_CHECK(cudaMemcpyAsync(state_bk_host_ + (size_t)L.gdn_idx * c.nv * c.dv * c.dk, L.ssm_state, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToHost, stream_));
+        if (L.ssm_alt) CUDA_CHECK(cudaMemcpyAsync(L.ssm_alt, L.ssm_state, state_bytes(), cudaMemcpyDeviceToDevice, stream_));
+        else CUDA_CHECK(cudaMemcpyAsync((float*)((uint8_t*)state_bk_host_ + (size_t)L.gdn_idx * state_bytes()), L.ssm_state, state_bytes(), cudaMemcpyDeviceToHost, stream_));
         CUDA_CHECK(cudaMemcpyAsync(L.conv_hist, L.conv_state, 3 * (size_t)c.conv_dim() * 4, cudaMemcpyDeviceToDevice, stream_));
       }
       CUDA_CHECK(cudaMemcpyAsync(hcarry_bk_, hcarry_, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
@@ -1939,8 +1939,8 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
         if (!test_ovf) QE_LOG("[warn] fp16 GEMM overflow in chunk at %d: recomputing with fp32 accumulation\n", p0);
         for (auto& L : layers_) {
           if (!L.conv_hist) continue;
-          if (L.ssm_alt) CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, L.ssm_alt, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyDeviceToDevice, stream_));
-          else CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, state_bk_host_ + (size_t)L.gdn_idx * c.nv * c.dv * c.dk, (size_t)c.nv * c.dv * c.dk * 4, cudaMemcpyHostToDevice, stream_));
+          if (L.ssm_alt) CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, L.ssm_alt, state_bytes(), cudaMemcpyDeviceToDevice, stream_));
+          else CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, (float*)((uint8_t*)state_bk_host_ + (size_t)L.gdn_idx * state_bytes()), state_bytes(), cudaMemcpyHostToDevice, stream_));
           CUDA_CHECK(cudaMemcpyAsync(L.conv_state, L.conv_hist, 3 * (size_t)c.conv_dim() * 4, cudaMemcpyDeviceToDevice, stream_));
         }
         CUDA_CHECK(cudaMemcpyAsync(hcarry_, hcarry_bk_, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));

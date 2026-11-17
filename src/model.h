@@ -234,6 +234,8 @@ class Model {
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
   bool legacy16_ = false;
   bool zc_ = true;
+  bool state16_ = false;  // GDN recurrent state stored as fp16
+  size_t state_bytes() const { return (size_t)cfg_.nv * cfg_.dv * cfg_.dk * (state16_ ? 2 : 4); }
   qk::GdnBatch* gdn_tab_ = nullptr;  // per-GDN-layer pointers for the batched rollback
   int n_gdn_tab_ = 0;
   // online choice of the decode CPU mode (0 = GPU-only, 1 = hybrid)

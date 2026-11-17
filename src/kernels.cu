@@ -3493,6 +3493,30 @@ void gdn_prep(float* qkv, int qts, const float* alpha, const float* beta_raw, in
 }
 
 // grid (nv, dv/32): CTA = 8 warps x 4 columns; lane holds rows 4*lane..4*lane+3 (dk = 128)
+// GDN state element access: fp32, or fp16 (QE_STATE16: half the state traffic and VRAM)
+template <bool H>
+static __device__ __forceinline__ float4 state_ld(const float* p, size_t i) {
+  if constexpr (H) {
+    const uint2 u = *(const uint2*)((const __half*)p + i);
+    const float2 a = __half22float2(*(const __half2*)&u.x), b = __half22float2(*(const __half2*)&u.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+  } else {
+    return *(const float4*)(p + i);
+  }
+}
+template <bool H>
+static __device__ __forceinline__ void state_st(float* p, size_t i, float4 v) {
+  if constexpr (H) {
+    const __half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+    uint2 u;
+    u.x = *(const uint32_t*)&a;
+    u.y = *(const uint32_t*)&b;
+    *(uint2*)((__half*)p + i) = u;
+  } else {
+    *(float4*)(p + i) = v;
+  }
+}
+template <bool H>
 __global__ void __launch_bounds__(256)
     k_gdn_rec(const float* __restrict__ qkv, int qts, const float* __restrict__ g,
               const float* __restrict__ beta, const float* state, float* state_out,
@@ -3508,10 +3532,10 @@ __global__ void __launch_bounds__(256)
   const int j0 = blockIdx.y * 32 + warp * 4;
   const int hk = h % nk;
   float S[4][4];  // [column jj][row r]
-  const float* st = state + (size_t)h * DV * DK;
+  const size_t hoff = (size_t)h * DV * DK;
 #pragma unroll
   for (int jj = 0; jj < 4; jj++) {
-    const float4 v = *(const float4*)(st + (size_t)(j0 + jj) * DK + 4 * lane);
+    const float4 v = state_ld<H>(state, hoff + (size_t)(j0 + jj) * DK + 4 * lane);
     S[jj][0] = v.x; S[jj][1] = v.y; S[jj][2] = v.z; S[jj][3] = v.w;
   }
   const float qscale = rsqrtf((float)DK);
@@ -3574,24 +3598,31 @@ __global__ void __launch_bounds__(256)
   }
   }
   if (!state_out) return;  // verify pass: state is read-only
-  float* so = state_out + (size_t)h * DV * DK;
 #pragma unroll
   for (int jj = 0; jj < 4; jj++)
-    *(float4*)(so + (size_t)(j0 + jj) * DK + 4 * lane) = make_float4(S[jj][0], S[jj][1], S[jj][2], S[jj][3]);
+    state_st<H>(state_out, hoff + (size_t)(j0 + jj) * DK + 4 * lane, make_float4(S[jj][0], S[jj][1], S[jj][2], S[jj][3]));
 }
 void gdn_rollback_batched(const GdnBatch* tab, int nl, int qts, int nk, int nv, int dk, int n_keep, int C, bool conv,
-                          cudaStream_t s) {
+                          cudaStream_t s, bool half) {
   QE_ASSERT(dk == 128);
-  k_gdn_rec<<<dim3(nv, 128 / 32, nl), 256, 0, s>>>(nullptr, qts, nullptr, nullptr, nullptr, nullptr, nullptr, nk, nv, n_keep,
-                                                   -1, nullptr, tab);
+  if (half)
+    k_gdn_rec<true><<<dim3(nv, 128 / 32, nl), 256, 0, s>>>(nullptr, qts, nullptr, nullptr, nullptr, nullptr, nullptr, nk, nv,
+                                                         n_keep, -1, nullptr, tab);
+  else
+    k_gdn_rec<false><<<dim3(nv, 128 / 32, nl), 256, 0, s>>>(nullptr, qts, nullptr, nullptr, nullptr, nullptr, nullptr, nk, nv,
+                                                          n_keep, -1, nullptr, tab);
   if (conv) k_conv_rollback_b<<<dim3(cdiv(C, 256), nl), 256, 0, s>>>(tab, C, n_keep);
 }
 void gdn_recurrence(const float* qkv, int qts, const float* g, const float* beta, const float* state_in,
                     float* state_out, float* out, int nk, int nv, int dk, int T, cudaStream_t s, int snap_t,
-                    float* snap) {
+                    float* snap, bool half) {
   QE_ASSERT(dk == 128);
-  k_gdn_rec<<<dim3(nv, 128 / 32), 256, 0, s>>>(qkv, qts, g, beta, state_in, state_out, out, nk, nv, T,
-                                               snap ? snap_t : -1, snap);
+  if (half)
+    k_gdn_rec<true><<<dim3(nv, 128 / 32), 256, 0, s>>>(qkv, qts, g, beta, state_in, state_out, out, nk, nv, T,
+                                                     snap ? snap_t : -1, snap);
+  else
+    k_gdn_rec<false><<<dim3(nv, 128 / 32), 256, 0, s>>>(qkv, qts, g, beta, state_in, state_out, out, nk, nv, T,
+                                                      snap ? snap_t : -1, snap);
 }
 
 __global__ void k_gdn_gated_norm(float* o, const float* __restrict__ z, int zts,

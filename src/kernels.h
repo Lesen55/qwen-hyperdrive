@@ -141,10 +141,10 @@ struct GdnBatch {  // per-layer pointers for the batched rollback
   const float* conv_hist;
 };
 void gdn_rollback_batched(const GdnBatch* tab, int nl, int qts, int nk, int nv, int dk, int n_keep, int C, bool conv,
-                          cudaStream_t s);
+                          cudaStream_t s, bool half = false);
 void gdn_recurrence(const float* qkv, int qkv_tstride, const float* g, const float* beta,
                     const float* state_in, float* state_out, float* out, int nk, int nv, int dk, int T,
-                    cudaStream_t s, int snap_t = -1, float* snap = nullptr);
+                    cudaStream_t s, int snap_t = -1, float* snap = nullptr, bool half = false);
 // out[t][h*dv+i] = rmsnorm(out_h) * w[i] * silu(z[t][h*dv+i])
 void gdn_gated_norm(float* o, const float* z, int z_tstride, const float* w, int nv, int dv,
                     int T, float eps, cudaStream_t s, __half* o16 = nullptr, int8_t* xq = nullptr,
