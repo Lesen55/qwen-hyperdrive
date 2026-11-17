@@ -33,6 +33,8 @@ int main(int argc, char** argv) {
   std::string ids_path;
   int n_gen = 32, chunk = 512, reserve = 4096;
   float spec_relax = 1.f;
+  int mtp_max = 3;
+  bool ngram = true;
   float draft_pmin = 0.f;
   SamplingParams sp;
   sp.temperature = 0.f;
@@ -59,7 +61,8 @@ int main(int argc, char** argv) {
     else if (a == "--no-mtp") opt.use_mtp = false;
     else if (a == "--no-elastic") opt.elastic_kv = false;
     else if (a == "--reserve") reserve = std::stoi(next());
-    else if (a == "--draft") opt.draft_max = std::stoi(next());
+    else if (a == "--draft") mtp_max = std::stoi(next());
+    else if (a == "--no-ngram") ngram = false;
     else if (a == "--cache-keep") opt.cache_keep = std::stoi(next());
     else if (a == "--cache-blocks") opt.cache_blocks = std::stoi(next());
     else if (a == "--cache-host-mb") opt.cache_host_mb = std::stoi(next());
@@ -105,6 +108,8 @@ int main(int argc, char** argv) {
     Generator gen(model, sp, opt.use_mtp);
     gen.set_draft_pmin(draft_pmin);
     gen.set_spec_relax(spec_relax);
+    gen.set_mtp_max(mtp_max);
+    gen.set_ngram(ngram);
     std::vector<int> out;
     // QE_REPEAT=n: run the same generation n times through the prompt cache (server-like reuse)
     for (int rep = getenv("QE_REPEAT") ? atoi(getenv("QE_REPEAT")) : 1; rep > 1; rep--) {
@@ -126,6 +131,7 @@ int main(int argc, char** argv) {
            ids.size(), st.t_prefill, ids.size() / st.t_prefill, st.generated - 1, st.t_decode,
            (st.generated - 1) / st.t_decode, st.accepted, st.drafted);
     printf("time: verify %.2f s, sample %.2f s, mtp+rollback %.2f s\n", st.t_verify, st.t_sample, st.t_mtp);
+    printf("n-gram drafted steps %d: accepted %d/%d\n", st.ng_steps, st.ng_accepted, st.ng_drafted);
     printf("steps %d, accepted-per-step histogram: 0:%d 1:%d 2:%d 3:%d  (%.2f tok/step)\n", st.steps, st.acc_hist[0],
            st.acc_hist[1], st.acc_hist[2], st.acc_hist[3], (st.generated - 1) / (double)std::max(1, st.steps));
   }

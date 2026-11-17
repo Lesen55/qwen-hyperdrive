@@ -31,7 +31,7 @@ struct EngineOptions {
   int cache_blocks = 0;        // ... resident in VRAM with at most this many KV blocks (others: host RAM)
   int cache_host_mb = 6144;    // host RAM for offloaded KV of inactive conversations (LRU beyond)   // lossy: layers whose FFN block is dropped (saves their PCIe/VRAM bytes)
   int mtp_vocab = 0;           // MTP draft head vocabulary subset (first ids + special tail), 0 = full            // prompt-cache state checkpoints kept in pinned host memory
-  int draft_max = 3;           // MTP chained draft length (1..3)
+  int draft_max = 7;           // max drafts per verify pass (n-gram drafts; MTP chains are capped separately)
   double cpu_frac = -1;         // fraction of streamed FFN rows computed on the CPU (<0: auto per layer)
   double pcie_gbps = 38.0;      // effective host->GPU bandwidth assumed by the auto balancer
   double dram_gbps = 44.0;      // host DRAM bandwidth shared by CPU kernels and DMA
@@ -120,7 +120,9 @@ class Model {
   // normed hidden states of the previous forward (rows hrow0..hrow0+n-1) or the carried row (hrow0 = -1).
   // Returns the greedy draft token predicted after the last pair.
   // logits_host (optional): receives the MTP logits of the last row (for sampled drafts).
-  int mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf = nullptr, float* logits_host = nullptr);
+  // head=false: only run the MTP block (fills its KV for these positions), no logits / draft
+  int mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf = nullptr, float* logits_host = nullptr,
+                bool head = true);
   // Chained draft: pair (MTP output hidden of the previous mtp_* call, token) at MTP position pos.
   int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr);
   int draft_max() const { return opt_.draft_max; }

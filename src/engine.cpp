@@ -207,6 +207,9 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
   m_.prepare_context(n + reserve);
   const double t_prep = qe_now();
   history_ = prompt;
+  ng_idx_.clear();
+  ng_built_ = 0;
+  last_ng_ = false;
   const int m = n - p0;
   if (sampler_.greedy()) m_.forward(prompt.data() + p0, m, p0, nullptr, 1, &last_, false, mtp_);
   else {
@@ -250,7 +253,7 @@ void Generator::make_drafts(int first_argmax, bool have_logits) {
   }
   drafts_.push_back(d);
   hist.push_back(d);
-  const int maxd = std::min(m_.draft_max(), want_drafts_);
+  const int maxd = std::min({m_.draft_max(), mtp_max_, want_drafts_});
   for (int k = 1; k < maxd; k++) {
     float conf = 1.f;
     const int a = m_.mtp_chain(d, pos_ + k, g && draft_pmin_ > 0 ? &conf : nullptr, g ? nullptr : mtp_logits_.data());
@@ -267,6 +270,27 @@ void Generator::make_drafts(int first_argmax, bool have_logits) {
   }
 }
 
+bool Generator::ngram_lookup(std::vector<int>& out) {
+  const int N = ngram_n_, H = (int)history_.size();
+  auto key = [&](int end) {  // hash of history_[end-N+1 .. end]
+    uint64_t h = 1469598103934665603ull;
+    for (int i = end - N + 1; i <= end; i++) h = (h ^ (uint32_t)history_[i]) * 1099511628211ull;
+    return h;
+  };
+  // index every n-gram that has a continuation (ends before the last token), latest occurrence wins
+  for (; (int)ng_built_ + 1 < H; ng_built_++)
+    if ((int)ng_built_ >= N - 1) ng_idx_[key((int)ng_built_)] = (int)ng_built_;
+  if (H < N) return false;
+  auto it = ng_idx_.find(key(H - 1));
+  if (it == ng_idx_.end()) return false;
+  const int p = it->second;
+  for (int i = 0; i < N; i++)  // guard against hash collisions
+    if (history_[p - i] != history_[H - 1 - i]) return false;
+  const int maxd = m_.draft_max();
+  for (int i = p + 1; i < H && (int)out.size() < maxd; i++) out.push_back(history_[i]);
+  return !out.empty();
+}
+
 // Choose the draft length maximizing expected tokens per second:
 //   E[tokens | n] = 1 + sum_{k<=n} prod_{j<=k} alpha_j,   time(n) = EMA step time with n drafts.
 // Unmeasured lengths are explored occasionally so their time estimate stays current.
@@ -278,7 +302,7 @@ void Generator::update_policy(int nd, int a, double dt) {
   }
   tstep_[nd] = nstep_[nd] ? (1 - 0.1) * tstep_[nd] + 0.1 * dt : dt;
   nstep_[nd]++;
-  const int maxd = m_.draft_max();
+  const int maxd = std::min(m_.draft_max(), mtp_max_);
   int best = maxd;
   double best_rate = 0;
   bool explore = false;
@@ -365,7 +389,14 @@ void Generator::step(std::vector<int>& out) {
       break;
     }
   }
-  update_policy(nd, a, qe_now() - t0);
+  if (last_ng_) {
+    st_.ng_steps++;
+    st_.ng_drafted += nd;
+    st_.ng_accepted += a;
+    ng_run_ = 0.7 * ng_run_ + 0.3 * a;  // recent accepted run length -> n-gram draft cap
+  } else {
+    update_policy(nd, a, qe_now() - t0);
+  }
   st_.drafted += nd;
   st_.accepted += a;
   st_.acc_hist[std::min(a, 3)]++;
@@ -389,7 +420,43 @@ void Generator::step(std::vector<int>& out) {
   const int d = m_.mtp_draft(0, toks, a + 1, pos_ - a, g && draft_pmin_ > 0 ? &conf : nullptr, g ? nullptr : mtp_logits_.data());
   drafts_.clear();
   dq_.clear();
-  if (conf >= draft_pmin_) make_drafts(d, !g);
+  last_ng_ = false;
+  std::vector<int> ng;
+  if (ngram_on_ && ngram_lookup(ng)) {
+    // first draft from the MTP head; when it agrees with the n-gram continuation, extend with the
+    // rest of the n-gram (free) instead of running the MTP chain
+    int d0 = d;
+    if (!g) {
+      dq_.emplace_back();
+      sampler_.dist(mtp_logits_.data(), m_.cfg().n_vocab, history_, dq_.back());
+      d0 = sampler_.draw(dq_.back());
+    }
+    if (d0 == ng[0]) {
+      last_ng_ = true;
+      const int cap = std::clamp((int)std::lround(ng_run_ + 2.0), 2, m_.draft_max());
+      drafts_.push_back(d0);
+      for (int i = 1; i < (int)ng.size() && i < cap; i++) {
+        drafts_.push_back(ng[i]);
+        if (!g) dq_.push_back(Dist{{ng[i], 1.f}});  // deterministic proposal: q = point mass
+      }
+    } else if (!g) {
+      // keep the sampled first draft and continue with the MTP chain
+      drafts_.push_back(d0);
+      std::vector<int> hist = history_;
+      hist.push_back(d0);
+      const int maxd = std::min({m_.draft_max(), mtp_max_, want_drafts_});
+      int dd = d0;
+      for (int k = 1; k < maxd; k++) {
+        m_.mtp_chain(dd, pos_ + k, nullptr, mtp_logits_.data());
+        dq_.emplace_back();
+        sampler_.dist(mtp_logits_.data(), m_.cfg().n_vocab, hist, dq_.back());
+        dd = sampler_.draw(dq_.back());
+        drafts_.push_back(dd);
+        hist.push_back(dd);
+      }
+    }
+  }
+  if (drafts_.empty() && conf >= draft_pmin_) make_drafts(d, !g);
   st_.t_mtp += qe_now() - tv;
   st_.t_decode += qe_now() - t0;
 }

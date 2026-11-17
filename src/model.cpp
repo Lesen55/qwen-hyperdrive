@@ -1190,7 +1190,7 @@ int Model::mtp_finish(int n, float* conf, float* logits_host) {
   return d;
 }
 
-int Model::mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf, float* logits_host) {
+int Model::mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf, float* logits_host, bool head) {
   const Config& c = cfg_;
   QE_ASSERT(has_mtp() && n >= 1 && n <= qk::kMaxB);
   ensure_kv(pos0 + n + 1);
@@ -1199,6 +1199,10 @@ int Model::mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf,
   float* hsafe = hsafe_;
   CUDA_CHECK(cudaMemcpyAsync(hsafe, src, (size_t)n * c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
   mtp_block(hsafe, tokens, n, pos0);
+  if (!head) {
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    return -1;
+  }
   return mtp_finish(n, conf, logits_host);
 }
 

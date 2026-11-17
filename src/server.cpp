@@ -107,6 +107,8 @@ std::string take_utf8(std::string& buf) {
 
 struct Server {
   EngineOptions opt;
+  bool ngram = true;
+  int mtp_max = 3;
   float spec_relax = 1.f;  // >1: lenient speculative acceptance (faster, slightly biased sampling)
   std::unique_ptr<Model> model;
   std::unique_ptr<Tokenizer> tok;
@@ -617,6 +619,8 @@ int main(int argc, char** argv) {
     else if (a == "--no-mtp") srv.opt.use_mtp = false;
     else if (a == "-v" || a == "--verbose") srv.opt.verbose = true;
     else if (a == "--spec-relax") srv.spec_relax = std::stof(next());
+    else if (a == "--no-ngram") srv.ngram = false;
+    else if (a == "--draft") srv.mtp_max = std::stoi(next());
     else if (a == "--cache-keep") srv.opt.cache_keep = std::stoi(next());
     else if (a == "--cache-blocks") srv.opt.cache_blocks = std::stoi(next());
     else if (a == "--cache-host-mb") srv.opt.cache_host_mb = std::stoi(next());
@@ -640,6 +644,8 @@ int main(int argc, char** argv) {
   srv.stop_ids[1] = srv.tok->find("<|endoftext|>");
   srv.gen->set_boundary_token(srv.tok->find("<|im_start|>"));
   srv.gen->set_spec_relax(srv.spec_relax);
+  srv.gen->set_mtp_max(srv.mtp_max);
+  srv.gen->set_ngram(srv.ngram);
   {
     std::string p = srv.opt.model_path;
     const size_t sl = p.find_last_of('/');
