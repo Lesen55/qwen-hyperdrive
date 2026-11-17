@@ -97,6 +97,7 @@ std::string take_utf8(std::string& buf) {
 
 struct Server {
   EngineOptions opt;
+  float spec_relax = 1.f;  // >1: lenient speculative acceptance (faster, slightly biased sampling)
   std::unique_ptr<Model> model;
   std::unique_ptr<Tokenizer> tok;
   std::unique_ptr<Generator> gen;
@@ -340,10 +341,11 @@ int main(int argc, char** argv) {
     else if (a == "--vram-reserve") srv.opt.vram_reserve_mb = std::stoul(next());
     else if (a == "--no-mtp") srv.opt.use_mtp = false;
     else if (a == "-v" || a == "--verbose") srv.opt.verbose = true;
+    else if (a == "--spec-relax") srv.spec_relax = std::stof(next());
     else if (a == "--no-elastic") srv.opt.elastic_kv = false;
     else if (a == "-h" || a == "--help") {
       printf("usage: qwen35-server -m model.gguf [--host 127.0.0.1] [--port 8080] [-c 131072] [--kv q4|q8|f16]\n"
-             "                    [--cpu-frac auto|0..1] [--pcie-gbps 20] [-t 6] [--ubatch 512] [--vram-reserve 64] [--no-mtp] [--no-elastic]\n");
+             "                    [--cpu-frac auto|0..1] [--pcie-gbps 20] [-t 6] [--ubatch 512] [--vram-reserve 64] [--no-mtp] [--no-elastic] [--spec-relax 1]\n");
       return 0;
     } else QE_FATAL("unknown argument %s (see --help)", a.c_str());
   }
@@ -354,6 +356,7 @@ int main(int argc, char** argv) {
   srv.stop_ids[0] = srv.tok->eos();
   srv.stop_ids[1] = srv.tok->find("<|endoftext|>");
   srv.gen->set_boundary_token(srv.tok->find("<|im_start|>"));
+  srv.gen->set_spec_relax(srv.spec_relax);
   {
     std::string p = srv.opt.model_path;
     const size_t sl = p.find_last_of('/');

@@ -59,6 +59,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 | `--no-elastic` | | 未使用 KV プールの FFN 層への貸し出しを無効化 |
 | `-v` | | 詳細ログ（キャッシュ・貸し出し・TTFT 内訳） |
 | `--vram-reserve` | 64 | 空けておく VRAM (MiB) |
+| `--spec-relax λ` | 1 | 投機デコードの採択を min(1, λp/q) に緩める（λ>1 で速くなる代わりに分布がわずかに MTP 側へ偏る。λ=4 で約 +13%） |
 
 開発: `nix develop` → `cmake -S . -B build -G Ninja && ninja -C build`。
 CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）。

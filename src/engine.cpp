@@ -90,7 +90,7 @@ static float prob_of(const Dist& d, int id) {
 
 Generator::Generator(Model& m, const SamplingParams& sp, bool use_mtp)
     : m_(m), sampler_(sp), mtp_(use_mtp && m.has_mtp()) {
-  logits_.resize((size_t)4 * m.cfg().n_vocab);
+  logits_.resize((size_t)qk::kMaxB * m.cfg().n_vocab);  // verify rows (up to draft_max + 1)
   mtp_logits_.resize(m.cfg().n_vocab);
 }
 
@@ -316,9 +316,9 @@ void Generator::step(std::vector<int>& out) {
   // verify [last, d1..dn] in one pass
   const int nd = (int)drafts_.size();
   const int T = 1 + nd;
-  int in[4] = {last_, 0, 0, 0};
+  int in[8] = {last_};
   for (int i = 0; i < nd; i++) in[1 + i] = drafts_[i];
-  int am[4];
+  int am[8];
   double tv = qe_now();
   if (g) m_.forward(in, T, pos_, nullptr, T, am, nd > 0);
   else m_.forward(in, T, pos_, logits_.data(), T, nullptr, nd > 0);
@@ -342,7 +342,8 @@ void Generator::step(std::vector<int>& out) {
       if (a == nd) { s = sampler_.draw(p); break; }
       const int x = drafts_[a];
       const float px = prob_of(p, x), qx = prob_of(dq_[a], x);
-      if (qx > 0 && sampler_.uniform() * qx < px) {
+      // spec_relax_ > 1 accepts drafts more leniently (min(1, lambda*p/q)): faster, slightly biased
+      if (qx > 0 && sampler_.uniform() * qx < spec_relax_ * px) {
         history_.push_back(x);
         out.push_back(x);
         a++;
@@ -375,7 +376,7 @@ void Generator::step(std::vector<int>& out) {
   if (nd > 0) m_.rollback(a + 1);  // commit the accepted prefix of the verify pass
   m_.set_carry_row(a);
   // MTP: pairs (h_{pos+i}, x_{pos+i+1}) for i = 0..a  ->  next drafts
-  int toks[4];
+  int toks[8];
   for (int i = 0; i < a; i++) toks[i] = drafts_[i];
   toks[a] = s;
   pos_ += a + 1;

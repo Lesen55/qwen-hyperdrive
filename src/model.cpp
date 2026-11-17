@@ -240,7 +240,7 @@ void Model::plan_and_load() {
   const int n_gdn = nL - n_attn;
   size_t ssm_bytes = (size_t)n_gdn * ((size_t)c.nv * c.dv * c.dk * 4 + 3 * (size_t)c.conv_dim() * 4);
   if (has_mtp()) {
-    opt_.draft_max = std::clamp(opt_.draft_max, 1, 3);
+    opt_.draft_max = std::clamp(opt_.draft_max, 1, qk::kMaxB - 1);
     // saved recurrence inputs of the verified tokens (the accepted prefix is recomputed in place after
     // verification, so no second copy of the state is needed); legacy fp16-GEMM mode keeps a backup
     legacy16_ = getenv("QE_GEMM16") && atoi(getenv("QE_GEMM16")) == 1;

@@ -45,6 +45,7 @@ class Generator {
   void set_sampling(const SamplingParams& sp) { sampler_ = Sampler(sp); }
   void set_draft_pmin(float p) { draft_pmin_ = p; }
   void set_boundary_token(int id) { boundary_tok_ = id; }
+  void set_spec_relax(float l) { spec_relax_ = l < 1.f ? 1.f : l; }
   // Process the prompt; returns the first generated token.  If the model state currently holds a
   // strict prefix of `prompt` (previous conversation turn), only the new suffix is processed.
   int start(const std::vector<int>& prompt, bool allow_reuse = true, int reserve = 4096);
@@ -77,14 +78,15 @@ class Generator {
   std::vector<int> slot_seq_, slot_pos_;
   std::vector<uint64_t> slot_used_;
   uint64_t clk_ = 0;
-  int boundary_tok_ = -1;                     // <|im_start|>: checkpoint before the generation prompt
+  int boundary_tok_ = -1;
+  float spec_relax_ = 1.f;                     // <|im_start|>: checkpoint before the generation prompt
   int take_slot(int seq, int pos);
   void drop_slot(int slot);
   std::vector<int>& committed() { return convs_[live_].toks; }
   // adaptive draft length: EMA of acceptance at each depth and of step time per verify size
-  double alpha_[4] = {0.7, 0.6, 0.5, 0.5};
-  double tstep_[5] = {0, 0, 0, 0, 0};
-  int nstep_[5] = {0, 0, 0, 0, 0};
+  double alpha_[8] = {0.7, 0.6, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
+  double tstep_[9] = {};
+  int nstep_[9] = {};
   int want_drafts_ = 3;
   void update_policy(int nd, int a, double dt);
   int reused_ = 0;

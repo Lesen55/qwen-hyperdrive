@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
   EngineOptions opt;
   std::string ids_path;
   int n_gen = 32, chunk = 512, reserve = 4096;
+  float spec_relax = 1.f;
   float draft_pmin = 0.f;
   SamplingParams sp;
   sp.temperature = 0.f;
@@ -60,6 +61,7 @@ int main(int argc, char** argv) {
     else if (a == "--reserve") reserve = std::stoi(next());
     else if (a == "--draft") opt.draft_max = std::stoi(next());
     else if (a == "--vram-reserve") opt.vram_reserve_mb = std::stoul(next());
+    else if (a == "--spec-relax") spec_relax = std::stof(next());
     else if (a == "--mtp-vocab") opt.mtp_vocab = std::stoi(next());
     else if (a == "--draft-pmin") draft_pmin = std::stof(next());
     else if (a == "-v") opt.verbose = true;
@@ -95,6 +97,7 @@ int main(int argc, char** argv) {
   } else if (cmd == "gen") {
     Generator gen(model, sp, opt.use_mtp);
     gen.set_draft_pmin(draft_pmin);
+    gen.set_spec_relax(spec_relax);
     std::vector<int> out;
     // QE_REPEAT=n: run the same generation n times through the prompt cache (server-like reuse)
     for (int rep = getenv("QE_REPEAT") ? atoi(getenv("QE_REPEAT")) : 1; rep > 1; rep--) {

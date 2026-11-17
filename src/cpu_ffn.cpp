@@ -272,7 +272,11 @@ void mv_b(const uint8_t* W, size_t rb, int K, int r0, int r1, const Q8Act& x, in
     case 2: mv<T, 2>(W, rb, K, r0, r1, x, y, ldy); break;
     case 3: mv<T, 3>(W, rb, K, r0, r1, x, y, ldy); break;
     case 4: mv<T, 4>(W, rb, K, r0, r1, x, y, ldy); break;
-    default: QE_FATAL("cpu matvec: batch %d > 4 not supported", B);
+    case 5: mv<T, 5>(W, rb, K, r0, r1, x, y, ldy); break;
+    case 6: mv<T, 6>(W, rb, K, r0, r1, x, y, ldy); break;
+    case 7: mv<T, 7>(W, rb, K, r0, r1, x, y, ldy); break;
+    case 8: mv<T, 8>(W, rb, K, r0, r1, x, y, ldy); break;
+    default: QE_FATAL("cpu matvec: batch %d > 8 not supported", B);
   }
 }
 
@@ -389,7 +393,11 @@ void matvec_r4(const int8_t* tab, const uint8_t* W, int K, int r0, int r1, const
     case 2: mv_r4<2>(tab, W, K, r0, r1, x, y, ldy); break;
     case 3: mv_r4<3>(tab, W, K, r0, r1, x, y, ldy); break;
     case 4: mv_r4<4>(tab, W, K, r0, r1, x, y, ldy); break;
-    default: QE_FATAL("cpu matvec_r4: batch %d > 4", B);
+    case 5: mv_r4<5>(tab, W, K, r0, r1, x, y, ldy); break;
+    case 6: mv_r4<6>(tab, W, K, r0, r1, x, y, ldy); break;
+    case 7: mv_r4<7>(tab, W, K, r0, r1, x, y, ldy); break;
+    case 8: mv_r4<8>(tab, W, K, r0, r1, x, y, ldy); break;
+    default: QE_FATAL("cpu matvec_r4: batch %d > 8", B);
   }
 }
 

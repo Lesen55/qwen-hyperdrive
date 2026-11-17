@@ -226,7 +226,7 @@ class Model {
   bool stream_full_ = false;  // current streaming mode: full layers (prefill) or GPU part only (decode)
   void set_stream_mode(bool full);
   // hybrid CPU FFN
-  static constexpr int kCpuMaxB = 4;
+  static constexpr int kCpuMaxB = 8;
   std::unique_ptr<cpu::ThreadPool> pool_;
   float *hx_in_ = nullptr, *hy_out_ = nullptr, *t5_ = nullptr;
   volatile uint32_t* hflags_ = nullptr;  // [0] = input ready seq, [16] = output ready seq
