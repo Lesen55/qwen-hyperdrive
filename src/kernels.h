@@ -55,6 +55,9 @@ void h2f_accum(const __half* src, int ld_src, int rows, int cols, float* dst, in
 void f32_to_f16(const float* x, __half* y, int64_t n, cudaStream_t s);
 
 // y[t][i] = x[t][i] / rms(x[t]) * w[i]  (rows of n).  y may alias x.  If y16 != null also writes f16.
+void add_rmsnorm_q8(float* x, const float* r, const float* w, float* y, int n, int rows, float eps, int8_t* xq,
+                    float* xd, cudaStream_t s);
+void silu_mul_q8(const float* g, const float* u, float* h, int64_t n, int8_t* xq, float* xd, cudaStream_t s);
 void rmsnorm(const float* x, const float* w, float* y, int n, int rows, float eps, cudaStream_t s,
              __half* y16 = nullptr);
 // In-place per-head RMS norm on strided heads: x[t*tstride + h*hstride + i], i<hd.

@@ -230,7 +230,11 @@ class Model {
   int n_gdn_ = 0;
   int cap_pos_ = -1, cap_slot_ = -1, snap_t_ = -1;
   bool legacy16_ = false;
-  bool zc_ = true;  // small H2D transfers by kernels (zero-copy) instead of the copy engine
+  bool zc_ = true;
+  bool fuse_ = true;              // decode: fused residual + norm + quantize kernels
+  const float* pend_ = nullptr;   // deferred residual (x_ += pend_ in the next norm_in)
+  void norm_in(const float* w, float* y, int T, bool quant);
+  void residual(const float* src, int T);  // small H2D transfers by kernels (zero-copy) instead of the copy engine
   static constexpr int kTopKMax = 128;
   int topk_K_ = 0;
   int* topk_i_h_ = nullptr;

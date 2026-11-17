@@ -1694,6 +1694,59 @@ static __device__ float block_sum(float v, float* sh) {
   return v;
 }
 
+// Fused decode-path layer input: x += r (deferred residual, optional), y = rmsnorm(x) * w, and the
+// int8-per-32 activation quantization of y for the matvec kernels (xq/xd optional).
+__global__ void __launch_bounds__(256) k_add_rmsnorm_q8(float* __restrict__ x, const float* __restrict__ r,
+                                                       const float* __restrict__ w, float* __restrict__ y, int n,
+                                                       float eps, int8_t* __restrict__ xq, float* __restrict__ xd) {
+  __shared__ float sh[32];
+  float* xr = x + (size_t)blockIdx.x * n;
+  const float* rr = r ? r + (size_t)blockIdx.x * n : nullptr;
+  float ss = 0.f;
+  for (int i = threadIdx.x; i < n; i += 256) {
+    float v = xr[i];
+    if (rr) { v += rr[i]; xr[i] = v; }
+    ss += v * v;
+  }
+  ss = block_sum(ss, sh);
+  const float inv = rsqrtf(ss / n + eps);
+  float* yr = y + (size_t)blockIdx.x * n;
+  const int lane = threadIdx.x & 31;
+  for (int i = threadIdx.x; i < n; i += 256) {  // a warp covers 32 contiguous elements per iteration
+    const float v = xr[i] * inv * w[i];
+    yr[i] = v;
+    if (xq) {
+      const float amax = warp_max(fabsf(v));
+      const float d = amax / 127.f;
+      const float id = d > 0.f ? 1.f / d : 0.f;
+      const size_t g = (size_t)blockIdx.x * n + i;
+      xq[g] = (int8_t)__float2int_rn(v * id);
+      if (lane == 0) xd[g / 32] = d;
+    }
+  }
+}
+void add_rmsnorm_q8(float* x, const float* r, const float* w, float* y, int n, int rows, float eps, int8_t* xq,
+                    float* xd, cudaStream_t s) {
+  k_add_rmsnorm_q8<<<rows, 256, 0, s>>>(x, r, w, y, n, eps, xq, xd);
+}
+// h = silu(g) * u, plus its int8-per-32 quantization
+__global__ void k_silu_mul_q8(const float* __restrict__ g, const float* __restrict__ u, float* h, int64_t n,
+                              int8_t* __restrict__ xq, float* __restrict__ xd) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const float a = i < n ? g[i] : 0.f;
+  const float v = i < n ? a / (1.f + __expf(-a)) * u[i] : 0.f;
+  const float amax = warp_max(fabsf(v));
+  if (i >= n) return;
+  h[i] = v;
+  const float d = amax / 127.f;
+  const float id = d > 0.f ? 1.f / d : 0.f;
+  xq[i] = (int8_t)__float2int_rn(v * id);
+  if ((threadIdx.x & 31) == 0) xd[i / 32] = d;
+}
+void silu_mul_q8(const float* g, const float* u, float* h, int64_t n, int8_t* xq, float* xd, cudaStream_t s) {
+  k_silu_mul_q8<<<cdiv(n, 256), 256, 0, s>>>(g, u, h, n, xq, xd);
+}
+
 __global__ void k_rmsnorm(const float* __restrict__ x, const float* __restrict__ w,
                           float* __restrict__ y, int n, float eps, __half* __restrict__ y16) {
   __shared__ float sh[32];

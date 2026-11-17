@@ -593,6 +593,7 @@ void Model::plan_and_load() {
   mmq_gs_ = getenv("QE_MMQ_GS") ? atoi(getenv("QE_MMQ_GS")) : 32;
   use_gq_ = !getenv("QE_GQ") || atoi(getenv("QE_GQ")) != 0;
   zc_ = !getenv("QE_ZC") || atoi(getenv("QE_ZC")) != 0;
+  fuse_ = (!getenv("QE_FUSE") || atoi(getenv("QE_FUSE")) != 0) && !getenv("QE_DEBUG_SUMS");
   mmq_max_T_ = getenv("QE_MMQ_MAXT") ? atoi(getenv("QE_MMQ_MAXT")) : 192;
   ovf_dev_ = (int*)dalloc(256);
   hcarry_bk_ = (float*)dalloc((size_t)c.n_embd * 4);
@@ -895,8 +896,7 @@ void Model::layer_attn(int il, int T, int pos0) {
   Layer& L = layers_[il];
   cudaStream_t s = stream_;
   const int qw = c.n_head * c.hd * 2, kvw = c.n_kv * c.hd;
-  qk::rmsnorm(x_, L.attn_norm, xn_, c.n_embd, T, c.eps, s);
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  norm_in(L.attn_norm, xn_, T, true);
   float* qg = t0_;
   float* k = t3_;
   float* v = t3_ + (size_t)T * kvw;
@@ -931,7 +931,29 @@ void Model::layer_attn(int il, int T, int pos0) {
   qk::gate_sigmoid(o, qg, c.hd, c.n_head, T, s);
   prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   linear(&L, L.wo, o, T, t4_, c.n_embd, false, s);
-  qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
+  residual(t4_, T);
+}
+
+// Layer input norm.  On the decode path the previous layer's residual add is deferred into it and
+// the result is quantized for the matvec kernels in the same kernel.
+void Model::norm_in(const float* w, float* y, int T, bool quant) {
+  const Config& c = cfg_;
+  if (fuse_ && T <= qk::kMaxB) {
+    qk::add_rmsnorm_q8(x_, pend_, w, y, c.n_embd, T, c.eps, quant ? xq_ : nullptr, quant ? xd_ : nullptr, stream_);
+    pend_ = nullptr;
+    prep16_ = nullptr; gqp_ = nullptr;
+    if (quant) { prepared_ = y; prepared_K_ = c.n_embd; prepared_T_ = T; }
+    else prepared_ = nullptr;
+    return;
+  }
+  if (pend_) { qk::add_inplace(x_, pend_, (int64_t)T * c.n_embd, stream_); pend_ = nullptr; }
+  qk::rmsnorm(x_, w, y, c.n_embd, T, c.eps, stream_);
+  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+}
+void Model::residual(const float* src, int T) {
+  QE_ASSERT(!pend_);
+  if (fuse_ && T <= qk::kMaxB) pend_ = src;
+  else qk::add_inplace(x_, src, (int64_t)T * cfg_.n_embd, stream_);
 }
 
 void Model::layer_gdn(int il, int T) {
@@ -939,8 +961,7 @@ void Model::layer_gdn(int il, int T) {
   Layer& L = layers_[il];
   cudaStream_t s = stream_;
   const int C = c.conv_dim();
-  qk::rmsnorm(x_, L.attn_norm, xn_, c.n_embd, T, c.eps, s);
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  norm_in(L.attn_norm, xn_, T, true);
   float* qkv_raw = t0_;
   float* z = t1_;
   float* ab = t4_;  // alpha [T][nv] then beta [T][nv] (t4 is free until the output projection)
@@ -980,7 +1001,7 @@ void Model::layer_gdn(int il, int T) {
   prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   linear(&L, L.wssm_out, o, T, t4_, c.n_embd, false, s);
   qe_debug_dump("linear_attn_out", il, t4_, T, c.n_embd, s);
-  qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
+  residual(t4_, T);
 }
 
 void Model::layer_ffn(int il, int T) {
@@ -988,15 +1009,19 @@ void Model::layer_ffn(int il, int T) {
   Layer& L = layers_[il];
   cudaStream_t s = stream_;
   if (L.ffn_skip) return;  // dropped by --skip-ffn (lossy)
-  qk::rmsnorm(x_, L.post_norm, xn_, c.n_embd, T, c.eps, s);
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  norm_in(L.post_norm, xn_, T, true);
   if (!L.ffn_streamed) {
     linear(&L, L.ffn_gate, xn_, T, t0_, c.n_ff, false, s);
     linear(&L, L.ffn_up, xn_, T, t1_, c.n_ff, false, s);
-    qk::silu_mul(t0_, t1_, t0_, (int64_t)T * c.n_ff, s);
-    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+    if (fuse_ && T <= qk::kMaxB && c.n_ff % 32 == 0) {
+      qk::silu_mul_q8(t0_, t1_, t0_, (int64_t)T * c.n_ff, xq_, xd_, s);
+      prepared_ = t0_; prepared_K_ = c.n_ff; prepared_T_ = T; prep16_ = nullptr; gqp_ = nullptr;
+    } else {
+      qk::silu_mul(t0_, t1_, t0_, (int64_t)T * c.n_ff, s);
+      prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+    }
     linear(&L, L.ffn_down, t0_, T, t4_, c.n_embd, false, s);
-    qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
+    residual(t4_, T);
     return;
   }
   const int r = L.cpu_rows, Ng = c.n_ff - r;
@@ -1039,7 +1064,7 @@ void Model::layer_ffn(int il, int T) {
     else CUDA_CHECK(cudaMemcpyAsync(t5_, hy_out_, (size_t)T * c.n_embd * 4, cudaMemcpyHostToDevice, s));
     qk::add_inplace(t4_, t5_, (int64_t)T * c.n_embd, s);
   }
-  qk::add_inplace(x_, t4_, (int64_t)T * c.n_embd, s);
+  residual(t4_, T);
   stream_release(il);
 }
 
@@ -1146,7 +1171,7 @@ void Model::mtp_block(const float* hrows, const int* tokens, int T, int pos0) {
   layer_attn(il, T, pos0);
   layer_ffn(il, T);
   snapshot_ = snap_save;
-  qk::rmsnorm(x_, L.shared_head_norm ? L.shared_head_norm : output_norm_, xn_, c.n_embd, T, c.eps, s);
+  norm_in(L.shared_head_norm ? L.shared_head_norm : output_norm_, xn_, T, false);
 }
 
 // MTP draft head.  Drafts only need the likely tokens, so the logits are computed over a vocabulary
@@ -1693,7 +1718,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
       dsum("l_out", il, x_, (size_t)T * c.n_embd);
     }
     // final norm for all rows (MTP needs every row's hidden state)
-    qk::rmsnorm(x_, output_norm_, hid_, c.n_embd, T, c.eps, stream_);
+    norm_in(output_norm_, hid_, T, false);
     // logits for rows that fall in this chunk
     const int first_logit_row = n - n_logits;  // global index
     const int r_begin = std::max(first_logit_row, b0), r_end = b0 + T;
