@@ -1,0 +1,52 @@
+// Prefill stage 2: Y[t][n] (+)= sum_k W16[n][k] X[t][k] with W16 the f16 copy from dq16.  Tiles of
+// 64 rows x 64 tokens x 32 k; both tiles are read with coalesced loads; 4x4 outputs per thread; split
+// K over z (as in gemm.comp) when the tile grid is small.
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
+shared float Ws[32][65];  // [k][row]
+shared float Xs[64][33];  // [token][k]
+void main() {
+  U32 w = U32(pc.w); F32 x = F32(pc.x); F32 y = F32(pc.y);
+  const uint tid = gl_LocalInvocationID.x;
+  const uint r0 = gl_WorkGroupID.x * 64u, c0 = gl_WorkGroupID.y * 64u;
+  const uint tx = tid % 16u, ty = tid / 16u;
+  float acc[4][4];
+  for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+  const uint ng = pc.K / 32u;
+  const uint gs = gl_WorkGroupID.z * pc.kg, ge = min(ng, gs + pc.kg);
+  const bool split = gl_NumWorkGroups.z > 1u;
+  const uint yoff = gl_WorkGroupID.z * pc.T * pc.ldy;
+  const uint KW = pc.K / 2u;  // words per f16 row
+  for (uint g = gs; g < ge; g++) {
+    for (uint e = tid; e < 64u * 16u; e += 256u) {  // 64 rows x 16 words (32 halves)
+      const uint rr = e / 16u, kw = e % 16u, row = r0 + rr;
+      const vec2 h = row < pc.N ? unpackHalf2x16(w.d[row * KW + g * 16u + kw]) : vec2(0.0);
+      Ws[2u * kw][rr] = h.x;
+      Ws[2u * kw + 1u][rr] = h.y;
+    }
+    for (uint e = tid; e < 64u * 32u; e += 256u) {
+      const uint c = e / 32u, k = e % 32u;
+      Xs[c][k] = (c0 + c < pc.T) ? x.d[(c0 + c) * pc.ldx + g * 32u + k] : 0.0;
+    }
+    barrier();
+    for (uint k = 0u; k < 32u; k++) {
+      float a[4], b[4];
+      for (uint i = 0u; i < 4u; i++) { a[i] = Ws[k][tx + 16u * i]; b[i] = Xs[ty + 16u * i][k]; }
+      for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] += a[i] * b[j];
+    }
+    barrier();
+  }
+  for (uint j = 0u; j < 4u; j++) {
+    const uint c = c0 + ty + 16u * j;
+    if (c >= pc.T) continue;
+    for (uint i = 0u; i < 4u; i++) {
+      const uint r = r0 + tx + 16u * i;
+      if (r >= pc.N) continue;
+      const uint o = c * pc.ldy + r;
+      if (split) y.d[yoff + o] = acc[i][j];
+      else y.d[o] = pc.acc != 0u ? y.d[o] + acc[i][j] : acc[i][j];
+    }
+  }
+}

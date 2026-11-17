@@ -1,0 +1,17 @@
+// variants: dq16_f32:QT=0 dq16_f16:QT=1 dq16_bf16:QT=30 dq16_q8_0:QT=8 dq16_q2_k:QT=10 dq16_q3_k:QT=11 dq16_q4_k:QT=12 dq16_q5_k:QT=13 dq16_q6_k:QT=14 dq16_iq2_xxs:QT=16 dq16_iq2_xs:QT=17 dq16_iq2_s:QT=22 dq16_iq3_xxs:QT=18 dq16_iq3_s:QT=21 dq16_iq1_s:QT=19 dq16_iq1_m:QT=29 dq16_iq4_xs:QT=23
+// Prefill stage 1: dequantize W [N][K] to f16 (packed pairs) with one invocation per 32-group;
+// adjacent invocations read adjacent groups of a row, so the weight reads are coalesced.
+#version 450
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
+void main() {
+  const uint gi = gl_GlobalInvocationID.y * 65535u * 64u + gl_GlobalInvocationID.x, ng = pc.K / 32u;
+  if (gi >= ng * pc.N) return;
+  U32 w = U32(pc.w); U32 tab = U32(pc.tab); U32 y = U32(pc.y);
+  const uint row = gi / ng, g = gi % ng;
+  float v[32];
+  deq32(w, tab, row * pc.rb + (g / 8u) * BB, g % 8u, v);
+  const uint o = (row * pc.K + g * 32u) / 2u;
+  for (uint j = 0u; j < 16u; j++) y.d[o + j] = packHalf2x16(vec2(v[2u * j], v[2u * j + 1u]));
+}

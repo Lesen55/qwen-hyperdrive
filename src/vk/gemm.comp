@@ -1,0 +1,57 @@
+// variants: mm_f32:QT=0 mm_f16:QT=1 mm_bf16:QT=30 mm_q8_0:QT=8 mm_q2_k:QT=10 mm_q3_k:QT=11 mm_q4_k:QT=12 mm_q5_k:QT=13 mm_q6_k:QT=14 mm_iq2_xxs:QT=16 mm_iq2_xs:QT=17 mm_iq2_s:QT=22 mm_iq3_xxs:QT=18 mm_iq3_s:QT=21 mm_iq1_s:QT=19 mm_iq1_m:QT=29 mm_iq4_xs:QT=23
+// Prefill GEMM: Y[t][n] (+)= sum_k W[n][k] X[t][k], tiles of 64 rows x 64 tokens x 64 k.
+// Per k-step threads 0..127 dequantize one 32-group of one row each (64 rows x 2 groups) while
+// threads 128..255 load the 64x64 activation tile; then every thread computes 4x4 outputs.
+// Split-K (z > 1 workgroups along K, kg groups each) when the tile grid alone cannot fill the GPU:
+// slice z writes y + z*T*ldy without accumulation and ksum adds the slices.
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
+shared float Ws[64][64];  // [k][row]
+shared float Xs[64][64];  // [token][k]  (32 KiB in total)
+void main() {
+  U32 w = U32(pc.w); U32 tab = U32(pc.tab); F32 x = F32(pc.x); F32 y = F32(pc.y);
+  const uint tid = gl_LocalInvocationID.x;
+  const uint r0 = gl_WorkGroupID.x * 64u, c0 = gl_WorkGroupID.y * 64u;
+  const uint tx = tid % 16u, ty = tid / 16u;
+  float acc[4][4];
+  for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+  const uint ng = pc.K / 32u;
+  const uint gs = gl_WorkGroupID.z * pc.kg, ge = min(ng, gs + pc.kg);
+  const bool split = gl_NumWorkGroups.z > 1u;
+  const uint yoff = gl_WorkGroupID.z * pc.T * pc.ldy;
+  for (uint g0 = gs; g0 < ge; g0 += 2u) {
+    if (tid < 128u) {
+      const uint rr = tid % 64u, h = tid / 64u, row = r0 + rr, gi = g0 + h;
+      float v[32];
+      if (row < pc.N) deq32(w, tab, row * pc.rb + (gi / 8u) * BB, gi % 8u, v);
+      else for (uint j = 0u; j < 32u; j++) v[j] = 0.0;
+      for (uint j = 0u; j < 32u; j++) Ws[32u * h + j][rr] = v[j];
+    } else {
+      const uint u = tid - 128u, k = u % 64u;
+      for (uint i = 0u; i < 32u; i++) {
+        const uint c = u / 64u + 2u * i;
+        Xs[c][k] = (c0 + c < pc.T) ? x.d[(c0 + c) * pc.ldx + g0 * 32u + k] : 0.0;
+      }
+    }
+    barrier();
+    for (uint k = 0u; k < 64u; k++) {
+      float a[4], b[4];
+      for (uint i = 0u; i < 4u; i++) { a[i] = Ws[k][tx + 16u * i]; b[i] = Xs[ty + 16u * i][k]; }
+      for (uint i = 0u; i < 4u; i++) for (uint j = 0u; j < 4u; j++) acc[i][j] += a[i] * b[j];
+    }
+    barrier();
+  }
+  for (uint j = 0u; j < 4u; j++) {
+    const uint c = c0 + ty + 16u * j;
+    if (c >= pc.T) continue;
+    for (uint i = 0u; i < 4u; i++) {
+      const uint r = r0 + tx + 16u * i;
+      if (r >= pc.N) continue;
+      const uint o = c * pc.ldy + r;
+      if (split) y.d[yoff + o] = acc[i][j];
+      else y.d[o] = pc.acc != 0u ? y.d[o] + acc[i][j] : acc[i][j];
+    }
+  }
+}

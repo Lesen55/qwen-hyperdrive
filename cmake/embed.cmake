@@ -1,0 +1,17 @@
+# Embed a SPIR-V binary as a C array of 32-bit words: cmake -DIN=x.spv -DOUT=x.h -DNAME=sym -P embed.cmake
+file(READ ${IN} hex HEX)
+string(LENGTH "${hex}" n)
+set(out "static const unsigned ${NAME}[] = {")
+set(i 0)
+while(i LESS n)
+  string(SUBSTRING "${hex}" ${i} 8 w)
+  # little-endian bytes -> 32-bit word
+  string(SUBSTRING "${w}" 0 2 b0)
+  string(SUBSTRING "${w}" 2 2 b1)
+  string(SUBSTRING "${w}" 4 2 b2)
+  string(SUBSTRING "${w}" 6 2 b3)
+  string(APPEND out "0x${b3}${b2}${b1}${b0}u,")
+  math(EXPR i "${i} + 8")
+endwhile()
+string(APPEND out "};\n")
+file(WRITE ${OUT} "${out}")

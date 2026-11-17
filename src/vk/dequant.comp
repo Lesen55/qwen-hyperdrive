@@ -1,0 +1,15 @@
+// variants: dq_f32:QT=0 dq_f16:QT=1 dq_bf16:QT=30 dq_q8_0:QT=8 dq_q2_k:QT=10 dq_q3_k:QT=11 dq_q4_k:QT=12 dq_q5_k:QT=13 dq_q6_k:QT=14 dq_iq2_xxs:QT=16 dq_iq2_xs:QT=17 dq_iq2_s:QT=22 dq_iq3_xxs:QT=18 dq_iq3_s:QT=21 dq_iq1_s:QT=19 dq_iq1_m:QT=29 dq_iq4_xs:QT=23
+// Test helper: dequantize rows [0, N) of W to f32 (y[row][k]).
+#version 450
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
+void main() {
+  const uint gi = gl_GlobalInvocationID.x, ng = pc.K / 32u;
+  if (gi >= ng * pc.N) return;
+  U32 w = U32(pc.w); U32 tab = U32(pc.tab); F32 y = F32(pc.y);
+  const uint row = gi / ng, g = gi % ng;
+  float v[32];
+  deq32(w, tab, row * pc.rb + (g / 8u) * BB, g % 8u, v);
+  for (uint j = 0u; j < 32u; j++) y.d[row * pc.K + g * 32u + j] = v[j];
+}

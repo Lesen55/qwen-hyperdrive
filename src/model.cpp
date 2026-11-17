@@ -168,34 +168,7 @@ Model::~Model() {
   if (stream_) cudaStreamDestroy(stream_);
 }
 
-void Model::load_config() {
-  const auto& g = *gguf_;
-  Config& c = cfg_;
-  const std::string a = "qwen35.";
-  c.n_embd = (int)g.get_int(a + "embedding_length", 0);
-  const int blocks = (int)g.get_int(a + "block_count", 0);
-  c.n_mtp = (int)g.get_int(a + "nextn_predict_layers", 0);
-  c.n_layer = blocks - c.n_mtp;
-  c.n_ff = (int)g.get_int(a + "feed_forward_length", 0);
-  c.n_head = (int)g.get_int(a + "attention.head_count", 0);
-  c.n_kv = (int)g.get_int(a + "attention.head_count_kv", 0);
-  c.hd = (int)g.get_int(a + "attention.key_length", 256);
-  c.rope_dims = (int)g.get_int(a + "rope.dimension_count", 64);
-  c.rope_base = (float)g.get_float(a + "rope.freq_base", 1e7);
-  c.eps = (float)g.get_float(a + "attention.layer_norm_rms_epsilon", 1e-6);
-  c.conv_k = (int)g.get_int(a + "ssm.conv_kernel", 4);
-  c.dk = c.dv = (int)g.get_int(a + "ssm.state_size", 128);
-  c.nk = (int)g.get_int(a + "ssm.group_count", 16);
-  c.nv = (int)g.get_int(a + "ssm.time_step_rank", 48);
-  c.d_inner = (int)g.get_int(a + "ssm.inner_size", 6144);
-  c.attn_interval = (int)g.get_int(a + "full_attention_interval", 4);
-  c.n_vocab = (int)g.need("token_embd.weight").ne[1];
-  if (c.hd != 256 || c.dk != 128 || c.conv_k != 4 || c.d_inner != c.nv * c.dv || c.n_head % c.n_kv || c.nv % c.nk)
-    QE_FATAL("unsupported qwen35 dimensions: attention head %d (need 256), GDN state %d (need 128), conv %d (need 4), "
-             "heads %d/%d, GDN heads %d/%d", c.hd, c.dk, c.conv_k, c.n_head, c.n_kv, c.nk, c.nv);
-  QE_LOG("[model] qwen35: %d layers (+%d MTP), embd %d, ff %d, heads %d/%d x %d, GDN %d/%d x %d, vocab %d\n",
-         c.n_layer, c.n_mtp, c.n_embd, c.n_ff, c.n_head, c.n_kv, c.hd, c.nk, c.nv, c.dk, c.n_vocab);
-}
+void Model::load_config() { cfg_ = load_qwen35_config(*gguf_); }
 
 void Model::requant_mtp() {
   Layer& L = layers_[cfg_.n_layer];
@@ -1784,7 +1757,7 @@ void Model::prepare_context(int npos, bool small_prefill) {
   }
 }
 
-Model::KvInfo Model::kv_info() const {
+KvInfo Model::kv_info() const {
   KvInfo k;
   k.blocks_total = n_kv_blocks_;
   for (int b = 0; b < n_kv_blocks_; b++) k.blocks_used += blk_owner_[b] >= 0;

@@ -1,0 +1,124 @@
+// variants: attn_f16: attn_q8:KVQ8=1
+// Flash attention (causal, GQA) for head dim 256.  Workgroup = (block of query rows, kv head, split):
+// 32 query rows = TB tokens x R heads of one kv group share every K/V tile loaded into
+// shared memory (16 keys per tile, 27 KiB of shared memory); online softmax; nsplit > 1 writes partial (O, m, l) for attn_combine (decode).
+#version 450
+#include "common.glsl"
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uvec2 q, kc, vc, o, part; uint T, pos0, nh, nkv, qts, nsplit, chunk; float scale; } pc;
+#define HD 256u
+#define HW 128u   // half2 words per row
+shared uint Qs[32][HW];
+shared uint KV[16][HW + 1u];
+shared float S[32][17];
+shared float m_s[32], l_s[32], a_s[32];
+const float NEG = -1e30;
+
+void load_tile(U32 c, uint kb, uint end, uint g) {
+  const uint tid = gl_LocalInvocationID.x;
+  for (uint e = tid; e < 16u * HW; e += 128u) {
+    const uint kk = e / HW, i = e % HW, pos = kb + kk;
+    uint val = 0u;
+    if (pos < end) {
+#ifdef KVQ8
+      const uint rw = HD / 4u + HD / 32u, base = (pos * pc.nkv + g) * rw;
+      const uint wq = c.d[base + i / 2u];
+      const float d = uintBitsToFloat(c.d[base + HD / 4u + i / 16u]);
+      const uint j = (2u * i) & 3u;
+      val = packHalf2x16(vec2(float(sbyte_of(wq, j)), float(sbyte_of(wq, j + 1u))) * d);
+#else
+      val = c.d[(pos * pc.nkv + g) * HW + i];
+#endif
+    }
+    KV[kk][i] = val;
+  }
+}
+
+void main() {
+  const uint tid = gl_LocalInvocationID.x;
+  const uint b = gl_WorkGroupID.x, g = gl_WorkGroupID.y, s = gl_WorkGroupID.z;
+  const uint R = pc.nh / pc.nkv, TB = 32u / R;
+  const uint t0 = b * TB, nt = min(TB, pc.T - t0), nr = nt * R;
+  F32 q = F32(pc.q);
+  // queries (pre-scaled) -> shared f16
+  for (uint e = tid; e < 32u * HW; e += 128u) {
+    const uint r = e / HW, i = e % HW;
+    uint val = 0u;
+    if (r < nr) {
+      const uint t = t0 + r / R, h = g * R + r % R;
+      const uint qb = t * pc.qts + h * 2u * HD + 2u * i;
+      val = packHalf2x16(vec2(q.d[qb], q.d[qb + 1u]) * pc.scale);
+    }
+    Qs[r][i] = val;
+  }
+  if (tid < 32u) { m_s[tid] = NEG; l_s[tid] = 0.0; }
+  const uint kend = pc.pos0 + t0 + nt;  // keys [0, kend) are visible to some row of this block
+  const uint ks = s * pc.chunk, ke = min(kend, ks + pc.chunk);
+  float o0[32], o1[32];
+  for (uint r = 0u; r < 32u; r++) { o0[r] = 0.0; o1[r] = 0.0; }
+  barrier();
+  for (uint kb = ks; kb < ke; kb += 16u) {
+    load_tile(U32(pc.kc), kb, ke, g);
+    barrier();
+    for (uint e = tid; e < 32u * 16u; e += 128u) {
+      const uint r = e / 16u, kk = e % 16u;
+      float sc = NEG;
+      if (r < nr && kb + kk < ke && kb + kk <= pc.pos0 + t0 + r / R) {
+        float a = 0.0;
+        for (uint i = 0u; i < HW; i++) {
+          const vec2 x = unpackHalf2x16(Qs[r][i]), y = unpackHalf2x16(KV[kk][i]);
+          a += x.x * y.x + x.y * y.y;
+        }
+        sc = a;
+      }
+      S[r][kk] = sc;
+    }
+    barrier();
+    if (tid < nr) {
+      const uint r = tid;
+      float mx = m_s[r];
+      for (uint kk = 0u; kk < 16u; kk++) mx = max(mx, S[r][kk]);
+      const float al = exp(m_s[r] - mx);
+      float sum = 0.0;
+      for (uint kk = 0u; kk < 16u; kk++) {
+        const float p = S[r][kk] <= 0.5 * NEG ? 0.0 : exp(S[r][kk] - mx);
+        S[r][kk] = p;
+        sum += p;
+      }
+      l_s[r] = l_s[r] * al + sum;
+      m_s[r] = mx;
+      a_s[r] = al;
+    }
+    barrier();
+    load_tile(U32(pc.vc), kb, ke, g);
+    barrier();
+    for (uint r = 0u; r < 32u; r++) {
+      if (r < nr) {
+        float x0 = o0[r] * a_s[r], x1 = o1[r] * a_s[r];
+        for (uint kk = 0u; kk < 16u; kk++) {
+          const vec2 vv = unpackHalf2x16(KV[kk][tid]);
+          x0 += S[r][kk] * vv.x;
+          x1 += S[r][kk] * vv.y;
+        }
+        o0[r] = x0; o1[r] = x1;
+      }
+    }
+    barrier();
+  }
+  for (uint r = 0u; r < 32u; r++) {
+    if (r >= nr) continue;
+    const uint t = t0 + r / R, h = g * R + r % R;
+    if (pc.nsplit == 1u) {
+      const float il = l_s[r] > 0.0 ? 1.0 / l_s[r] : 0.0;
+      F32 o = F32(pc.o);
+      o.d[(t * pc.nh + h) * HD + 2u * tid] = o0[r] * il;
+      o.d[(t * pc.nh + h) * HD + 2u * tid + 1u] = o1[r] * il;
+    } else {
+      F32 p = F32(pc.part);
+      const uint pb = ((s * pc.T + t) * pc.nh + h) * (HD + 2u);
+      p.d[pb + 2u * tid] = o0[r];
+      p.d[pb + 2u * tid + 1u] = o1[r];
+      if (tid == 0u) { p.d[pb + HD] = m_s[r]; p.d[pb + HD + 1u] = l_s[r]; }
+    }
+  }
+}

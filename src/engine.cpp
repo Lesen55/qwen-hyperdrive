@@ -1,6 +1,8 @@
 #include "engine.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 #include <cmath>
 #include <queue>
 
@@ -100,9 +102,9 @@ static float prob_of(const Dist& d, int id) {
   return 0.f;
 }
 
-Generator::Generator(Model& m, const SamplingParams& sp, bool use_mtp)
+Generator::Generator(IModel& m, const SamplingParams& sp, bool use_mtp)
     : m_(m), sampler_(sp), mtp_(use_mtp && m.has_mtp()) {
-  logits_.resize((size_t)qk::kMaxB * m.cfg().n_vocab);  // verify rows (up to draft_max + 1)
+  logits_.resize((size_t)kMaxTok * m.cfg().n_vocab);  // verify rows (up to draft_max + 1)
   mtp_logits_.resize(m.cfg().n_vocab);
 }
 
@@ -216,13 +218,14 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
   }
   reused_ = p0;
   m_.draft_vocab_add(prompt.data(), n);
-  m_.prepare_context(n + reserve, n - p0 <= qk::kMaxB);
+  m_.prepare_context(n + reserve, n - p0 <= kMaxTok);
   const double t_prep = qe_now();
   history_ = prompt;
   {
     const SamplingParams& sp = sampler_.params();
     topk_ = !sampler_.greedy() && sp.top_k > 0 && sp.top_k <= 128 && sp.presence_penalty == 0.f && !getenv("QE_NO_GPU_TOPK");
     m_.set_topk(topk_ ? sp.top_k : 0);
+    topk_ = topk_ && m_.topk_K() > 0;  // backends without GPU top-K return full logits
   }
   ng_idx_.clear();
   ng_built_ = 0;
@@ -293,7 +296,7 @@ void Generator::row_dist(int row, Dist& p) {
   else sampler_.dist(logits_.data() + (size_t)row * m_.cfg().n_vocab, m_.cfg().n_vocab, history_, p);
 }
 void Generator::mtp_dist(const std::vector<int>& hist, Dist& q) {
-  if (topk_) sampler_.dist_sparse(m_.topk_idx(qk::kMaxB), m_.topk_val(qk::kMaxB), m_.topk_K(), q);
+  if (topk_) sampler_.dist_sparse(m_.topk_idx(kMaxTok), m_.topk_val(kMaxTok), m_.topk_K(), q);
   else sampler_.dist(mtp_logits_.data(), m_.cfg().n_vocab, hist, q);
 }
 
@@ -467,7 +470,7 @@ void Generator::step(std::vector<int>& out) {
   st_.generated += a + 1;
   float conf = 1.f;
   const int d = m_.mtp_draft(0, toks, a + 1, pos_ - a, g && draft_pmin_ > 0 ? &conf : nullptr, g ? nullptr : mtp_logits_.data());
-  for (int k = 0; k < 4; k++) first_top_[k] = m_.top2_[k];
+  for (int k = 0; k < 4; k++) first_top_[k] = m_.mtp_top4()[k];
   const double hp2 = qe_now();
   drafts_.clear();
   dq_.clear();

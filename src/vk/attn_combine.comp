@@ -1,0 +1,21 @@
+// merge split-K partial attention results: one workgroup per (token, head), one invocation per dim
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uvec2 part, o; uint rows, nsplit; } pc;
+void main() {
+  const uint row = gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
+  F32 p = F32(pc.part); F32 o = F32(pc.o);
+  float M = -1e30;
+  for (uint s = 0u; s < pc.nsplit; s++) M = max(M, p.d[(s * pc.rows + row) * 258u + 256u]);
+  float L = 0.0, acc = 0.0;
+  for (uint s = 0u; s < pc.nsplit; s++) {
+    const uint pb = (s * pc.rows + row) * 258u;
+    const float l = p.d[pb + 257u];
+    if (l <= 0.0) continue;
+    const float f = exp(p.d[pb + 256u] - M);
+    L += l * f;
+    acc += p.d[pb + d] * f;
+  }
+  o.d[row * 256u + d] = L > 0.0 ? acc / L : 0.0;
+}

@@ -5,7 +5,8 @@
 #include <random>
 #include <vector>
 
-#include "model.h"
+#include "common.h"
+#include "imodel.h"
 
 struct SamplingParams {
   float temperature = 1.0f;  // <= 0: greedy
@@ -47,7 +48,7 @@ struct GenStats {
 
 class Generator {
  public:
-  Generator(Model& m, const SamplingParams& sp, bool use_mtp);
+  Generator(IModel& m, const SamplingParams& sp, bool use_mtp);
   void set_sampling(const SamplingParams& sp) { sampler_ = Sampler(sp); }
   void set_draft_pmin(float p) { draft_pmin_ = p; }
   void set_boundary_token(int id) { boundary_tok_ = id; }
@@ -65,7 +66,7 @@ class Generator {
 
  private:
   void make_drafts(int first_argmax, bool have_logits);
-  Model& m_;
+  IModel& m_;
   Sampler sampler_;
   bool mtp_;
   int pos_ = 0;    // tokens committed into the KV/state

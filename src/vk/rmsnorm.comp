@@ -1,0 +1,19 @@
+// y = rmsnorm(x [+= res]) * w, one workgroup per row
+#version 450
+#include "common.glsl"
+#include "reduce.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uvec2 x, res, w, y; uint n; float eps; } pc;
+void main() {
+  F32 x = F32(pc.x); F32 w = F32(pc.w); F32 y = F32(pc.y);
+  const uint b = gl_WorkGroupID.x * pc.n, tid = gl_LocalInvocationID.x;
+  const bool hr = !is_null(pc.res);
+  float ss = 0.0;
+  for (uint i = tid; i < pc.n; i += 256u) {
+    float v = x.d[b + i];
+    if (hr) { v += F32(pc.res).d[b + i]; x.d[b + i] = v; }
+    ss += v * v;
+  }
+  const float r = inversesqrt(wg_sum(ss) / float(pc.n) + pc.eps);
+  for (uint i = tid; i < pc.n; i += 256u) y.d[b + i] = x.d[b + i] * r * w.d[i];
+}

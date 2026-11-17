@@ -1,0 +1,630 @@
+#pragma once
+static const char kWebUi[] = R"QEHTML(<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperdrive Console</title>
+<style>
+:root {
+  --bg: #0d1014; --panel: #151a20; --panel2: #1b2129; --line: #262e38; --text: #e6eaf0; --dim: #8b95a3;
+  --acc: #5ad1a0; --acc2: #6aa8ff; --warn: #f2b84b; --hot: #ff6b6b; --user: #1f3a5a; --code: #0f1318;
+  --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f4f6f9; --panel: #ffffff; --panel2: #f0f3f7; --line: #dde3ea; --text: #17202b; --dim: #5d6876;
+    --acc: #12976a; --acc2: #2f6fd6; --warn: #b67a07; --hot: #d63b3b; --user: #dbe9fb; --code: #f2f4f7;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f4f6f9; --panel: #ffffff; --panel2: #f0f3f7; --line: #dde3ea; --text: #17202b; --dim: #5d6876;
+  --acc: #12976a; --acc2: #2f6fd6; --warn: #b67a07; --hot: #d63b3b; --user: #dbe9fb; --code: #f2f4f7;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 14px/1.55 var(--sans); }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header .logo { font-weight: 700; letter-spacing: .02em; }
+header .logo span { color: var(--acc); }
+header .model { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+header .sp { flex: 1; }
+.badge { font: 600 11px var(--mono); padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); text-transform: uppercase; }
+.badge.decode { color: var(--acc); border-color: var(--acc); }
+.badge.prefill { color: var(--warn); border-color: var(--warn); }
+.badge.decode::before, .badge.prefill::before { content: "●"; margin-right: 5px; animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+.live { font: 600 15px var(--mono); min-width: 110px; text-align: right; }
+button, select, input[type=number] { font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+button { cursor: pointer; }
+button:hover { border-color: var(--acc2); }
+button.primary { background: var(--acc2); border-color: var(--acc2); color: #fff; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 400px; height: calc(100% - 53px); }
+#chat { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.toolbar label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.toolbar select { max-width: 220px; }
+#msgs { flex: 1; overflow-y: auto; padding: 18px 16px 8px; }
+.msg { max-width: 860px; margin: 0 auto 16px; }
+.msg .who { font-size: 11px; color: var(--dim); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .06em; }
+.msg.user .body { background: var(--user); border-radius: 12px; padding: 10px 14px; white-space: pre-wrap; }
+.msg.assistant .body { padding: 2px 2px; }
+.msg .body p { margin: .4em 0; }
+.msg .body pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font: 12.5px/1.5 var(--mono); }
+.msg .body code { font-family: var(--mono); font-size: .92em; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+.msg .body pre code { background: none; padding: 0; }
+.msg .body h1, .msg .body h2, .msg .body h3, .msg .body h4 { margin: .8em 0 .3em; line-height: 1.3; }
+.msg .body ul, .msg .body ol { padding-left: 1.4em; margin: .3em 0; }
+.msg .body table { border-collapse: collapse; margin: .5em 0; }
+.msg .body td, .msg .body th { border: 1px solid var(--line); padding: 3px 8px; }
+details.think { margin: 4px 0 8px; border-left: 2px solid var(--line); padding-left: 10px; color: var(--dim); }
+details.think summary { cursor: pointer; font-size: 12px; }
+details.think div { white-space: pre-wrap; font-size: 13px; }
+.mstat { font: 11px var(--mono); color: var(--dim); margin-top: 6px; }
+.status { color: var(--dim); font-size: 13px; }
+.status::before { content: "●"; color: var(--warn); margin-right: 6px; animation: pulse 1s infinite; }
+.sources { margin-top: 8px; font-size: 12.5px; border-top: 1px dashed var(--line); padding-top: 6px; }
+.sources a { color: var(--acc2); text-decoration: none; }
+.sources a:hover { text-decoration: underline; }
+.sources div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sources span { color: var(--dim); }
+a.cite { color: var(--acc2); text-decoration: none; font-size: .85em; vertical-align: super; }
+.msg.user .web { font-size: 11px; color: var(--acc2); margin-top: 4px; }
+.msg .web { font-size: 12px; color: var(--acc2); }
+.msg.tool { margin-top: -8px; }
+.rec { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 8px; }
+.rec div { background: var(--panel2); border-radius: 8px; padding: 6px 8px; }
+.rec .v { font: 700 15px var(--mono); }
+.rec .l { font-size: 11px; color: var(--dim); }
+.composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel); }
+.composer textarea { flex: 1; resize: none; min-height: 44px; max-height: 220px; font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.composer textarea:focus { outline: none; border-color: var(--acc2); }
+.empty { color: var(--dim); text-align: center; margin-top: 18vh; }
+.empty b { color: var(--text); font-size: 18px; display: block; margin-bottom: 6px; }
+#dash { overflow-y: auto; padding: 12px; background: var(--bg); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+.card h3 { margin: 0 0 8px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; display: flex; justify-content: space-between; }
+.card h3 span { text-transform: none; letter-spacing: 0; color: var(--dim); font-weight: 400; }
+.big { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 8px; }
+.big div { background: var(--panel2); border-radius: 8px; padding: 8px; }
+.big .v { font: 700 20px var(--mono); }
+.big .l { font-size: 11px; color: var(--dim); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; }
+.kv .k { color: var(--dim); }
+.kv .v { font-family: var(--mono); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin: 3px 0 7px; }
+.bar i { display: block; height: 100%; background: var(--acc2); transition: width .4s; }
+.bar i.hot { background: var(--hot); } .bar i.warm { background: var(--warn); } .bar i.ok { background: var(--acc); }
+canvas { width: 100%; height: 70px; display: block; }
+.legend { display: flex; gap: 10px; font-size: 11px; color: var(--dim); margin-top: 4px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; height: auto; }
+  #chat { height: 78vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  header .model { display: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">qwen-<span>hyperdrive</span></div>
+  <div class="model" id="hdrModel"></div>
+  <div class="sp"></div>
+  <div class="badge" id="phase">idle</div>
+  <div class="live" id="liveTps">– tok/s</div>
+  <button id="themeBtn" title="テーマ切替">◐</button>
+</header>
+<main>
+  <section id="chat">
+    <div class="toolbar">
+      <button id="newBtn">＋ 新しいチャット</button>
+      <select id="convSel"></select>
+      <label><input type="checkbox" id="think"> 思考 (thinking)</label>
+      <label><input type="checkbox" id="web"> 🌐 Web検索</label>
+      <label>温度 <input type="number" id="temp" min="0" max="2" step="0.1" value="0.7" style="width:64px"></label>
+      <label>最大 <input type="number" id="maxTok" min="16" max="131072" step="256" value="16384" style="width:90px"></label>
+      <button id="delBtn" title="このチャットを削除">🗑</button>
+    </div>
+    <div id="msgs"></div>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="メッセージ（Enter で送信 / Shift+Enter で改行）"></textarea>
+      <button class="primary" id="sendBtn">送信</button>
+    </div>
+  </section>
+  <aside id="dash">
+    <div class="card">
+      <h3>Engine <span id="engUptime"></span></h3>
+      <div class="big">
+        <div><div class="v" id="bDecode">–</div><div class="l">decode tok/s</div></div>
+        <div><div class="v" id="bPrefill">–</div><div class="l">prefill tok/s</div></div>
+        <div><div class="v" id="bTtft">–</div><div class="l">TTFT</div></div>
+      </div>
+      <div class="rec">
+        <div><div class="v" id="rDec">–</div><div class="l">最速 decode tok/s</div></div>
+        <div><div class="v" id="rPf">–</div><div class="l">最速 prefill tok/s</div></div>
+        <div><div class="v" id="aDec">–</div><div class="l">平均 decode tok/s</div></div>
+        <div><div class="v" id="aPf">–</div><div class="l">平均 prefill tok/s</div></div>
+      </div>
+      <div class="kv" id="engKv"></div>
+      <canvas id="cReq"></canvas>
+      <div class="legend"><span><i style="background:var(--acc)"></i>decode tok/s</span><span><i style="background:var(--warn)"></i>prefill tok/s (÷20)</span><span>直近のリクエスト</span></div>
+    </div>
+    <div class="card">
+      <h3>Memory / KV</h3>
+      <div class="kv" id="memKv"></div>
+    </div>
+    <div class="card">
+      <h3>GPU <span id="gpuName"></span></h3>
+      <div class="kv" id="gpuKv"></div>
+      <canvas id="cGpu"></canvas>
+      <div class="legend"><span><i style="background:var(--hot)"></i>温度 °C</span><span><i style="background:var(--warn)"></i>電力 W</span><span><i style="background:var(--acc2)"></i>使用率 %</span><span><i style="background:var(--acc)"></i>PCIe RX GB/s ×10</span></div>
+    </div>
+    <div class="card">
+      <h3>CPU / RAM <span id="cpuName"></span></h3>
+      <div class="kv" id="cpuKv"></div>
+      <canvas id="cCpu"></canvas>
+      <div class="legend"><span><i style="background:var(--hot)"></i>温度 °C</span><span><i style="background:var(--acc2)"></i>使用率 %</span></div>
+    </div>
+    <div class="card">
+      <h3>Config</h3>
+      <div class="kv" id="cfgKv"></div>
+    </div>
+  </aside>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const ls = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ---------------- theme ----------------
+(function () {
+  const t = ls.get("hd.theme", null);
+  if (t) document.documentElement.dataset.theme = t;
+  $("themeBtn").onclick = () => {
+    const cur = document.documentElement.dataset.theme ||
+      (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    const nx = cur === "light" ? "dark" : "light";
+    document.documentElement.dataset.theme = nx;
+    ls.set("hd.theme", nx);
+  };
+})();
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+// ---------------- markdown (small, escape-first) ----------------
+function esc(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function inline(s) {
+  return s.replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function md(src) {
+  const out = [];
+  const parts = src.split(/```/);
+  parts.forEach((part, i) => {
+    if (i % 2 === 1) {
+      const nl = part.indexOf("\n");
+      const code = nl >= 0 ? part.slice(nl + 1) : part;
+      out.push("<pre><code>" + esc(code.replace(/\n$/, "")) + "</code></pre>");
+      return;
+    }
+    const lines = esc(part).split("\n");
+    let list = null, para = [], table = [];
+    const flushP = () => { if (para.length) { out.push("<p>" + inline(para.join("<br>")) + "</p>"); para = []; } };
+    const flushL = () => { if (list) { out.push("<" + list.t + ">" + list.items.map((x) => "<li>" + inline(x) + "</li>").join("") + "</" + list.t + ">"); list = null; } };
+    const flushT = () => {
+      if (!table.length) return;
+      const rows = table.filter((r) => !/^\|?\s*:?-{2,}/.test(r)).map((r) => r.replace(/^\||\|$/g, "").split("|"));
+      out.push("<table>" + rows.map((r, j) => "<tr>" + r.map((c) => (j ? "<td>" : "<th>") + inline(c.trim()) + (j ? "</td>" : "</th>")).join("") + "</tr>").join("") + "</table>");
+      table = [];
+    };
+    for (const ln of lines) {
+      let m;
+      if (/^\s*\|.*\|\s*$/.test(ln)) { flushP(); flushL(); table.push(ln.trim()); continue; } else flushT();
+      if ((m = ln.match(/^(#{1,4})\s+(.*)/))) { flushP(); flushL(); out.push("<h" + (m[1].length + 1) + ">" + inline(m[2]) + "</h" + (m[1].length + 1) + ">"); }
+      else if ((m = ln.match(/^\s*[-*]\s+(.*)/))) { flushP(); if (!list || list.t !== "ul") { flushL(); list = { t: "ul", items: [] }; } list.items.push(m[1]); }
+      else if ((m = ln.match(/^\s*\d+[.)]\s+(.*)/))) { flushP(); if (!list || list.t !== "ol") { flushL(); list = { t: "ol", items: [] }; } list.items.push(m[1]); }
+      else if (/^\s*(---|\*\*\*)\s*$/.test(ln)) { flushP(); flushL(); out.push("<hr>"); }
+      else if (ln.trim() === "") { flushP(); flushL(); }
+      else { flushL(); para.push(ln); }
+    }
+    flushP(); flushL(); flushT();
+  });
+  return out.join("");
+}
+
+// ---------------- conversations ----------------
+let convs = ls.get("hd.convs", []);
+let curId = ls.get("hd.cur", null);
+const settings = Object.assign({ think: false, web: false, temp: 0.7, maxTok: 16384 }, ls.get("hd.settings", {}));
+if (settings.maxTok === 2048) settings.maxTok = 16384;  // old default cut thinking short
+$("think").checked = settings.think; $("web").checked = settings.web; $("temp").value = settings.temp; $("maxTok").value = settings.maxTok;
+for (const id of ["think", "web", "temp", "maxTok"]) $(id).onchange = () => {
+  settings.think = $("think").checked; settings.web = $("web").checked; settings.temp = +$("temp").value; settings.maxTok = +$("maxTok").value;
+  ls.set("hd.settings", settings);
+};
+function save() { ls.set("hd.convs", convs.slice(-50)); ls.set("hd.cur", curId); }
+function cur() { return convs.find((c) => c.id === curId); }
+function newConv() { const c = { id: Date.now().toString(36), title: "新しいチャット", msgs: [] }; convs.push(c); curId = c.id; save(); renderAll(); }
+function renderSel() {
+  $("convSel").innerHTML = convs.slice().reverse().map((c) => `<option value="${c.id}"${c.id === curId ? " selected" : ""}>${esc(c.title)}</option>`).join("");
+}
+$("convSel").onchange = () => { curId = $("convSel").value; save(); renderAll(); };
+$("newBtn").onclick = newConv;
+$("delBtn").onclick = () => { convs = convs.filter((c) => c.id !== curId); curId = convs.length ? convs[convs.length - 1].id : null; if (!curId) newConv(); else { save(); renderAll(); } };
+
+function msgEl(m) {
+  if (m.role === "tool") {
+    const d = document.createElement("div");
+    d.className = "msg tool";
+    d.innerHTML = `<div class="web">🔎 ${esc(m.name || "tool")}${m.query ? "「" + esc(m.query) + "」" : ""} → ${m.sources ? m.sources.length + " 件" : "完了"}</div>`;
+    if (m.sources && m.sources.length) {
+      const det = document.createElement("details");
+      det.className = "think";
+      det.innerHTML = "<summary>検索結果</summary>";
+      det.appendChild(sourcesEl(m.sources, m.content));
+      d.appendChild(det);
+    }
+    return d;
+  }
+  const d = document.createElement("div");
+  d.className = "msg " + m.role;
+  d.innerHTML = `<div class="who">${m.role === "user" ? "you" : "assistant"}</div>`;
+  if (m.role === "assistant" && m.reasoning) {
+    const th = document.createElement("details");
+    th.className = "think";
+    th.innerHTML = `<summary>思考 (${m.reasoning.length} 文字)</summary><div></div>`;
+    th.querySelector("div").textContent = m.reasoning;
+    d.appendChild(th);
+  }
+  const b = document.createElement("div");
+  b.className = "body";
+  if (m.role === "user") b.textContent = m.content; else b.innerHTML = cite(md(m.content || ""), m.sources);
+  d.appendChild(b);
+  if (m.role === "user" && m.query) { const w = document.createElement("div"); w.className = "web"; w.textContent = "🌐 検索: " + m.query; d.appendChild(w); }
+  if (m.role === "assistant" && m.tool_calls && !m.content) b.innerHTML = `<div class="web">ツールを呼び出し: ${m.tool_calls.map((t) => esc(t.function.name)).join(", ")}</div>`;
+  if (m.sources && m.sources.length && !m.tool_calls) d.appendChild(sourcesEl(m.sources));
+  if (m.stat) { const s = document.createElement("div"); s.className = "mstat"; s.textContent = m.stat; d.appendChild(s); }
+  return d;
+}
+function cite(html, src) {
+  if (!src || !src.length) return html;
+  return html.replace(/\[(\d{1,2})\]/g, (all, n) => {
+    const s = src[+n - 1];
+    return s ? `<a class="cite" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.title)}">[${n}]</a>` : all;
+  });
+}
+function sourcesEl(src, toolText) {
+  const d = document.createElement("div");
+  d.className = "sources";
+  const off = toolText ? Math.max(0, (+((toolText.match(/\n\[(\d+)\] /) || [])[1] || 1)) - 1) : 0;
+  d.innerHTML = "<span>出典</span>" + src.map((s, i) => `<div>[${i + 1 + off}] <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title || s.url)}</a> <span>${esc(new URL(s.url).hostname)}</span></div>`).join("");
+  return d;
+}
+function renderMsgs() {
+  const c = cur(), box = $("msgs");
+  box.innerHTML = "";
+  if (!c || !c.msgs.length) {
+    box.innerHTML = `<div class="empty"><b>qwen-hyperdrive</b>RTX 3080 10GB で 27B / 128K コンテキスト。右側でハードの状態と速度をリアルタイムに表示します。</div>`;
+    return;
+  }
+  for (const m of c.msgs) box.appendChild(msgEl(m));
+  box.scrollTop = box.scrollHeight;
+}
+function renderAll() { renderSel(); renderMsgs(); }
+if (!convs.length || !cur()) newConv(); else renderAll();
+
+// ---------------- chat send (SSE) ----------------
+let ctrl = null;
+const input = $("input");
+input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(220, input.scrollHeight) + "px"; });
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+$("sendBtn").onclick = () => (ctrl ? ctrl.abort() : send());
+
+const WEB_TOOL = {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "Search the web (DuckDuckGo/Brave) and return the top results with page text. Use it only when the question needs current, external or verifiable facts that you do not reliably know; otherwise answer directly.",
+    parameters: { type: "object", properties: { query: { type: "string", description: "search query (keywords)" } }, required: ["query"] },
+  },
+};
+
+function apiMessages(msgs) {
+  return msgs.map((m) => {
+    if (m.role === "tool") return { role: "tool", tool_call_id: m.tool_call_id, content: m.content };
+    const o = { role: m.role, content: m.role === "user" ? (m.send || m.content) : (m.content || "") };
+    if (m.role === "assistant" && m.reasoning) o.reasoning_content = m.reasoning;
+    if (m.role === "assistant" && m.tool_calls) o.tool_calls = m.tool_calls;
+    return o;
+  });
+}
+
+// one streamed model turn into the placeholder `am` (last element of c.msgs)
+async function streamTurn(c, am, withTools, signal) {
+  const box = $("msgs");
+  const el = box.lastChild;
+  const body = el.querySelector(".body");
+  let thinkDiv = null, pending = false;
+  const t0 = performance.now();
+  let tFirst = 0, gotHeaders = false;
+  const status = (t) => { if (!am.content) body.innerHTML = `<div class="status">${esc(t)}</div>`; };
+  const waitTimer = setTimeout(() => { if (!gotHeaders) status("待機中…（他のリクエストを処理中）"); }, 700);
+  const req = {
+    messages: apiMessages(c.msgs.slice(0, -1)),
+    stream: true, temperature: settings.temp, max_tokens: settings.maxTok,
+    chat_template_kwargs: { enable_thinking: settings.think },
+  };
+  if (withTools) req.tools = [WEB_TOOL];
+  const paint = () => {
+    pending = false;
+    if (am.reasoning) {
+      if (!thinkDiv) {
+        const th = document.createElement("details");
+        th.className = "think"; th.open = !am.content;
+        th.innerHTML = "<summary>思考中…</summary><div></div>";
+        el.insertBefore(th, body);
+        thinkDiv = th;
+      }
+      thinkDiv.querySelector("div").textContent = am.reasoning;
+      thinkDiv.querySelector("summary").textContent = am.content ? `思考 (${am.reasoning.length} 文字)` : "思考中…";
+      if (am.content && thinkDiv.open) thinkDiv.open = false;
+      if (!am.content) body.innerHTML = `<div class="status">思考中… ${am.reasoning.length} 文字</div>`;
+    }
+    if (am.content) body.innerHTML = cite(md(am.content), am.sources);
+    const near = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
+    if (near) box.scrollTop = box.scrollHeight;
+  };
+  let timings = null, finish = null, toolCalls = [];
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req), signal });
+    gotHeaders = true;
+    if (!r.ok) throw new Error(await r.text());
+    status("プロンプトを処理中…");
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        const j = JSON.parse(data);
+        const ch = j.choices && j.choices[0];
+        const d = ch && ch.delta;
+        if (d) {
+          if (!tFirst && (d.content || d.reasoning_content)) tFirst = performance.now();
+          if (d.reasoning_content) am.reasoning += d.reasoning_content;
+          if (d.content) am.content += d.content;
+          if (d.tool_calls) for (const tc of d.tool_calls) toolCalls.push({ id: tc.id, type: "function", function: tc.function });
+        }
+        if (j.timings) timings = j.timings;
+        if (ch && ch.finish_reason) finish = ch.finish_reason;
+        if (!pending) {  // rAF can be throttled or paused (background tab): a timer backs it up
+          pending = true;
+          requestAnimationFrame(paint);
+          setTimeout(() => { if (pending) paint(); }, 120);
+        }
+      }
+    }
+    if (pending) paint();
+  } finally {
+    clearTimeout(waitTimer);
+  }
+  if (finish === "length") am.cut = true;
+  if (timings) {
+    am.stat = (am.cut ? "⚠ 最大トークン数で打ち切り · " : "") + `prefill ${timings.prompt_n} tok` + (timings.cache_n ? ` (+${timings.cache_n} cached)` : "") +
+      ` ${fmt(timings.prompt_per_second, 0)} tok/s · TTFT ${fmt((tFirst || performance.now()) - t0, 0)} ms · ` +
+      `decode ${timings.predicted_n} tok ${fmt(timings.predicted_per_second, 1)} tok/s · MTP ${timings.draft_n_accepted}/${timings.draft_n}`;
+  }
+  if (!am.reasoning) delete am.reasoning;
+  return { finish, toolCalls };
+}
+
+async function runTool(tc, turnSources, signal, statusEl) {
+  let args = {};
+  try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+  const tm = { role: "tool", tool_call_id: tc.id, name: tc.function.name, content: "" };
+  if (tc.function.name !== "web_search") { tm.content = `unknown tool: ${tc.function.name}`; return tm; }
+  tm.query = String(args.query || "").slice(0, 200);
+  statusEl.innerHTML = `<div class="status">🔎 検索中: ${esc(tm.query)}</div>`;
+  try {
+    const r = await fetch(`/api/search?q=${encodeURIComponent(tm.query)}&n=6&fetch=3&chars=2500`, { signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const res = ((await r.json()).results || []).filter((x) => x.url);
+    const base = turnSources.length;
+    tm.sources = res.map((x) => ({ title: x.title, url: x.url }));
+    turnSources.push(...tm.sources);
+    const today = new Date().toISOString().slice(0, 10);
+    tm.content = res.length
+      ? `検索日 ${today}、検索語「${tm.query}」の結果:\n\n` + res.map((x, i) => `[${base + i + 1}] ${x.title}\nURL: ${x.url}\n抜粋: ${x.snippet}` + (x.text ? `\n本文: ${x.text}` : "")).join("\n\n") +
+        `\n\n回答で根拠にした結果は [番号] で示してください。`
+      : `検索語「${tm.query}」の結果はありませんでした。`;
+  } catch (e) {
+    if (e.name === "AbortError") throw e;
+    tm.content = `検索に失敗しました: ${e.message}`;
+  }
+  return tm;
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || ctrl) return;
+  const c = cur();
+  c.msgs.push({ role: "user", content: text });
+  if (c.title === "新しいチャット") c.title = text.slice(0, 40);
+  input.value = ""; input.style.height = "auto";
+  ctrl = new AbortController();
+  $("sendBtn").textContent = "停止";
+  const turnSources = [];
+  let am = null;
+  try {
+    for (let round = 0; round < 4; round++) {
+      am = { role: "assistant", content: "", reasoning: "" };
+      if (turnSources.length) am.sources = turnSources.slice();
+      c.msgs.push(am);
+      save(); renderAll();
+      const { finish, toolCalls } = await streamTurn(c, am, settings.web && round < 3, ctrl.signal);
+      if (finish !== "tool_calls" || !toolCalls.length) break;
+      am.tool_calls = toolCalls;
+      save(); renderMsgs();
+      const statusEl = document.createElement("div");
+      statusEl.className = "msg";
+      $("msgs").appendChild(statusEl);
+      for (const tc of toolCalls) c.msgs.push(await runTool(tc, turnSources, ctrl.signal, statusEl));
+    }
+  } catch (e) {
+    if (am) {
+      if (e.name !== "AbortError") am.content += (am.content ? "\n\n" : "") + "⚠️ " + e.message;
+      else am.stat = "（停止しました）";
+    }
+  } finally {
+    ctrl = null;
+    $("sendBtn").textContent = "送信";
+    if (am && !am.sources) delete am.sources;
+    save(); renderMsgs();
+  }
+}
+
+// ---------------- dashboard ----------------
+function fmt(v, d = 1) { return v === undefined || v === null || v < 0 || !isFinite(v) ? "–" : Number(v).toFixed(d); }
+function kvHtml(rows) {
+  return rows.map(([k, v, bar]) => {
+    let h = `<div class="k">${k}</div><div class="v">${v}</div>`;
+    if (bar !== undefined) {
+      const p = Math.max(0, Math.min(100, bar[0])), cls = bar[1] || "";
+      h += `<div style="grid-column:1/3" class="bar"><i class="${cls}" style="width:${p}%"></i></div>`;
+    }
+    return h;
+  }).join("");
+}
+const heat = (p) => (p > 85 ? "hot" : p > 65 ? "warm" : "ok");
+const series = { gpuT: [], gpuP: [], gpuU: [], rx: [], cpuT: [], cpuU: [] };
+const N = 150;
+function push(a, v) { a.push(v); if (a.length > N) a.shift(); }
+function chart(cv, lines, maxY) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = css("--line"); g.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { g.beginPath(); g.moveTo(0, (h * i) / 4); g.lineTo(w, (h * i) / 4); g.stroke(); }
+  for (const [arr, col] of lines) {
+    if (arr.length < 2) continue;
+    g.strokeStyle = col; g.lineWidth = 1.6; g.beginPath();
+    arr.forEach((v, i) => { const x = (i / (N - 1)) * w, y = h - (Math.max(0, v) / maxY) * (h - 4) - 2; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  }
+}
+function bars(cv, hist) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const items = hist.slice(-30);
+  if (!items.length) return;
+  const mx = Math.max(60, ...items.map((r) => r.decode_tps), ...items.map((r) => r.prefill_tps / 20));
+  const bw = w / 30;
+  items.forEach((r, i) => {
+    const x = i * bw;
+    g.fillStyle = css("--warn");
+    g.fillRect(x + 1, h - (r.prefill_tps / 20 / mx) * h, bw / 2 - 1, (r.prefill_tps / 20 / mx) * h);
+    g.fillStyle = css("--acc");
+    g.fillRect(x + bw / 2, h - (r.decode_tps / mx) * h, bw / 2 - 1, (r.decode_tps / mx) * h);
+  });
+}
+function dur(s) { s = Math.floor(s); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); return (h ? h + "h " : "") + m + "m " + (s % 60) + "s"; }
+
+let lastHist = [];
+async function poll() {
+  let j;
+  try { j = await (await fetch("/api/stats", { cache: "no-store" })).json(); } catch { setTimeout(poll, 2000); return; }
+  const e = j.engine, g = j.gpu, c = j.cpu, cf = j.config, k = e.kv, cr = e.current;
+  $("hdrModel").textContent = cf.model + " · ctx " + cf.ctx;
+  const ph = $("phase"); ph.textContent = e.phase; ph.className = "badge " + e.phase;
+  $("liveTps").textContent = e.phase === "decode" ? fmt(cr.decode_tps, 1) + " tok/s" : e.phase === "prefill" ? "prefill…" : "– tok/s";
+  const last = e.history.length ? e.history[e.history.length - 1] : null;
+  const ref = e.phase !== "idle" ? cr : last;
+  $("bDecode").textContent = ref ? fmt(ref.decode_tps, 1) : "–";
+  $("bPrefill").textContent = ref && ref.prompt_n ? fmt(ref.prefill_tps, 0) : "–";
+  $("bTtft").textContent = ref && ref.ttft_ms ? (ref.ttft_ms >= 1000 ? fmt(ref.ttft_ms / 1000, 2) + "s" : fmt(ref.ttft_ms, 0) + "ms") : "–";
+  $("engUptime").textContent = "uptime " + dur(e.uptime_s);
+  $("rDec").textContent = e.best_decode && e.best_decode.decode_tps > 0 ? fmt(e.best_decode.decode_tps, 1) : "–";
+  $("rPf").textContent = e.best_prefill && e.best_prefill.prefill_tps > 0 ? fmt(e.best_prefill.prefill_tps, 0) : "–";
+  $("rDec").title = e.best_decode ? `${e.best_decode.id}: ${e.best_decode.gen_n} tok` : "";
+  $("rPf").title = e.best_prefill ? `${e.best_prefill.id}: ${e.best_prefill.prompt_n} tok` : "";
+  $("aDec").textContent = fmt(e.avg_decode_tps, 1);
+  $("aPf").textContent = fmt(e.avg_prefill_tps, 0);
+  const acc = ref && ref.drafted ? (100 * ref.accepted) / ref.drafted : -1;
+  const tps = ref && ref.steps ? (ref.gen_n - 1) / ref.steps : -1;
+  $("engKv").innerHTML = kvHtml([
+    ["状態", e.phase + (e.phase !== "idle" ? ` (${fmt(e.elapsed_s, 1)} s)` : "")],
+    ["プロンプト", ref ? `${ref.prompt_n} tok` + (ref.cache_n ? ` + ${ref.cache_n} cached` : "") : "–"],
+    ["生成", ref ? `${ref.gen_n} tok` : "–"],
+    ["MTP 採択", acc >= 0 ? `${fmt(acc, 0)} % · ${fmt(tps, 2)} tok/pass` : "–"],
+    ["文脈", `${e.pos} / ${cf.ctx}`, [(100 * e.pos) / cf.ctx]],
+    ["累計", `${e.requests} req · ${e.total_prompt} prompt · ${e.total_gen} gen tok`],
+  ]);
+  if (JSON.stringify(e.history.slice(-1)) !== JSON.stringify(lastHist.slice(-1)) || e.phase !== "idle") {
+    lastHist = e.history.slice();
+    bars($("cReq"), e.phase === "decode" ? e.history.concat([cr]) : e.history);
+  }
+  $("memKv").innerHTML = kvHtml([
+    ["KV ブロック (使用 / 全体)", `${k.blocks_used} / ${k.blocks_total} (${fmt(k.blocks_used * k.block_mb, 0)} MiB)`, [(100 * k.blocks_used) / Math.max(1, k.blocks_total)]],
+    ["FFN 層: 常駐", `${cf.resident_ffn} / ${cf.n_layer}`],
+    ["FFN 層: KV 領域に貸出", `${k.borrowed_kv}`],
+    ["FFN 層: ワークスペースに貸出", `${k.borrowed_ws}`],
+    ["FFN 層: PCIe ストリーム", `${k.streamed}`],
+    ["キャッシュ会話", `${k.seqs} (host 退避 ${k.seqs_offloaded}, ${fmt(k.host_mb, 0)} MiB)`],
+  ]);
+  if (g.ok) {
+    $("gpuName").textContent = g.name;
+    const vp = (100 * g.mem_used_mb) / g.mem_total_mb, pp = (100 * g.power_w) / g.power_limit_w;
+    $("gpuKv").innerHTML = kvHtml([
+      ["温度", `${g.temp_c} °C · fan ${g.fan_pct} %`, [g.temp_c, heat(g.temp_c)]],
+      ["電力", `${fmt(g.power_w, 0)} / ${fmt(g.power_limit_w, 0)} W`, [pp, heat(pp)]],
+      ["使用率", `GPU ${g.util_gpu} % · mem ${g.util_mem} %`, [g.util_gpu]],
+      ["VRAM", `${fmt(g.mem_used_mb / 1024, 2)} / ${fmt(g.mem_total_mb / 1024, 1)} GiB`, [vp, heat(vp)]],
+      ["クロック", `${g.clock_gpu_mhz} MHz · mem ${g.clock_mem_mhz} MHz`],
+      ["PCIe", `Gen${g.pcie_gen} x${g.pcie_width} · RX ${fmt(g.pcie_rx_mbs / 1024, 1)} GB/s`, [(100 * g.pcie_rx_mbs / 1024) / 26]],
+    ]);
+    push(series.gpuT, g.temp_c); push(series.gpuP, g.power_w); push(series.gpuU, g.util_gpu); push(series.rx, (g.pcie_rx_mbs / 1024) * 10);
+    chart($("cGpu"), [[series.gpuT, css("--hot")], [series.gpuP, css("--warn")], [series.gpuU, css("--acc2")], [series.rx, css("--acc")]], Math.max(320, g.power_limit_w || 0));
+  } else {
+    $("gpuKv").innerHTML = kvHtml([["NVML", "取得できません"]]);
+  }
+  $("cpuName").textContent = (c.name || "").replace(/\s+\d+-Core Processor/, "");
+  const rp = (100 * c.ram_used_mb) / c.ram_total_mb;
+  $("cpuKv").innerHTML = kvHtml([
+    ["温度", `${fmt(c.temp_c, 1)} °C`, [c.temp_c, heat(c.temp_c)]],
+    ["使用率", `${fmt(c.util_pct, 0)} % (${c.threads} threads)`, [c.util_pct]],
+    ["クロック", `avg ${fmt(c.freq_avg_mhz, 0)} · max ${fmt(c.freq_max_mhz, 0)} MHz`],
+    ["RAM", `${fmt(c.ram_used_mb / 1024, 1)} / ${fmt(c.ram_total_mb / 1024, 1)} GiB`, [rp, heat(rp)]],
+  ]);
+  push(series.cpuT, c.temp_c); push(series.cpuU, c.util_pct);
+  chart($("cCpu"), [[series.cpuT, css("--hot")], [series.cpuU, css("--acc2")]], 100);
+  $("cfgKv").innerHTML = kvHtml([
+    ["KV 形式", cf.kv_type],
+    ["MTP", cf.mtp ? `on · draft ≤ ${cf.draft_max}` : "off"],
+    ["spec-relax λ", fmt(cf.spec_relax, 1)],
+    ["skip-ffn", cf.skip_ffn || "なし"],
+    ["常駐重み", `${fmt(cf.resident_mb / 1024, 2)} GiB`],
+    ["ストリーム / CPU", `${fmt(cf.streamed_mb / 1024, 2)} / ${fmt(cf.cpu_mb / 1024, 2)} GiB`],
+  ]);
+  setTimeout(poll, e.phase === "idle" ? 1000 : 500);
+}
+poll();
+</script>
+</body>
+</html>
+)QEHTML";

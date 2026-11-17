@@ -28,6 +28,11 @@
       cuda = pkgs.cudaPackages;
 
       engine = pkgs.callPackage ./nix/engine.nix { cudaPackages = cuda; };
+      # Vulkan only: no CUDA in the closure (AMD Radeon, Intel Arc, ...)
+      engine-vulkan = pkgs.callPackage ./nix/engine.nix {
+        cudaPackages = cuda;
+        withCuda = false;
+      };
 
       reference =
         (pkgs.callPackage "${llama-cpp-src}/.devops/nix/package.nix" {
@@ -52,6 +57,7 @@
     {
       packages.${system} = {
         default = engine;
+        vulkan = engine-vulkan;
         inherit engine reference;
       };
 
@@ -82,6 +88,10 @@
           pkgs.ninja
           (pkgs.python3.withPackages (ps: [ ps.numpy ps.gguf ]))
           pkgs.gdb
+          pkgs.vulkan-headers
+          pkgs.vulkan-loader
+          pkgs.shaderc
+          pkgs.vulkan-tools
         ];
         shellHook = ''
           export LD_LIBRARY_PATH=/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}

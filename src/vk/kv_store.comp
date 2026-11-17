@@ -1,0 +1,35 @@
+// K/V rows of T tokens -> cache at positions pos0.. ; one invocation per (token, kv head, 32-group).
+// f16: [pos][head][hd] halves; q8: per (pos, head) hd int8 (hd/4 words) + hd/32 fp32 scales.
+#version 450
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uvec2 k, v, kc, vc; uint nkv, hd, T, pos0, kts, q8; } pc;
+void store(F32 src, U32 dst, uint t, uint h, uint grp) {
+  const uint sb = t * pc.kts + h * pc.hd + grp * 32u;
+  const uint slot = (pc.pos0 + t) * pc.nkv + h;
+  if (pc.q8 == 0u) {
+    const uint o = (slot * pc.hd + grp * 32u) / 2u;
+    for (uint i = 0u; i < 16u; i++) dst.d[o + i] = packHalf2x16(vec2(src.d[sb + 2u * i], src.d[sb + 2u * i + 1u]));
+  } else {
+    const uint rw = pc.hd / 4u + pc.hd / 32u;  // words per (pos, head)
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) amax = max(amax, abs(src.d[sb + i]));
+    const float d = amax / 127.0, id = d > 0.0 ? 1.0 / d : 0.0;
+    for (uint i = 0u; i < 8u; i++) {
+      uint wv = 0u;
+      for (uint j = 0u; j < 4u; j++) {
+        const int q = clamp(int(round(src.d[sb + 4u * i + j] * id)), -127, 127);
+        wv |= (uint(q) & 0xffu) << (8u * j);
+      }
+      dst.d[slot * rw + grp * 8u + i] = wv;
+    }
+    dst.d[slot * rw + pc.hd / 4u + grp] = floatBitsToUint(d);
+  }
+}
+void main() {
+  const uint id = gl_GlobalInvocationID.x, ng = pc.hd / 32u;
+  if (id >= pc.T * pc.nkv * ng) return;
+  const uint grp = id % ng, h = (id / ng) % pc.nkv, t = id / (ng * pc.nkv);
+  store(F32(pc.k), U32(pc.kc), t, h, grp);
+  store(F32(pc.v), U32(pc.vc), t, h, grp);
+}

@@ -1,0 +1,19 @@
+// GDN causal depthwise conv (kernel 4) over T tokens + SiLU; conv_state keeps the last 3 inputs
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uvec2 x, st, w, y; uint C, T, xts; } pc;
+void main() {
+  const uint c = gl_GlobalInvocationID.x;
+  if (c >= pc.C) return;
+  F32 x = F32(pc.x); F32 st = F32(pc.st); F32 w = F32(pc.w); F32 y = F32(pc.y);
+  float w0 = st.d[c], w1 = st.d[pc.C + c], w2 = st.d[2u * pc.C + c];
+  const float k0 = w.d[4u * c], k1 = w.d[4u * c + 1u], k2 = w.d[4u * c + 2u], k3 = w.d[4u * c + 3u];
+  for (uint t = 0u; t < pc.T; t++) {
+    const float xi = x.d[t * pc.xts + c];
+    const float o = k0 * w0 + k1 * w1 + k2 * w2 + k3 * xi;
+    y.d[t * pc.C + c] = o / (1.0 + exp(-o));
+    w0 = w1; w1 = w2; w2 = xi;
+  }
+  st.d[c] = w0; st.d[pc.C + c] = w1; st.d[2u * pc.C + c] = w2;
+}

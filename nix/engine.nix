@@ -1,6 +1,13 @@
 {
   lib,
+  stdenv,
   cudaPackages,
+  vulkan-loader,
+  vulkan-headers,
+  shaderc,
+  # CUDA backend (NVIDIA, fastest there) and/or Vulkan backend (AMD Radeon, Intel Arc, NVIDIA, ...)
+  withCuda ? true,
+  withVulkan ? true,
   cmake,
   ninja,
   autoAddDriverRunpath,
@@ -11,7 +18,7 @@
 }:
 
 let
-  core = cudaPackages.backendStdenv.mkDerivation {
+  core = (if withCuda then cudaPackages.backendStdenv else stdenv).mkDerivation {
     pname = "qwen35-engine";
     version = "0.1.0";
 
@@ -22,38 +29,49 @@ let
         let
           rel = lib.removePrefix (toString ../. + "/") (toString name);
         in
-        rel == "CMakeLists.txt" || lib.hasPrefix "src" rel || lib.hasPrefix "tools" rel || lib.hasPrefix "web" rel;
+        rel == "CMakeLists.txt" || lib.hasPrefix "src" rel || lib.hasPrefix "tools" rel || lib.hasPrefix "web" rel
+        || lib.hasPrefix "cmake" rel;
     };
 
     nativeBuildInputs = [
       cmake
       ninja
-      cudaPackages.cuda_nvcc
       autoAddDriverRunpath
-    ];
+    ]
+    ++ lib.optionals withCuda [ cudaPackages.cuda_nvcc ]
+    ++ lib.optionals withVulkan [ shaderc ];
 
-    buildInputs = [
-      cudaPackages.cuda_cudart
-      cudaPackages.cccl
-      cudaPackages.libcublas
-    ];
+    buildInputs =
+      lib.optionals withCuda [
+        cudaPackages.cuda_cudart
+        cudaPackages.cccl
+        cudaPackages.libcublas
+      ]
+      ++ lib.optionals withVulkan [
+        vulkan-loader
+        vulkan-headers
+      ];
 
     cmakeFlags = [
       (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
+      (lib.cmakeBool "QE_CUDA" withCuda)
+      (lib.cmakeBool "QE_VULKAN" withVulkan)
+    ]
+    ++ lib.optionals withCuda [
       # A100 / RTX 30 / RTX 40 / H100 machine code, plus PTX for newer GPUs
       (lib.cmakeFeature "CMAKE_CUDA_ARCHITECTURES" "80-real;86-real;89-real;90")
     ];
 
     # install the test / benchmark tools too
     postInstall = ''
-      for t in qe_test_kernels qe_test_cpu qe_bench_attn qe_tokenize qe_dump; do
+      for t in qe_test_kernels qe_test_cpu qe_bench_attn qe_tokenize qe_dump qe_vk_test; do
         [ -x "$t" ] && install -Dm755 "$t" "$out/bin/$t"
       done
     '';
 
     meta = {
-      description = "From-scratch hybrid CPU/GPU inference engine for qwen35 (Qwen3.8-27B) GGUF models";
-      mainProgram = "qwen35-server";
+      description = "From-scratch inference engine for qwen35 (Qwen3.5 / 3.8) GGUF models (CUDA + Vulkan)";
+      mainProgram = if withCuda then "qwen35-server" else "qwen35-server-vk";
       platforms = [ "x86_64-linux" ];
     };
   };
@@ -128,7 +146,23 @@ let
         fi
         args=(-m "$model" "$@") ;;
     esac
-    ${core}/bin/qwen35-server "''${args[@]}" &
+    # backend: LLM_ENGINE_BACKEND=cuda|vulkan, default cuda when an NVIDIA driver is loaded and the
+    # CUDA build is present, else Vulkan (AMD Radeon / Intel Arc / any Vulkan 1.2 GPU)
+    backend="''${LLM_ENGINE_BACKEND:-auto}"
+    if [ "$backend" = auto ]; then
+      if [ -x ${core}/bin/qwen35-server ] && [ -e /proc/driver/nvidia/version ]; then backend=cuda; else backend=vulkan; fi
+    fi
+    case "$backend" in
+      cuda) server=${core}/bin/qwen35-server ;;
+      vulkan) server=${core}/bin/qwen35-server-vk ;;
+      *) echo "llm-engine: unknown LLM_ENGINE_BACKEND=$backend (cuda|vulkan)" >&2; exit 1 ;;
+    esac
+    if [ ! -x "$server" ]; then
+      echo "llm-engine: this build has no $backend backend" >&2
+      exit 1
+    fi
+    echo "llm-engine: $backend backend" >&2
+    "$server" "''${args[@]}" &
     pid=$!
     trap 'kill -TERM $pid 2>/dev/null' INT TERM
     wait $pid

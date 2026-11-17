@@ -26,7 +26,9 @@
 #include "hwmon.h"
 #include "websearch.h"
 #include "webui_html.h"
+#include "backend.h"
 #include "engine.h"
+#include "gguf.h"
 #include "json.h"
 #include "tokenizer.h"
 
@@ -112,7 +114,7 @@ struct Server {
   bool ngram = true;
   int mtp_max = 5;
   float spec_relax = 1.f;  // >1: lenient speculative acceptance (faster, slightly biased sampling)
-  std::unique_ptr<Model> model;
+  std::unique_ptr<IModel> model;
   std::unique_ptr<Tokenizer> tok;
   std::unique_ptr<Generator> gen;
   std::mutex mu;  // one generation at a time
@@ -148,7 +150,7 @@ struct Server {
     double t_start = 0;
     ReqStat cur;
     std::deque<ReqStat> hist;
-    Model::KvInfo kv;
+    KvInfo kv;
     int pos = 0;
     uint64_t total_gen = 0, total_prompt = 0, requests = 0;
     // records and token-weighted averages (prefill: prompts >= 128 new tokens, decode: >= 32 tokens)
@@ -158,7 +160,7 @@ struct Server {
   const double t_boot = qe_now();
 
   void live_update(const char* phase, const ReqStat* r, bool kv) {
-    Model::KvInfo k;
+    KvInfo k;
     if (kv) k = model->kv_info();
     std::lock_guard<std::mutex> g(live.m);
     if (phase) live.phase = phase;
@@ -257,10 +259,10 @@ struct Server {
     cf["draft_max"] = model->options().draft_max;
     cf["spec_relax"] = spec_relax;
     cf["skip_ffn"] = skip_ffn_str;
-    cf["resident_mb"] = model->plan_res_mb_;
-    cf["streamed_mb"] = model->plan_stream_mb_;
-    cf["cpu_mb"] = model->plan_cpu_mb_;
-    cf["resident_ffn"] = model->plan_res_ffn_;
+    cf["resident_mb"] = model->plan_stats().res_mb;
+    cf["streamed_mb"] = model->plan_stats().stream_mb;
+    cf["cpu_mb"] = model->plan_stats().cpu_mb;
+    cf["resident_ffn"] = model->plan_stats().res_ffn;
     cf["n_layer"] = model->cfg().n_layer;
     j["config"] = cf;
     return j.dump();
@@ -682,7 +684,7 @@ int main(int argc, char** argv) {
     else if (a == "-c" || a == "--ctx") srv.opt.ctx = std::stoi(next());
     else if (a == "--kv") {
       std::string k = next();
-      srv.opt.kv_type = k == "f16" ? qk::KV_F16 : k == "q8" ? qk::KV_Q8 : k == "q3" ? qk::KV_Q3 : qk::KV_Q4;
+      srv.opt.kv_type = k == "f16" ? 0 : k == "q8" ? 1 : k == "q3" ? 3 : 2;
     } else if (a == "--cpu-frac") {
       const std::string v = next();
       srv.opt.cpu_frac = v == "auto" ? -1.0 : std::stod(v);
@@ -713,7 +715,7 @@ int main(int argc, char** argv) {
     } else QE_FATAL("unknown argument %s (see --help)", a.c_str());
   }
   if (srv.opt.model_path.empty()) QE_FATAL("-m model.gguf is required");
-  srv.model = std::make_unique<Model>(srv.opt);
+  srv.model = create_model(srv.opt);
   srv.tok = std::make_unique<Tokenizer>(srv.model->gguf());
   srv.gen = std::make_unique<Generator>(*srv.model, SamplingParams{}, srv.opt.use_mtp);
   srv.stop_ids[0] = srv.tok->eos();

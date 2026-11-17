@@ -1,0 +1,16 @@
+// NeoX RoPE on the first 2*half dims of each head; angles (cos, sin) precomputed on the host in fp64
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uvec2 x, cs; uint nh, hs, ts, T, half_; } pc;
+void main() {
+  const uint idx = gl_GlobalInvocationID.y * 65535u * 256u + gl_GlobalInvocationID.x;
+  if (idx >= pc.T * pc.nh * pc.half_) return;
+  F32 x = F32(pc.x); F32 cs = F32(pc.cs);
+  const uint i = idx % pc.half_, h = (idx / pc.half_) % pc.nh, t = idx / (pc.half_ * pc.nh);
+  const uint b = t * pc.ts + h * pc.hs;
+  const float c = cs.d[2u * (t * pc.half_ + i)], s = cs.d[2u * (t * pc.half_ + i) + 1u];
+  const float a = x.d[b + i], bb = x.d[b + i + pc.half_];
+  x.d[b + i] = a * c - bb * s;
+  x.d[b + i + pc.half_] = a * s + bb * c;
+}

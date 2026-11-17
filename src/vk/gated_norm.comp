@@ -1,0 +1,19 @@
+// GDN output: o = rmsnorm(o per head) * w * silu(z), one workgroup per (token, v head)
+#version 450
+#include "common.glsl"
+#include "reduce.glsl"
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uvec2 o, z, w; uint nv, dv, zts; float eps; } pc;
+void main() {
+  const uint id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  const uint t = id / pc.nv, h = id % pc.nv, tid = gl_LocalInvocationID.x;
+  F32 o = F32(pc.o); F32 z = F32(pc.z); F32 w = F32(pc.w);
+  const uint b = t * pc.nv * pc.dv + h * pc.dv, zb = t * pc.zts + h * pc.dv;
+  float ss = 0.0;
+  for (uint i = tid; i < pc.dv; i += 128u) { const float v = o.d[b + i]; ss += v * v; }
+  const float r = inversesqrt(wg_sum(ss) / float(pc.dv) + pc.eps);
+  for (uint i = tid; i < pc.dv; i += 128u) {
+    const float zv = z.d[zb + i];
+    o.d[b + i] = o.d[b + i] * r * w.d[i] * (zv / (1.0 + exp(-zv)));
+  }
+}

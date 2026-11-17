@@ -45,11 +45,30 @@
 |---|---|
 | モデル | GGUF の `qwen35` アーキテクチャ（Qwen3.5 / 3.6 / 3.8 系の DeltaNet + ゲート付き注意のハイブリッド。サイズ・層数・ヘッド数は GGUF から読む。注意ヘッド次元 256、DeltaNet 状態 128 が前提）。MTP（NextN）層があれば自己投機デコードに使い、なければ自動で通常デコード |
 | 量子化 | IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / BF16 / F16 / F32（Q4_K_M・Q5_K_M・Q8_0・IQ 系の混在 GGUF をそのまま読める） |
-| GPU | NVIDIA Ampere 以降（compute 8.0 以上: RTX 30 / 40 系、A100、H100 など）。Nix パッケージは sm_80 / 86 / 89 / 90 の機械語と PTX を同梱。VRAM 容量に合わせて常駐・ストリーミング・KV を自動配置 |
+| GPU（CUDA） | NVIDIA Ampere 以降（compute 8.0 以上: RTX 30 / 40 系、A100、H100 など）。Nix パッケージは sm_80 / 86 / 89 / 90 の機械語と PTX を同梱。VRAM 容量に合わせて常駐・ストリーミング・KV を自動配置。NVIDIA ではこちらが最速 |
+| GPU（Vulkan） | Vulkan 1.2 の GPU なら何でも: AMD Radeon（RADV / AMDVLK）、Intel Arc（ANV）、NVIDIA など。必要なのはバッファデバイスアドレス、8 レーン以上のサブグループ（算術・クラスタ演算）、32 KiB の共有メモリだけ。`VK_KHR_cooperative_matrix` があればプリフィルの行列積を行列演算器（RDNA3 WMMA / Arc XMX / Tensor Core）で行う（起動時に自己テストし、合わなければスカラーに戻る） |
 | CPU | x86-64-v3（AVX2 / FMA / F16C / BMI2）。物理コア数・PCIe 帯域・DRAM 帯域は起動時に実測して CPU/GPU 分担に使う（`-t` / `--pcie-gbps` で上書き可） |
 
 検証済み: Huihui-Qwen3.8-27B IQ3_XXS-mtp（10 GB に収まらないためストリーミング + CPU 併用）、Qwen3.5-9B Q4_K_M MTP（全層 VRAM 常駐）。
 Qwen3.5-9B Q4_K_M（RTX 3080）: 短い文脈のデコード 141〜259 tok/s、32K プリフィル 9.7 秒（3376 tok/s）。
+
+### Vulkan バックエンド
+
+`nix build .#vulkan` で CUDA を含まない Vulkan 専用パッケージ（クロージャ約 100 MiB）を作れる。既定パッケージは CUDA と Vulkan の両方を含み、`llm-engine` は NVIDIA ドライバがあれば CUDA、なければ Vulkan を選ぶ（`LLM_ENGINE_BACKEND=cuda|vulkan` で指定、`QE_VK_DEVICE=<番号>` で GPU を選択）。
+
+- 重みは GGUF の形式のままシェーダー内で展開（17 形式すべて、CPU 参照実装とビット一致）。VRAM に入らない FFN 層は GPU がシステム RAM から PCIe 越しに読む
+- KV キャッシュは q8（`--kv f16` も可。q4 / q3 は未実装で q8 になる）。DeltaNet 状態のチェックポイントで会話の続きを再利用
+- MTP 投機デコードと CPU 併用は CUDA 版のみ（Vulkan は 1 トークンずつ）
+- 移植性の確認: RTX 3080（NVIDIA Vulkan ドライバ）と Mesa lavapipe（CPU 実装、8 レーンのサブグループ）の両方で CUDA 版と同じトークン列を出力。`qe_vk_test <model.gguf>` でシェーダーの単体テスト
+
+| Qwen3.5-9B Q4_K_M, RTX 3080 | CUDA | Vulkan |
+|---|---|---|
+| デコード（短い文脈） | 141〜259 tok/s（MTP あり） | 57〜63 tok/s |
+| デコード（32K 文脈） | — | 41 tok/s |
+| プリフィル 2K / 32K | — / 3376 tok/s | 755 / 471 tok/s |
+| perplexity（同一テキスト 2K） | 6.527 | 6.540 |
+
+Qwen3.8-27B IQ3_XXS も Vulkan で CUDA と同じ出力になる（10 GB では FFN 5 層がシステム RAM 側になり 9.4 tok/s。NVIDIA では CUDA 版を使うこと）。
 
 ## 使い方
 

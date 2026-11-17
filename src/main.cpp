@@ -8,7 +8,8 @@
 #include <sstream>
 
 #include "engine.h"
-#include "model.h"
+#include "backend.h"
+#include "gguf.h"
 
 static std::vector<int> read_ids(const std::string& path) {
   std::ifstream f(path);
@@ -50,7 +51,7 @@ int main(int argc, char** argv) {
     else if (a == "--vram-budget") opt.vram_budget_mb = std::stoll(next());
     else if (a == "--kv") {
       std::string k = next();
-      opt.kv_type = k == "f16" ? qk::KV_F16 : k == "q8" ? qk::KV_Q8 : k == "q3" ? qk::KV_Q3 : qk::KV_Q4;
+      opt.kv_type = k == "f16" ? 0 : k == "q8" ? 1 : k == "q3" ? 3 : 2;
     } else if (a == "--cpu-frac") opt.cpu_frac = std::stod(next());
     else if (a == "-t") opt.cpu_threads = std::stoi(next());
     else if (a == "--pcie-gbps") opt.pcie_gbps = std::stod(next());
@@ -77,7 +78,8 @@ int main(int argc, char** argv) {
     else if (a == "-v") opt.verbose = true;
     else QE_FATAL("unknown argument %s", a.c_str());
   }
-  Model model(opt);
+  std::unique_ptr<IModel> mp = create_model(opt);
+  IModel& model = *mp;
   const int V = model.cfg().n_vocab;
   std::vector<int> ids = read_ids(ids_path);
   if (cmd == "ppl") {

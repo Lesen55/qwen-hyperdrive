@@ -1,0 +1,26 @@
+// per-row argmax (lowest index on ties), one workgroup per row
+#version 450
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uvec2 x, out_; uint n; } pc;
+shared float sv[256];
+shared uint si[256];
+void main() {
+  F32 x = F32(pc.x);
+  const uint row = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+  float bv = -3.0e38; uint bi = 0xffffffffu;
+  for (uint i = tid; i < pc.n; i += 256u) {
+    const float v = x.d[row * pc.n + i];
+    if (v > bv) { bv = v; bi = i; }
+  }
+  sv[tid] = bv; si[tid] = bi;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1) {
+    if (tid < s) {
+      const float v = sv[tid + s]; const uint i = si[tid + s];
+      if (v > sv[tid] || (v == sv[tid] && i < si[tid])) { sv[tid] = v; si[tid] = i; }
+    }
+    barrier();
+  }
+  if (tid == 0u) U32(pc.out_).d[row] = si[0];
+}

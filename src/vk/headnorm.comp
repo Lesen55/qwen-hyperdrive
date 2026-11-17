@@ -1,0 +1,20 @@
+// in-place per-(token, head) norm: mode 0 = RMS norm * w, mode 1 = L2 normalization (no weight)
+#version 450
+#include "common.glsl"
+#include "reduce.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uvec2 x, w; uint hd, nh, hs, ts, mode; float eps; } pc;
+void main() {
+  F32 x = F32(pc.x);
+  const uint id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  const uint t = id / pc.nh, h = id % pc.nh, tid = gl_LocalInvocationID.x;
+  const uint b = t * pc.ts + h * pc.hs;
+  float ss = 0.0;
+  for (uint i = tid; i < pc.hd; i += 64u) { const float v = x.d[b + i]; ss += v * v; }
+  ss = wg_sum(ss);
+  const float r = pc.mode == 0u ? inversesqrt(ss / float(pc.hd) + pc.eps) : inversesqrt(ss + pc.eps);
+  for (uint i = tid; i < pc.hd; i += 64u) {
+    const float v = x.d[b + i] * r;
+    x.d[b + i] = pc.mode == 0u ? v * F32(pc.w).d[i] : v;
+  }
+}

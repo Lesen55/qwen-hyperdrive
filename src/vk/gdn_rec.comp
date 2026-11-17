@@ -1,0 +1,40 @@
+// Gated DeltaNet recurrence (dk = dv = 128), state [head][col j][row r] fp32, updated in place.
+// Workgroup = (v head, 16 columns); 8 consecutive invocations own one column (16 rows each) and
+// reduce with clustered subgroup adds (subgroup size >= 8 is checked by the host).
+#version 450
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uvec2 qkv, g, beta, st, o; uint nk, nv, T, C; } pc;
+void main() {
+  const uint h = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+  const uint j = gl_WorkGroupID.y * 16u + tid / 8u, r0 = (tid % 8u) * 16u;
+  const uint hk = h % pc.nk;
+  F32 qkv = F32(pc.qkv); F32 gg = F32(pc.g); F32 bb = F32(pc.beta); F32 st = F32(pc.st); F32 o = F32(pc.o);
+  const uint sb = (h * 128u + j) * 128u + r0;
+  float S[16];
+  for (uint i = 0u; i < 16u; i++) S[i] = st.d[sb + i];
+  const float qs = inversesqrt(128.0);
+  for (uint t = 0u; t < pc.T; t++) {
+    const uint base = t * pc.C;
+    const float decay = exp(gg.d[t * pc.nv + h]), b = bb.d[t * pc.nv + h];
+    const float v = qkv.d[base + 2u * pc.nk * 128u + h * 128u + j];
+    float kk[16];
+    float sk = 0.0;
+    for (uint i = 0u; i < 16u; i++) {
+      kk[i] = qkv.d[base + pc.nk * 128u + hk * 128u + r0 + i];
+      S[i] *= decay;
+      sk += S[i] * kk[i];
+    }
+    sk = subgroupClusteredAdd(sk, 8u);
+    const float delta = (v - sk) * b;
+    float oo = 0.0;
+    for (uint i = 0u; i < 16u; i++) {
+      S[i] += kk[i] * delta;
+      oo += S[i] * qkv.d[base + hk * 128u + r0 + i];
+    }
+    oo = subgroupClusteredAdd(oo, 8u);
+    if (tid % 8u == 0u) o.d[t * pc.nv * 128u + h * 128u + j] = oo * qs;
+  }
+  for (uint i = 0u; i < 16u; i++) st.d[sb + i] = S[i];
+}

@@ -1,0 +1,89 @@
+// variants: mv_f32:QT=0 mv_f16:QT=1 mv_bf16:QT=30 mv_q8_0:QT=8 mv_q2_k:QT=10 mv_q3_k:QT=11 mv_q4_k:QT=12 mv_q5_k:QT=13 mv_q6_k:QT=14 mv_iq2_xxs:QT=16 mv_iq2_xs:QT=17 mv_iq2_s:QT=22 mv_iq3_xxs:QT=18 mv_iq3_s:QT=21 mv_iq1_s:QT=19 mv_iq1_m:QT=29 mv_iq4_xs:QT=23
+// y[t][row] (+)= W[row] . x[t]  for T <= 8 tokens (decode / speculative verify).
+// Workgroup = 16 rows: 4 teams of 32 lanes, a team owns 4 rows.  A lane walks the 32-element groups
+// with stride 32 (adjacent lanes read adjacent groups); for T == 1 the lane's activation chunk is
+// loaded once and reused for its 4 rows (activation traffic, not weights, was the limit).
+#version 450
+#include "common.glsl"
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer F32x4 { vec4 d[]; };
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
+shared float red[8][16][33];
+shared float redw[8][128];
+// wide mode (matrices with few rows): the whole workgroup works on one row
+void main_wide() {
+  const uint tid = gl_LocalInvocationID.x, row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  if (row >= pc.N) return;
+  U32 w = U32(pc.w); U32 tab = U32(pc.tab); F32x4 x = F32x4(pc.x); F32 y = F32(pc.y);
+  float s[8] = float[8](0, 0, 0, 0, 0, 0, 0, 0);
+  for (uint gi = tid; gi < pc.K / 32u; gi += 128u) {
+    float v[32];
+    deq32(w, tab, row * pc.rb + (gi / 8u) * BB, gi % 8u, v);
+    for (uint t = 0u; t < pc.T; t++) {
+      float a = 0.0;
+      for (uint j = 0u; j < 8u; j++)
+        a += dot(vec4(v[4u * j], v[4u * j + 1u], v[4u * j + 2u], v[4u * j + 3u]), x.d[(t * pc.ldx + gi * 32u) / 4u + j]);
+      s[t] += a;
+    }
+  }
+  for (uint t = 0u; t < pc.T; t++) redw[t][tid] = s[t];
+  barrier();
+  if (tid < pc.T) {
+    float a = 0.0;
+    for (uint i = 0u; i < 128u; i++) a += redw[tid][i];
+    const uint o = tid * pc.ldy + row;
+    y.d[o] = pc.acc != 0u ? y.d[o] + a : a;
+  }
+}
+float dot32(float v[32], vec4 xv[8]) {
+  float a = 0.0;
+  for (uint j = 0u; j < 8u; j++) a += dot(vec4(v[4u * j], v[4u * j + 1u], v[4u * j + 2u], v[4u * j + 3u]), xv[j]);
+  return a;
+}
+void main() {
+  if (pc.wide != 0u) { main_wide(); return; }
+  const uint tid = gl_LocalInvocationID.x, lane = tid % 32u, team = tid / 32u;
+  const uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  const uint row0 = wg * 16u + team * 4u;
+  U32 w = U32(pc.w); U32 tab = U32(pc.tab); F32x4 x = F32x4(pc.x); F32 y = F32(pc.y);
+  const uint ng = pc.K / 32u;
+  float s[4][8];
+  for (uint r = 0u; r < 4u; r++) for (uint t = 0u; t < 8u; t++) s[r][t] = 0.0;
+  if (pc.T == 1u) {
+    for (uint gi = lane; gi < ng; gi += 32u) {
+      vec4 xv[8];
+      for (uint j = 0u; j < 8u; j++) xv[j] = x.d[gi * 8u + j];
+      for (uint r = 0u; r < 4u; r++) {
+        if (row0 + r >= pc.N) break;
+        float v[32];
+        deq32(w, tab, (row0 + r) * pc.rb + (gi / 8u) * BB, gi % 8u, v);
+        s[r][0] += dot32(v, xv);
+      }
+    }
+  } else {
+    for (uint r = 0u; r < 4u; r++) {
+      if (row0 + r >= pc.N) break;
+      for (uint gi = lane; gi < ng; gi += 32u) {
+        float v[32];
+        deq32(w, tab, (row0 + r) * pc.rb + (gi / 8u) * BB, gi % 8u, v);
+        for (uint t = 0u; t < pc.T; t++) {
+          vec4 xv[8];
+          for (uint j = 0u; j < 8u; j++) xv[j] = x.d[(t * pc.ldx + gi * 32u) / 4u + j];
+          s[r][t] += dot32(v, xv);
+        }
+      }
+    }
+  }
+  for (uint r = 0u; r < 4u; r++)
+    for (uint t = 0u; t < pc.T; t++) red[t][team * 4u + r][lane] = s[r][t];
+  barrier();
+  if (tid < 16u * pc.T) {
+    const uint rr = tid % 16u, t = tid / 16u, row = wg * 16u + rr;
+    float a = 0.0;
+    for (uint i = 0u; i < 32u; i++) a += red[t][rr][i];
+    if (row < pc.N) {
+      const uint o = t * pc.ldy + row;
+      y.d[o] = pc.acc != 0u ? y.d[o] + a : a;
+    }
+  }
+}

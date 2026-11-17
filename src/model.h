@@ -13,40 +13,8 @@
 #include "gguf.h"
 #include "kernels.h"
 #include "cpu_ffn.h"
+#include "imodel.h"
 #include <cuda.h>
-
-struct EngineOptions {
-  std::string model_path;
-  int ctx = 131072;            // max context length (tokens)
-  int kv_type = qk::KV_Q4;     // KV cache format
-  int ubatch = 2048;           // prefill chunk (its workspace is lent to FFN weights while decoding)
-  size_t vram_reserve_mb = 64;   // keep this much VRAM free (all big buffers are allocated up front)
-  int64_t vram_budget_mb = -1;  // override total VRAM the engine may use (-1 = auto)
-  int cpu_threads = -1;        // -1: physical cores
-  bool use_mtp = true;
-  bool elastic_kv = true;      // lend unused KV pool space to FFN weights
-  int ck_slots = 8;
-  std::vector<int> skip_ffn;
-  int cache_keep = 1;          // inactive conversations kept in VRAM (if within cache_blocks)
-  int cache_blocks = 0;        // ... resident in VRAM with at most this many KV blocks (others: host RAM)
-  int cache_host_mb = 6144;    // host RAM for offloaded KV of inactive conversations (LRU beyond)   // lossy: layers whose FFN block is dropped (saves their PCIe/VRAM bytes)
-  int mtp_vocab = 32768;       // MTP draft head vocabulary: first ids + scripts in use + seen tokens (0 = full)            // prompt-cache state checkpoints kept in pinned host memory
-  int draft_max = 7;           // max drafts per verify pass (n-gram drafts; MTP chains are capped separately)
-  double cpu_frac = -1;         // fraction of streamed FFN rows computed on the CPU (<0: auto per layer)
-  double pcie_gbps = -1;        // host->GPU bandwidth assumed by the auto balancer (-1: measured at start-up)
-  double dram_gbps = -1;        // host DRAM bandwidth shared by CPU kernels and DMA (-1: measured)
-  bool cpu_r4 = true;           // allow lossless R4 repacking of the CPU part
-  bool verbose = false;
-};
-
-struct Config {
-  int n_embd, n_layer, n_ff, n_head, n_kv, hd, rope_dims, n_vocab;
-  float rope_base, eps;
-  int conv_k, dk, dv, nk, nv, d_inner, attn_interval;
-  int n_mtp;
-  int conv_dim() const { return 2 * nk * dk + nv * dv; }
-  bool is_attn(int il) const { return il >= n_layer || (il + 1) % attn_interval == 0; }
-};
 
 // A weight matrix [N rows][K] in GGUF quantized form.
 struct Mat {
@@ -96,13 +64,13 @@ struct Layer {
   bool hyb_on = true;                    // decode: CPU computes its row slice (else whole layer streamed)
 };
 
-class Model {
+class Model : public IModel {
  public:
   explicit Model(const EngineOptions& opt);
   ~Model();
 
-  const Config& cfg() const { return cfg_; }
-  const GGUFFile& gguf() const { return *gguf_; }
+  const Config& cfg() const override { return cfg_; }
+  const GGUFFile& gguf() const override { return *gguf_; }
 
   // Run the trunk on `n` tokens at positions pos0..pos0+n-1.  Writes logits for the last
   // `n_logits` tokens into host buffer `logits` ([n_logits][n_vocab]) if non-null.
@@ -113,58 +81,56 @@ class Model {
   // `mtp_prefill`: also feed the (h_{p-1}, x_p) pairs of these tokens through the MTP block so its
   // KV cache covers the prompt.
   void forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax = nullptr,
-               bool snapshot = false, bool mtp_prefill = false);
+               bool snapshot = false, bool mtp_prefill = false) override;
   // Must follow every forward(..., snapshot=true): keep the recurrent effect of the first `n_keep`
   // tokens of that pass (n_keep == n commits everything).  KV entries beyond are overwritten later.
-  void rollback(int n_keep);
+  void rollback(int n_keep) override;
   // MTP draft: pairs (h_row[i], tokens[i]) at MTP positions pos0+i, where h rows are the trunk's final
   // normed hidden states of the previous forward (rows hrow0..hrow0+n-1) or the carried row (hrow0 = -1).
   // Returns the greedy draft token predicted after the last pair.
   // logits_host (optional): receives the MTP logits of the last row (for sampled drafts).
   // head=false: only run the MTP block (fills its KV for these positions), no logits / draft
   int mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf = nullptr, float* logits_host = nullptr,
-                bool head = true);
+                bool head = true) override;
   // Chained draft: pair (MTP output hidden of the previous mtp_* call, token) at MTP position pos.
-  int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr);
-  int draft_max() const { return opt_.draft_max; }
-  void set_carry_row(int row);  // carried hidden := row of the last forward (for prefix continuation)
+  int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr) override;
+  int draft_max() const override { return opt_.draft_max; }
+  void set_carry_row(int row) override;  // carried hidden := row of the last forward (for prefix continuation)
   // ---- paged KV sequences + recurrent-state checkpoints (prompt caching across conversations) ----
-  int seq_create();
-  void seq_select(int id);   // KV positions of the selected sequence are used by forward()
-  bool seq_alive(int id) const { return seqs_.count(id) != 0; }
-  void seq_drop(int id);
+  int seq_create() override;
+  void seq_select(int id) override;   // KV positions of the selected sequence are used by forward()
+  bool seq_alive(int id) const override { return seqs_.count(id) != 0; }
+  void seq_drop(int id) override;
   int seq_current() const { return cur_seq_; }
-  int ck_slots() const { return (int)ck_host_.size(); }
-  void ck_save_live(int slot);   // current GDN/conv state + MTP carry -> host slot
-  void ck_restore(int slot);     // host slot -> current state
+  int ck_slots() const override { return (int)ck_host_.size(); }
+  void ck_save_live(int slot) override;   // current GDN/conv state + MTP carry -> host slot
+  void ck_restore(int slot) override;     // host slot -> current state
   // capture a checkpoint of the state after the first `pos` tokens during the next forward()
-  void set_capture(int pos, int slot) { cap_pos_ = pos; cap_slot_ = slot; }
-  void draft_vocab_add(const int* ids, int n);
+  void set_capture(int pos, int slot) override { cap_pos_ = pos; cap_slot_ = slot; }
+  void draft_vocab_add(const int* ids, int n) override;
   // sampling top-K on the GPU: when K > 0, forward()/mtp_* with a host logits pointer only fill
   // topk rows (forward: row j of the requested logits; MTP: row kMaxB) instead of the full rows
-  void set_topk(int K) { topk_K_ = K; }
-  void sync() { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
+  void set_topk(int K) override { topk_K_ = K; }
+  void sync() override { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
   int top2_[4] = {-1, -1, -1, -1};  // QE_MEASURE_TOP2: top-4 ids of the last MTP head output
-  int topk_K() const { return topk_K_; }
-  const int* topk_idx(int row) const { return topk_i_h_ + (size_t)row * kTopKMax; }
-  const float* topk_val(int row) const { return topk_v_h_ + (size_t)row * kTopKMax; }
+  int topk_K() const override { return topk_K_; }
+  const int* topk_idx(int row) const override { return topk_i_h_ + (size_t)row * kTopKMax; }
+  const float* topk_val(int row) const override { return topk_v_h_ + (size_t)row * kTopKMax; }
   void trim_cache();  // drop old cached sequences beyond the budget and compact the KV pool  // tokens the MTP draft head may propose
   // Elastic KV: reserve KV space for `npos` positions and lend the rest of the KV pool to
   // streamed FFN layers (evicted automatically if the context later grows).
-  void prepare_context(int npos, bool small_prefill = false);
+  void prepare_context(int npos, bool small_prefill = false) override;
   int borrowed_layers() const;
-  struct KvInfo {
-    int blocks_used = 0, blocks_total = 0, blocks_lendable = 0, seqs = 0, seqs_offloaded = 0, cur_positions = 0;
-    int borrowed_kv = 0, borrowed_ws = 0, streamed = 0;
-    double host_mb = 0, block_mb = 0;
-  };
-  KvInfo kv_info() const;
+  KvInfo kv_info() const override;
+  PlanStats plan_stats() const override { return {plan_res_mb_, plan_stream_mb_, plan_cpu_mb_, plan_res_ffn_}; }
+  const char* backend() const override { return "cuda"; }
+  const int* mtp_top4() const override { return top2_; }
   double plan_res_mb_ = 0, plan_stream_mb_ = 0, plan_cpu_mb_ = 0;
   int plan_res_ffn_ = 0;
-  const EngineOptions& options() const { return opt_; }
+  const EngineOptions& options() const override { return opt_; }
   int kv_limit() const;  // carried hidden := row of the last forward (for prefix continuation)
-  bool has_mtp() const { return cfg_.n_mtp > 0 && opt_.use_mtp; }
-  void reset();  // clear recurrent state (KV positions are simply overwritten)
+  bool has_mtp() const override { return cfg_.n_mtp > 0 && opt_.use_mtp; }
+  void reset() override;  // clear recurrent state (KV positions are simply overwritten)
 
   size_t vram_used() const { return vram_used_; }
   double weight_bytes_streamed() const { return stream_total_; }
