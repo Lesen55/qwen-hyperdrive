@@ -98,6 +98,7 @@ void attn_decode(int kvtype, const void* kcache, const void* vcache, const float
                  int q_tstride, float* out, int nh, int nkv, int hd, int pos0, int tokens,
                  float scale, float* work, size_t work_bytes, KVMap bs, cudaStream_t s);
 size_t attn_decode_work_bytes(int max_ctx, int nh, int hd, int tokens);
+size_t attn_decode_work_bytes_auto(int max_ctx, int nh, int nkv, int hd, int tokens);
 
 // Prefill attention (tensor cores, flash-attention style): queries at positions pos0..pos0+T-1
 // (all T tokens of this chunk already stored in the cache), causal.  q f32 [T][nh][q_hstride].

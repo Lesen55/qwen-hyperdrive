@@ -2149,7 +2149,7 @@ void attn_decode(int kvtype, const void* kcache, const void* vcache, const float
                  int qts, float* out, int nh, int nkv, int hd, int pos0, int T, float scale,
                  float* work, size_t work_bytes, KVMap bs, cudaStream_t s) {
   static const int mode = getenv("QE_ATT") ? atoi(getenv("QE_ATT")) : -1;  // 0 simt, 1 mma, -1 auto
-  const bool mma = mode == 1 || (mode == -1 && T >= 2);
+  const bool mma = mode != 0;  // the MMA kernel is as fast or faster at T = 1 too
   if (mma) attn_decode_mma(kvtype, kcache, vcache, q, qhs, qts, out, nh, nkv, hd, pos0, T, scale, work, work_bytes, bs, s);
   else attn_decode_simt(kvtype, kcache, vcache, q, qhs, qts, out, nh, nkv, hd, pos0, T, scale, work, work_bytes, bs, s);
 }
@@ -2835,14 +2835,29 @@ __global__ void __launch_bounds__(128, 1)
   }
 }
 
+static int mma_split(int L, int nkv) {
+  // largest split (multiple of the tile, divides KV_BLOCK) that still gives >= ~2 CTAs per SM
+  int split = 2048;
+  while (split > 256 && (long long)nkv * ((L + split - 1) / split) < 136) split /= 2;
+  return split;
+}
+size_t attn_decode_work_bytes_auto(int max_ctx, int nh, int nkv, int hd, int tokens) {
+  static const int mode = getenv("QE_ATT") ? atoi(getenv("QE_ATT")) : -1;
+  if (mode == 0) return attn_decode_work_bytes(max_ctx, nh, hd, tokens);
+  size_t mx = 0;
+  for (int L = 1; L <= max_ctx + tokens; L = L < 256 ? 256 : L + 256) {  // nsplit*T is not monotone in L
+    const int split = mma_split(L, nkv);
+    mx = std::max(mx, (size_t)((L + split - 1) / split) * nh * tokens * 258 * sizeof(float));
+  }
+  return mx;
+}
+
 void attn_decode_mma(int kvtype, const void* kcache, const void* vcache, const float* q, int qhs, int qts,
                      float* out, int nh, int nkv, int hd, int pos0, int T, float scale, float* work,
                      size_t work_bytes, KVMap bs, cudaStream_t s) {
   QE_ASSERT(hd == FA_D && nh / nkv * T <= 32);
   const int L = pos0 + T;
-  // largest split (multiple of the tile, divides KV_BLOCK) that still gives >= ~2 CTAs per SM
-  int split = 2048;
-  while (split > 256 && (long long)nkv * ((L + split - 1) / split) < 136) split /= 2;
+  const int split = mma_split(L, nkv);
   const int nsplit = (L + split - 1) / split;
   QE_ASSERT((size_t)nsplit * nh * T * 258 * sizeof(float) <= work_bytes);
   const int recb = (int)kv_bytes_per_token_head(kvtype, hd);

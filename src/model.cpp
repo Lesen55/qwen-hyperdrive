@@ -263,7 +263,7 @@ void Model::plan_and_load() {
   ws += w16_elems_ * 2;
   ws += (size_t)T * maxw * 2;                  // c16 (fp16 GEMM output)
   const int attT = 4;  // attn_decode handles T <= 4 (verify passes); larger T uses the prefill FA kernel
-  attn_work_bytes_ = qk::attn_decode_work_bytes(opt_.ctx, c.n_head, c.hd, attT);
+  attn_work_bytes_ = qk::attn_decode_work_bytes_auto(opt_.ctx, c.n_head, c.n_kv, c.hd, attT);
   ws += attn_work_bytes_;
   ws += (size_t)kCpuMaxB * c.n_embd * 4;
   ws += qk::attn_prefill_work_bytes(T, c.n_head, c.hd);
@@ -628,6 +628,28 @@ void Model::plan_and_load() {
       ck_dev_.push_back((uint8_t*)dp);
     }
     QE_LOG("[plan] prompt cache: %zu state checkpoints of %.0f MiB (pinned host)\n", ck_host_.size(), bytes / (double)MiB);
+  }
+  // Arena tail: whatever the plan did not use (slack items, rounding of the evenly spaced resident
+  // pick) permanently holds full copies of the largest streamed FFN layers that fit.
+  if (copy_stream_ && !getenv("QE_NO_TAIL")) {
+    std::vector<int> cand;
+    for (int il = 0; il < c.n_layer; il++)
+      if (layers_[il].ffn_streamed && !layers_[il].borrowed_dev && !layers_[il].ffn_skip) cand.push_back(il);
+    std::sort(cand.begin(), cand.end(), [&](int a, int b) { return layers_[a].stream_bytes_full > layers_[b].stream_bytes_full; });
+    int n = 0;
+    size_t tb = 0;
+    const size_t free0 = arena_bytes_ - vram_used_;
+    for (int il : cand) {
+      Layer& L = layers_[il];
+      const size_t b = (L.stream_bytes_full + 255) / 256 * 256;
+      if (vram_used_ + b > arena_bytes_) continue;
+      L.borrowed_dev = (uint8_t*)dalloc(b);
+      CUDA_CHECK(cudaMemcpy(L.borrowed_dev, L.stream_host, L.stream_bytes_full, cudaMemcpyHostToDevice));
+      n++;
+      tb += b;
+    }
+    if (n) refresh_streamed();
+    QE_LOG("[plan] arena tail %.0f MiB: %d streamed FFN layers made resident (%.0f MiB)\n", free0 / (double)MiB, n, tb / (double)MiB);
   }
   reset();
   size_t fr = 0;
