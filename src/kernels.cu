@@ -885,9 +885,12 @@ __global__ void k_mmv_float(const uint8_t* __restrict__ W, size_t rb, int K, int
 // N/8 blocks for such matrices and leaves most SMs idle.
 template <int WT, int B>
 __global__ void __launch_bounds__(256) k_mmv_float_row(const uint8_t* __restrict__ W, size_t rb, int K,
-                                                       const float* __restrict__ x, float* __restrict__ y, int ldy, int acc) {
-  const int row = blockIdx.x;
-  const uint8_t* wr = W + (size_t)row * rb;
+                                                       const float* __restrict__ x, float* __restrict__ y, int ldy, int acc,
+                                                       const uint8_t* __restrict__ W2 = nullptr, float* y2 = nullptr, int N1 = 0) {
+  int row = blockIdx.x;
+  const uint8_t* Wm = W;
+  if (W2 && row >= N1) { row -= N1; Wm = W2; y = y2; }  // second matrix of a fused pair
+  const uint8_t* wr = Wm + (size_t)row * rb;
   constexpr int E = WT == QT_F32 ? 4 : 8;  // elements per 16-byte load
   float sum[B];
 #pragma unroll
@@ -1879,6 +1882,20 @@ void topk_rows(const float* logits, int V, int rows, int K, float* out_val, int*
   k_topk2<<<rows, 1024, TK_S2 * 8, s>>>(wv, wi, K, out_val, out_idx);
 }
 
+// two float-weight matrices with the same input and K in one launch (GDN alpha / beta)
+void matvec_float_pair(uint32_t type, const void* W1, const void* W2, size_t rb, int K, int N, const float* x, int B,
+                       float* y1, float* y2, int ldy, cudaStream_t s) {
+  QE_ASSERT(type == QT_BF16 && N <= 256 && K % 8 == 0 && rb % 16 == 0);
+  const uint8_t* a = (const uint8_t*)W1;
+  const uint8_t* b = (const uint8_t*)W2;
+  switch (B) {
+#define CASE(n) case n: k_mmv_float_row<QT_BF16, n><<<2 * N, 256, 0, s>>>(a, rb, K, x, y1, ldy, 0, b, y2, N); return;
+    CASE(1) CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+  }
+  QE_FATAL("matvec_float_pair: batch %d", B);
+}
+
 bool mmq_supported(uint32_t type) {
   switch (type) {
     case QT_Q2_K: case QT_Q4_K: case QT_Q6_K: case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S:
@@ -2167,7 +2184,8 @@ __global__ void k_silu_mul(const float* g, const float* u, float* h, int64_t n, 
 void silu_mul(const float* g, const float* u, float* h, int64_t n, cudaStream_t s, __half* h16) {
   k_silu_mul<<<cdiv(n, 256), 256, 0, s>>>(g, u, h, n, h16);
 }
-__global__ void k_gate_sigmoid(float* o, const float* qg, int hd, int nh, int64_t n, __half* o16) {
+__global__ void k_gate_sigmoid(float* o, const float* qg, int hd, int nh, int64_t n, __half* o16, int8_t* xq,
+                               float* xd) {
   const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const int d = i % hd;
@@ -2177,10 +2195,54 @@ __global__ void k_gate_sigmoid(float* o, const float* qg, int hd, int nh, int64_
   const float v = o[i] / (1.f + __expf(-g));
   o[i] = v;
   if (o16) o16[i] = __float2half(v);
+  if (xq) {  // n % 32 == 0 and blocks of 256: every warp is one full 32-group
+    const float amax = warp_max(fabsf(v));
+    const float d = amax / 127.f;
+    xq[i] = (int8_t)__float2int_rn(d > 0.f ? v / d : 0.f);
+    if ((threadIdx.x & 31) == 0) xd[i / 32] = d;
+  }
 }
-void gate_sigmoid(float* o, const float* qg, int hd, int nh, int tokens, cudaStream_t s, __half* o16) {
+void gate_sigmoid(float* o, const float* qg, int hd, int nh, int tokens, cudaStream_t s, __half* o16, int8_t* xq,
+                  float* xd) {
   const int64_t n = (int64_t)tokens * nh * hd;
-  k_gate_sigmoid<<<cdiv(n, 256), 256, 0, s>>>(o, qg, hd, nh, n, o16);
+  k_gate_sigmoid<<<cdiv(n, 256), 256, 0, s>>>(o, qg, hd, nh, n, o16, xq, xd);
+}
+
+// Per-head RMS norm of q and k followed by NeoX RoPE on the first `rot` dims, one block per token:
+// the rotation angles (double precision) are computed once per token instead of once per head.
+__global__ void k_qk_norm_rope(float* q, const float* __restrict__ qw, int qhs, int qts, int nhq, float* k,
+                               const float* __restrict__ kw, int khs, int kts, int nhk, const int* __restrict__ pos,
+                               int hd, int rot, float log2_base, float eps) {
+  __shared__ float cs[64], sn[64];
+  const int t = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, half = rot / 2;
+  if (threadIdx.x < half) {
+    const double freq = exp2(-(double)log2_base * (2.0 * threadIdx.x / rot));
+    double sd, cd;
+    sincos((double)pos[t] * freq, &sd, &cd);
+    cs[threadIdx.x] = (float)cd;
+    sn[threadIdx.x] = (float)sd;
+  }
+  __syncthreads();
+  if (warp >= nhq + nhk) return;
+  float* p = warp < nhq ? q + (size_t)t * qts + (size_t)warp * qhs : k + (size_t)t * kts + (size_t)(warp - nhq) * khs;
+  const float* w = warp < nhq ? qw : kw;
+  float ss = 0.f;
+  for (int i = lane; i < hd; i += 32) ss += p[i] * p[i];
+  ss = warp_sum(ss);
+  const float r = rsqrtf(ss / hd + eps);
+  for (int i = lane; i < hd; i += 32) p[i] = p[i] * r * w[i];
+  __syncwarp();
+  for (int i = lane; i < half; i += 32) {
+    const float a = p[i], b = p[i + half];
+    p[i] = a * cs[i] - b * sn[i];
+    p[i + half] = a * sn[i] + b * cs[i];
+  }
+}
+bool qk_norm_rope(float* q, const float* qw, int qhs, int qts, int nhq, float* k, const float* kw, int khs, int kts,
+                  int nhk, const int* pos, int hd, int tokens, int rot, float base, float eps, cudaStream_t s) {
+  if ((nhq + nhk) * 32 > 1024 || rot > 128) return false;
+  k_qk_norm_rope<<<tokens, (nhq + nhk) * 32, 0, s>>>(q, qw, qhs, qts, nhq, k, kw, khs, kts, nhk, pos, hd, rot, log2f(base), eps);
+  return true;
 }
 
 // =============================================================================================
@@ -3515,7 +3577,7 @@ void gdn_recurrence(const float* qkv, int qts, const float* g, const float* beta
 
 __global__ void k_gdn_gated_norm(float* o, const float* __restrict__ z, int zts,
                                  const float* __restrict__ w, int nv, int dv, int T, float eps,
-                                 __half* o16) {
+                                 __half* o16, int8_t* xq, float* xd) {
   const int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
   if (wid >= T * nv) return;
   const int t = wid / nv, h = wid % nv;
@@ -3529,12 +3591,19 @@ __global__ void k_gdn_gated_norm(float* o, const float* __restrict__ z, int zts,
     const float zv = zz[i];
     const float v = p[i] * r * w[i] * (zv / (1.f + __expf(-zv)));
     p[i] = v;
-    if (o16) o16[(size_t)t * nv * dv + (size_t)h * dv + i] = __float2half(v);
+    const size_t gi = (size_t)t * nv * dv + (size_t)h * dv + i;
+    if (o16) o16[gi] = __float2half(v);
+    if (xq) {  // int8-per-32 quantization for the following matvec (dv % 32 == 0: a warp step = a group)
+      const float amax = warp_max(fabsf(v));
+      const float d = amax / 127.f;
+      xq[gi] = (int8_t)__float2int_rn(d > 0.f ? v / d : 0.f);
+      if (lane == 0) xd[gi / 32] = d;
+    }
   }
 }
 void gdn_gated_norm(float* o, const float* z, int zts, const float* w, int nv, int dv, int T,
-                    float eps, cudaStream_t s, __half* o16) {
-  k_gdn_gated_norm<<<cdiv(T * nv, 8), 256, 0, s>>>(o, z, zts, w, nv, dv, T, eps, o16);
+                    float eps, cudaStream_t s, __half* o16, int8_t* xq, float* xd) {
+  k_gdn_gated_norm<<<cdiv(T * nv, 8), 256, 0, s>>>(o, z, zts, w, nv, dv, T, eps, o16, xq, xd);
 }
 
 // =============================================================================================

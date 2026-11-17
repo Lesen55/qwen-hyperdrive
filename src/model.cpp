@@ -956,10 +956,13 @@ void Model::layer_attn(int il, int T, int pos0) {
   linear(&L, L.wq, xn_, T, qg, qw, false, s);
   linear(&L, L.wk, xn_, T, k, kvw, false, s);
   linear(&L, L.wv, xn_, T, v, kvw, false, s);
-  qk::rmsnorm_heads(qg, L.q_norm, c.hd, c.n_head, 2 * c.hd, T, qw, c.eps, s);
-  qk::rmsnorm_heads(k, L.k_norm, c.hd, c.n_kv, c.hd, T, kvw, c.eps, s);
-  qk::rope_neox(qg, pos_dev_, c.hd, c.n_head, 2 * c.hd, T, qw, c.rope_dims, c.rope_base, s);
-  qk::rope_neox(k, pos_dev_, c.hd, c.n_kv, c.hd, T, kvw, c.rope_dims, c.rope_base, s);
+  if (!fuse_ || !qk::qk_norm_rope(qg, L.q_norm, 2 * c.hd, qw, c.n_head, k, L.k_norm, c.hd, kvw, c.n_kv, pos_dev_, c.hd, T,
+                                  c.rope_dims, c.rope_base, c.eps, s)) {
+    qk::rmsnorm_heads(qg, L.q_norm, c.hd, c.n_head, 2 * c.hd, T, qw, c.eps, s);
+    qk::rmsnorm_heads(k, L.k_norm, c.hd, c.n_kv, c.hd, T, kvw, c.eps, s);
+    qk::rope_neox(qg, pos_dev_, c.hd, c.n_head, 2 * c.hd, T, qw, c.rope_dims, c.rope_base, s);
+    qk::rope_neox(k, pos_dev_, c.hd, c.n_kv, c.hd, T, kvw, c.rope_dims, c.rope_base, s);
+  }
   qk::kv_store(opt_.kv_type, L.kcache, L.vcache, k, v, pos_dev_, c.n_kv, c.hd, T, kvw, kvw, kvmap(), s);
   float* o = t2_;
   const float scale = 1.f / std::sqrt((float)c.hd);
@@ -981,8 +984,13 @@ void Model::layer_attn(int il, int T, int pos0) {
     qk::attn_prefill(opt_.kv_type, L.kcache, L.vcache, qg, 2 * c.hd, qw, o, c.n_head, c.n_kv, c.hd, pos0, T,
                      scale, fa_work_, kvmap(), s);
   }
-  qk::gate_sigmoid(o, qg, c.hd, c.n_head, T, s);
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  if (fuse_ && T <= qk::kMaxB) {
+    qk::gate_sigmoid(o, qg, c.hd, c.n_head, T, s, nullptr, xq_, xd_);
+    prepared_ = o; prepared_K_ = c.n_head * c.hd; prepared_T_ = T; prep16_ = nullptr; gqp_ = nullptr;
+  } else {
+    qk::gate_sigmoid(o, qg, c.hd, c.n_head, T, s);
+    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  }
   linear(&L, L.wo, o, T, t4_, c.n_embd, false, s);
   residual(t4_, T);
 }
@@ -1020,8 +1028,14 @@ void Model::layer_gdn(int il, int T) {
   float* ab = t4_;  // alpha [T][nv] then beta [T][nv] (t4 is free until the output projection)
   linear(&L, L.wqkv, xn_, T, qkv_raw, C, false, s);
   linear(&L, L.wgate, xn_, T, z, c.d_inner, false, s);
-  linear(&L, L.walpha, xn_, T, ab, c.nv, false, s);
-  linear(&L, L.wbeta, xn_, T, ab + (size_t)T * c.nv, c.nv, false, s);
+  if (fuse_ && T <= qk::kMaxB && L.walpha.dev && L.wbeta.dev && L.walpha.type == QT_BF16 && L.wbeta.type == QT_BF16 &&
+      L.walpha.row_bytes == L.wbeta.row_bytes && c.nv <= 256 && L.walpha.row_bytes % 16 == 0) {
+    qk::matvec_float_pair(QT_BF16, L.walpha.dev, L.wbeta.dev, L.walpha.row_bytes, c.n_embd, c.nv, xn_, T, ab,
+                          ab + (size_t)T * c.nv, c.nv, s);
+  } else {
+    linear(&L, L.walpha, xn_, T, ab, c.nv, false, s);
+    linear(&L, L.wbeta, xn_, T, ab + (size_t)T * c.nv, c.nv, false, s);
+  }
   qe_debug_dump("linear_attn_qkv_mixed", il, qkv_raw, T, C, s);
   qe_debug_dump("z", il, z, T, c.d_inner, s);
   float* qkv = t3_;
@@ -1048,10 +1062,13 @@ void Model::layer_gdn(int il, int T) {
                        -1, ck_state);
   }
   qe_debug_dump("attn_output", il, o, T, c.d_inner, s);
-  qk::gdn_gated_norm(o, z, c.d_inner, L.ssm_norm, c.nv, c.dv, T, c.eps, s);
+  const bool gq8 = fuse_ && T <= qk::kMaxB && c.dv % 32 == 0;
+  qk::gdn_gated_norm(o, z, c.d_inner, L.ssm_norm, c.nv, c.dv, T, c.eps, s, nullptr, gq8 ? xq_ : nullptr, gq8 ? xd_ : nullptr);
   }
   qe_debug_dump("final_output", il, o, T, c.d_inner, s);
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  prep16_ = nullptr; gqp_ = nullptr;
+  if (fuse_ && T <= qk::kMaxB && c.dv % 32 == 0) { prepared_ = o; prepared_K_ = c.d_inner; prepared_T_ = T; }  // quantized by gated_norm
+  else prepared_ = nullptr;
   linear(&L, L.wssm_out, o, T, t4_, c.n_embd, false, s);
   qe_debug_dump("linear_attn_out", il, t4_, T, c.n_embd, s);
   residual(t4_, T);
@@ -1234,6 +1251,52 @@ void Model::mtp_block(const float* hrows, const int* tokens, int T, int pos0) {
 // first mtp_vocab ids, the special-token tail and every token seen in the conversation (gathered rows
 // of the output head: ~1/8 of the bytes).  Drafts outside the subset are simply never proposed;
 // verification still uses the full head, so this only affects the acceptance rate.
+// Script class of a vocabulary entry (GPT-2 byte-level token string): 1 kana, 2 CJK, 3 hangul,
+// 4 cyrillic, 5 arabic, 6 thai, 0 other.  Used to seed the draft vocabulary per script in use.
+static int token_script(const std::string& tok) {
+  static int inv[324];
+  static bool init = false;
+  if (!init) {
+    for (int& v : inv) v = -1;
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+      const bool printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+      inv[printable ? b : 256 + n++] = b;
+    }
+    init = true;
+  }
+  std::string bytes;
+  for (size_t i = 0; i < tok.size();) {  // UTF-8 decode of the mapped characters
+    const unsigned char c0 = tok[i];
+    int cp, len;
+    if (c0 < 0x80) { cp = c0; len = 1; }
+    else if ((c0 >> 5) == 6 && i + 1 < tok.size()) { cp = ((c0 & 31) << 6) | (tok[i + 1] & 63); len = 2; }
+    else return 0;
+    if (cp >= 324 || inv[cp] < 0) return 0;
+    bytes += (char)inv[cp];
+    i += len;
+  }
+  for (size_t i = 0; i < bytes.size();) {
+    const unsigned char c0 = bytes[i];
+    int cp, len;
+    if (c0 < 0x80) { cp = c0; len = 1; }
+    else if ((c0 >> 5) == 6) { cp = c0 & 31; len = 2; }
+    else if ((c0 >> 4) == 14) { cp = c0 & 15; len = 3; }
+    else if ((c0 >> 3) == 30) { cp = c0 & 7; len = 4; }
+    else return 0;
+    if (i + len > bytes.size()) return 0;  // partial character
+    for (int k = 1; k < len; k++) cp = (cp << 6) | (bytes[i + k] & 63);
+    i += len;
+    if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0xFF66 && cp <= 0xFF9F)) return 1;
+    if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0xF900 && cp <= 0xFAFF)) return 2;
+    if (cp >= 0xAC00 && cp <= 0xD7AF) return 3;
+    if (cp >= 0x0400 && cp <= 0x04FF) return 4;
+    if (cp >= 0x0600 && cp <= 0x06FF) return 5;
+    if (cp >= 0x0E00 && cp <= 0x0E7F) return 6;
+  }
+  return 0;
+}
+
 void Model::draft_vocab_add(const int* ids, int n) {
   const Config& c = cfg_;
   if (opt_.mtp_vocab <= 0) return;
@@ -1242,14 +1305,30 @@ void Model::draft_vocab_add(const int* ids, int n) {
     const int head = std::min(opt_.mtp_vocab, c.n_vocab);
     for (int i = 0; i < head; i++) { dv_has_[i] = 1; dv_host_.push_back(i); }
     for (int i = std::max(head, c.n_vocab - 320); i < c.n_vocab; i++) { dv_has_[i] = 1; dv_host_.push_back(i); }
+    dv_cls_.assign(c.n_vocab, 0);
+    if (const GGUFValue* tk = gguf_->get("tokenizer.ggml.tokens"))
+      for (int i = 0; i < c.n_vocab && i < (int)tk->arr.size(); i++) dv_cls_[i] = (uint8_t)token_script(tk->arr[i].as_str());
     dv_dirty_ = true;
   }
-  for (int i = 0; i < n; i++) {
-    const int t = ids[i];
-    if (t < 0 || t >= c.n_vocab || dv_has_[t] || (int)dv_host_.size() >= kDraftVocabCap) continue;
+  auto add = [&](int t) {
+    if (dv_has_[t] || (int)dv_host_.size() >= kDraftVocabCap) return;
     dv_has_[t] = 1;
     dv_host_.push_back(t);
     dv_dirty_ = true;
+  };
+  for (int i = 0; i < n; i++) {
+    const int t = ids[i];
+    if (t < 0 || t >= c.n_vocab) continue;
+    const int cl = dv_cls_[t];
+    if (cl && !(dv_cls_on_ & (1u << cl))) {  // a script appears: every token of it becomes draftable
+      dv_cls_on_ |= 1u << cl;
+      if (cl == 2) dv_cls_on_ |= 1u << 1;  // CJK text: kana too (Japanese)
+      if (cl == 1) dv_cls_on_ |= 1u << 2;
+      for (int j = 0; j < c.n_vocab; j++)
+        if (dv_cls_[j] && (dv_cls_on_ & (1u << dv_cls_[j]))) add(j);
+      QE_DBG("[mtp] draft vocabulary: script %d enabled, %zu tokens\n", cl, dv_host_.size());
+    }
+    add(t);
   }
 }
 

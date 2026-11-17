@@ -74,8 +74,12 @@ void iota_i32(int* dst, int p0, int n, cudaStream_t s);
 void silu_mul(const float* g, const float* u, float* h, int64_t n, cudaStream_t s,
               __half* h16 = nullptr);
 // attn out gating: o[t][h*hd+i] *= sigmoid(qg[t][h*2hd + hd + i])
+bool qk_norm_rope(float* q, const float* qw, int qhs, int qts, int nhq, float* k, const float* kw, int khs, int kts,
+                  int nhk, const int* pos, int hd, int tokens, int rot, float base, float eps, cudaStream_t s);
+void matvec_float_pair(uint32_t type, const void* W1, const void* W2, size_t rb, int K, int N, const float* x, int B,
+                       float* y1, float* y2, int ldy, cudaStream_t s);
 void gate_sigmoid(float* o, const float* qg, int hd, int nh, int tokens, cudaStream_t s,
-                  __half* o16 = nullptr);
+                  __half* o16 = nullptr, int8_t* xq = nullptr, float* xd = nullptr);
 
 // ---- KV cache (full attention layers) -------------------------------------------------------
 enum KVType : int { KV_F16 = 0, KV_Q8 = 1, KV_Q4 = 2, KV_Q3 = 3 };
@@ -133,7 +137,8 @@ void gdn_recurrence(const float* qkv, int qkv_tstride, const float* g, const flo
                     cudaStream_t s, int snap_t = -1, float* snap = nullptr);
 // out[t][h*dv+i] = rmsnorm(out_h) * w[i] * silu(z[t][h*dv+i])
 void gdn_gated_norm(float* o, const float* z, int z_tstride, const float* w, int nv, int dv,
-                    int T, float eps, cudaStream_t s, __half* o16 = nullptr);
+                    int T, float eps, cudaStream_t s, __half* o16 = nullptr, int8_t* xq = nullptr,
+                    float* xd = nullptr);
 
 // ---- sampling ------------------------------------------------------------------------------------
 // argmax over rows: idx[r] = argmax(logits[r*n ...])

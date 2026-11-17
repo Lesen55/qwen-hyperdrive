@@ -30,7 +30,7 @@ struct EngineOptions {
   int cache_keep = 1;          // inactive conversations kept in VRAM (if within cache_blocks)
   int cache_blocks = 0;        // ... resident in VRAM with at most this many KV blocks (others: host RAM)
   int cache_host_mb = 6144;    // host RAM for offloaded KV of inactive conversations (LRU beyond)   // lossy: layers whose FFN block is dropped (saves their PCIe/VRAM bytes)
-  int mtp_vocab = 0;           // MTP draft head vocabulary subset (first ids + special tail), 0 = full            // prompt-cache state checkpoints kept in pinned host memory
+  int mtp_vocab = 32768;       // MTP draft head vocabulary: first ids + scripts in use + seen tokens (0 = full)            // prompt-cache state checkpoints kept in pinned host memory
   int draft_max = 7;           // max drafts per verify pass (n-gram drafts; MTP chains are capped separately)
   double cpu_frac = -1;         // fraction of streamed FFN rows computed on the CPU (<0: auto per layer)
   double pcie_gbps = 38.0;      // effective host->GPU bandwidth assumed by the auto balancer
@@ -251,7 +251,8 @@ class Model {
   void topk_to_host(const float* dev_logits, int V, int rows, int host_row0);
   static constexpr int kDraftVocabCap = 131072;
   std::vector<int> dv_host_;
-  std::vector<uint8_t> dv_has_;
+  std::vector<uint8_t> dv_has_, dv_cls_;
+  uint32_t dv_cls_on_ = 0;
   std::vector<float> dv_tmp_;
   int* dv_dev_ = nullptr;
   bool dv_dirty_ = false;

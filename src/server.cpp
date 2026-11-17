@@ -695,6 +695,7 @@ int main(int argc, char** argv) {
     else if (a == "-v" || a == "--verbose") srv.opt.verbose = true;
     else if (a == "--spec-relax") srv.spec_relax = std::stof(next());
     else if (a == "--no-ngram") srv.ngram = false;
+    else if (a == "--mtp-vocab") srv.opt.mtp_vocab = std::stoi(next());
     else if (a == "--draft") srv.mtp_max = std::stoi(next());
     else if (a == "--cache-keep") srv.opt.cache_keep = std::stoi(next());
     else if (a == "--cache-blocks") srv.opt.cache_blocks = std::stoi(next());
