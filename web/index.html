@@ -372,6 +372,7 @@ async function streamTurn(c, am, withTools, signal) {
       thinkDiv.querySelector("div").textContent = am.reasoning;
       thinkDiv.querySelector("summary").textContent = am.content ? `思考 (${am.reasoning.length} 文字)` : "思考中…";
       if (am.content && thinkDiv.open) thinkDiv.open = false;
+      if (!am.content) body.innerHTML = `<div class="status">思考中… ${am.reasoning.length} 文字</div>`;
     }
     if (am.content) body.innerHTML = cite(md(am.content), am.sources);
     const near = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
@@ -406,9 +407,14 @@ async function streamTurn(c, am, withTools, signal) {
         }
         if (j.timings) timings = j.timings;
         if (ch && ch.finish_reason) finish = ch.finish_reason;
-        if (!pending) { pending = true; requestAnimationFrame(paint); }
+        if (!pending) {  // rAF can be throttled or paused (background tab): a timer backs it up
+          pending = true;
+          requestAnimationFrame(paint);
+          setTimeout(() => { if (pending) paint(); }, 120);
+        }
       }
     }
+    if (pending) paint();
   } finally {
     clearTimeout(waitTimer);
   }

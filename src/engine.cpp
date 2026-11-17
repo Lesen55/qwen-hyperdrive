@@ -399,7 +399,9 @@ void Generator::step(std::vector<int>& out) {
       const int x = drafts_[a];
       const float px = prob_of(p, x), qx = prob_of(dq_[a], x);
       // spec_relax_ > 1 accepts drafts more leniently (min(1, lambda*p/q)): faster, slightly biased
-      if (qx > 0 && sampler_.uniform() * qx < spec_relax_ * px) {
+      // n-gram drafts (copies of earlier text) are verified exactly: relaxing them would feed loops
+      const double lam = last_ng_ ? 1.0 : spec_relax_;
+      if (qx > 0 && sampler_.uniform() * qx < lam * px) {
         history_.push_back(x);
         out.push_back(x);
         a++;

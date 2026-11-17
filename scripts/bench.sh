@@ -7,7 +7,7 @@ BIN=${BIN:-./build/qwen35-engine}
 MODEL=${MODEL:-models.gguf}
 export LD_LIBRARY_PATH=/run/opengl-driver/lib
 OUT=bench-results/BENCH.md
-FAST="--kv q3 --spec-relax 4 --skip-ffn 29,10"
+FAST="--kv q3 --spec-relax 2 --skip-ffn 29,10"
 EXACT=""
 run() { $BIN gen -m "$MODEL" -c 131072 "$@" 2>&1; }
 dec() { grep -o 'gen [0-9]* tok in [0-9.]* s ([0-9.]* tok/s)' | grep -o '([0-9.]*' | tr -d '('; }

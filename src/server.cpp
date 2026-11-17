@@ -474,7 +474,20 @@ struct Server {
         }
       }
       if (stop || (int)out.size() >= max_tokens || !alive) break;
-      if (think_budget > 0 && !forced && split.in_think && (int)out.size() >= think_budget) {
+      // a reasoning loop (the same passage repeated >= 4 times at the end) is closed like the budget
+      bool looping = false;
+      if (chat && thinking && !forced && split.in_think && (out.size() & 7) == 0 && reasoning.size() >= 800) {
+        const size_t L = reasoning.size();
+        for (size_t per = 12; per <= 400 && !looping && 4 * per <= L; per++) {
+          if (4 * per < 200) continue;
+          bool rep = true;
+          for (size_t k = 1; k < 4 && rep; k++)
+            rep = reasoning.compare(L - per, per, reasoning, L - (k + 1) * per, per) == 0;
+          looping = rep;
+        }
+      }
+      if (!forced && split.in_think && ((think_budget > 0 && (int)out.size() >= think_budget) || looping)) {
+        if (looping) QE_LOG("[server] %s: reasoning loop detected, closing the reasoning\n", id.c_str());
         // close the reasoning: feed the closing text as a prompt continuation (state is reused)
         forced = true;
         const std::vector<int> fx =
@@ -486,7 +499,7 @@ struct Server {
         cont.insert(cont.end(), out.begin(), out.end());
         cont.insert(cont.end(), fx.begin(), fx.end());
         out.insert(out.end(), fx.begin(), fx.end());
-        QE_LOG("[server] %s: thinking budget %d reached, closing the reasoning\n", id.c_str(), think_budget);
+        if (!looping) QE_LOG("[server] %s: thinking budget %d reached, closing the reasoning\n", id.c_str(), think_budget);
         out.push_back(gen->start(cont));
         pre.t_decode += gen->stats().t_prefill;  // the forced tokens count as decode time
         continue;
