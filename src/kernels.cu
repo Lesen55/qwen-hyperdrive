@@ -616,6 +616,12 @@ __global__ void __launch_bounds__(256) k_mmv_float_row(const uint8_t* __restrict
   }
 }
 
+// 4 rows per warp at B >= 3: the activation loads (B x 32 bytes per 32 weights, from L1) dominate
+// the per-weight work, so sharing them across more rows wins; IQ4_XS decodes cheaply and prefers R=2
+static bool mmv_r4() {
+  static bool r = !getenv("QE_MMV_R4") || atoi(getenv("QE_MMV_R4")) != 0;
+  return r;
+}
 static int mmv_mode() {
   static int m = getenv("QE_MMV") ? atoi(getenv("QE_MMV")) : 0;  // 0 = direct (faster on sm_86)
   return m;
@@ -634,6 +640,13 @@ static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* x
     if (B == 2 && !grid_t) {
       k_mmv_x<T, 2, 1><<<cdiv(N, MMV_WARPS), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
       return;
+    }
+    if (mmv_r4() && B >= 3 && T != QT_IQ4_XS) {
+      switch (B) {
+#define CASE(n) case n: k_mmv_x<T, n, 4><<<cdiv(N, MMV_WARPS * 4), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return;
+        CASE(3) CASE(4)
+#undef CASE
+      }
     }
     switch (B) {
 #define CASE(n) case n: k_mmv_x<T, n, 2><<<cdiv(N, MMV_WARPS * 2), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return;
@@ -654,6 +667,11 @@ static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* x
   if (B == 1 || (B == 2 && !grid_type)) {
     if (B == 1) k_mmv<T, 1, 1><<<cdiv(N, MMV_WARPS), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
     else k_mmv<T, 2, 1><<<cdiv(N, MMV_WARPS), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
+    return;
+  }
+  if (mmv_r4() && B >= 3 && B <= 4 && T != QT_IQ4_XS) {
+    if (B == 3) k_mmv<T, 3, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
+    else k_mmv<T, 4, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
     return;
   }
   const dim3 grid(cdiv(N, MMV_WARPS * 2));
