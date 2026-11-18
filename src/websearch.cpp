@@ -1,5 +1,7 @@
 #include "websearch.h"
 
+#include "common.h"
+
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -263,6 +265,137 @@ std::string between_div(const std::string& seg, const char* cls) {
   return collapse_ws(decode_entities(strip_tags(seg.substr(s + 1, e - s - 1))));
 }
 
+// base64url / base64 decode (Bing wraps result URLs as u=a1<base64url>)
+std::string b64_decode(const std::string& in) {
+  std::string out;
+  int val = 0, bits = -8;
+  for (unsigned char ch : in) {
+    int v;
+    if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
+    else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
+    else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
+    else if (ch == '+' || ch == '-') v = 62;
+    else if (ch == '/' || ch == '_') v = 63;
+    else break;
+    val = (val << 6) | v;
+    bits += 6;
+    if (bits >= 0) {
+      out += (char)((val >> bits) & 0xff);
+      bits -= 8;
+    }
+  }
+  return out;
+}
+
+std::string inner_text(const std::string& seg, size_t from, const char* close) {
+  const size_t s = seg.find('>', from);
+  if (s == std::string::npos) return "";
+  const size_t e = seg.find(close, s);
+  if (e == std::string::npos) return "";
+  return collapse_ws(decode_entities(strip_tags(seg.substr(s + 1, e - s - 1))));
+}
+
+// Bing HTML results: <li class="b_algo"> ... <h2><a href="https://www.bing.com/ck/a?...&u=a1<b64>">title</a></h2>
+// ... <p class="b_lineclamp...">snippet</p>
+std::vector<WebResult> parse_bing(const std::string& page, int n_results) {
+  std::vector<WebResult> res;
+  const std::string key = "class=\"b_algo\"";
+  size_t p = page.find(key);
+  while (p != std::string::npos && (int)res.size() < n_results) {
+    const size_t q = page.find(key, p + key.size());
+    const std::string seg = page.substr(p, (q == std::string::npos ? page.size() : q) - p);
+    p = q;
+    const size_t h2 = seg.find("<h2");
+    if (h2 == std::string::npos) continue;
+    const size_t a = seg.find("href=\"", h2);
+    if (a == std::string::npos) continue;
+    WebResult r;
+    std::string href = decode_entities(seg.substr(a + 6, seg.find('"', a + 6) - a - 6));
+    if (href.find("bing.com/ck/a") != std::string::npos) {
+      const size_t u = href.find("&u=");
+      if (u == std::string::npos) continue;
+      std::string enc = href.substr(u + 3, href.find('&', u + 3) - u - 3);
+      if (enc.rfind("a1", 0) == 0) enc = enc.substr(2);
+      href = b64_decode(enc);
+    }
+    r.url = href;
+    r.title = inner_text(seg, a, "</a>");
+    const size_t sn = seg.find("class=\"b_lineclamp");
+    if (sn != std::string::npos) r.snippet = inner_text(seg, sn, "</p>");
+    else {
+      const size_t cp = seg.find("class=\"b_caption");
+      const size_t pp = cp == std::string::npos ? cp : seg.find("<p", cp);
+      if (pp != std::string::npos) r.snippet = inner_text(seg, pp, "</p>");
+    }
+    if (r.title.empty() || !host_allowed(r.url)) continue;
+    res.push_back(std::move(r));
+  }
+  return res;
+}
+
+// Yahoo! JAPAN results: <div class="sw-Card__title"><a href="URL" ...><h3 ...>title</h3> ...
+// <div class="sw-Card__summary">snippet</div>
+std::vector<WebResult> parse_yahoo_jp(const std::string& page, int n_results) {
+  std::vector<WebResult> res;
+  const std::string key = "class=\"sw-Card__title\"";
+  size_t p = page.find(key);
+  while (p != std::string::npos && (int)res.size() < n_results) {
+    const size_t q = page.find(key, p + key.size());
+    const std::string seg = page.substr(p, (q == std::string::npos ? page.size() : q) - p);
+    p = q;
+    const size_t a = seg.find("href=\"");
+    if (a == std::string::npos) continue;
+    WebResult r;
+    r.url = decode_entities(seg.substr(a + 6, seg.find('"', a + 6) - a - 6));
+    const size_t t = seg.find("sw-Card__titleMain");
+    if (t != std::string::npos) r.title = inner_text(seg, t, "</h3>");
+    const size_t sm = seg.find("class=\"sw-Card__summary");
+    if (sm != std::string::npos) r.snippet = inner_text(seg, sm, "</div>");
+    if (r.title.empty() || !host_allowed(r.url) || r.url.find(".yahoo.co.jp/") != std::string::npos) continue;
+    bool dup = false;
+    for (auto& o : res) dup |= o.url == r.url;
+    if (!dup) res.push_back(std::move(r));
+  }
+  return res;
+}
+
+// does a result mention the query?  Every whitespace-separated query term (lower-cased) is looked up in
+// title + snippet + URL; a term without spaces in a CJK script also matches by any of its 2-character
+// pieces (Japanese queries are rarely split into words).  Relevant when at least half the terms match.
+std::vector<std::string> utf8_chars(const std::string& s) {
+  std::vector<std::string> v;
+  for (size_t i = 0; i < s.size();) {
+    const unsigned char c = (unsigned char)s[i];
+    const size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+    v.push_back(s.substr(i, n));
+    i += n;
+  }
+  return v;
+}
+bool relevant(const std::string& query, const WebResult& r) {
+  const std::string hay = lower(r.title + " " + r.snippet + " " + url_decode(r.url));
+  std::vector<std::string> terms;
+  std::string cur;
+  for (char ch : lower(query) + " ") {
+    if (ch == ' ' || ch == '\t' || ch == '"') {
+      if (!cur.empty()) terms.push_back(cur);
+      cur.clear();
+    } else {
+      cur += ch;
+    }
+  }
+  if (terms.empty()) return true;
+  int hit = 0;
+  for (const std::string& t : terms) {
+    bool ok = hay.find(t) != std::string::npos;
+    const std::vector<std::string> cs = utf8_chars(t);
+    for (size_t i = 0; !ok && cs.size() >= 2 && i + 1 < cs.size(); i++)
+      if (cs[i].size() > 1 && cs[i + 1].size() > 1) ok = hay.find(cs[i] + cs[i + 1]) != std::string::npos;
+    hit += ok;
+  }
+  return 2 * hit >= (int)terms.size();
+}
+
 // Brave Search HTML results (fallback when DuckDuckGo answers with a bot challenge)
 std::vector<WebResult> parse_brave(const std::string& page, int n_results) {
   std::vector<WebResult> res;
@@ -287,8 +420,32 @@ std::vector<WebResult> parse_brave(const std::string& page, int n_results) {
 }  // namespace
 
 std::vector<WebResult> web_search(const std::string& query, int n_results, int n_fetch, size_t max_chars) {
-  std::vector<WebResult> res = parse_ddg(curl_get("https://html.duckduckgo.com/html/?q=" + url_encode(query), 2 << 20, 10), n_results);
-  if (res.empty()) res = parse_brave(curl_get("https://search.brave.com/search?q=" + url_encode(query), 3 << 20, 10), n_results);
+  // engines in order until one returns relevant results.  Scrapers get bot challenges now and then
+  // (DuckDuckGo HTTP 202 "anomaly", Brave HTTP 429 captcha), and Bing may answer them with plausible
+  // but unrelated pages, so every engine's results go through relevant() first.
+  const std::string q = url_encode(query);
+  std::vector<WebResult> res;
+  const struct { const char* name; std::string url; std::vector<WebResult> (*parse)(const std::string&, int); size_t cap; } engines[] = {
+      {"Yahoo! JAPAN", "https://search.yahoo.co.jp/search?p=" + q, parse_yahoo_jp, 3u << 20},
+      {"DuckDuckGo", "https://html.duckduckgo.com/html/?q=" + q, parse_ddg, 2u << 20},
+      {"Brave", "https://search.brave.com/search?q=" + q, parse_brave, 3u << 20},
+      {"Bing", "https://www.bing.com/search?q=" + q + "&setlang=ja", parse_bing, 3u << 20},
+  };
+  for (const auto& e : engines) {
+    std::vector<WebResult> got = e.parse(curl_get(e.url, e.cap, 10), n_results + 4);
+    const size_t n_all = got.size();
+    got.erase(std::remove_if(got.begin(), got.end(), [&](const WebResult& r) { return !relevant(query, r); }), got.end());
+    if (n_all && got.size() * 3 < n_all) {  // mostly unrelated: treat the engine as failed
+      QE_LOG("[search] %s: %zu of %zu results unrelated to \"%s\", trying the next engine\n", e.name, n_all - got.size(), n_all,
+             query.c_str());
+      continue;
+    }
+    if (got.empty()) continue;
+    if ((int)got.size() > n_results) got.resize(n_results);
+    res = std::move(got);
+    break;
+  }
+  if (res.empty()) QE_LOG("[search] no results from Bing / DuckDuckGo / Yahoo! JAPAN / Brave for \"%s\"\n", query.c_str());
   // fetch the top pages in parallel
   std::vector<std::thread> th;
   for (int i = 0; i < (int)res.size() && i < n_fetch; i++)

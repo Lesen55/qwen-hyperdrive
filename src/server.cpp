@@ -437,6 +437,9 @@ struct Server {
     ThinkSplitter split(chat && thinking);
     ToolCallFilter tfilter;
     const bool use_tools = chat && tools.is_array();
+    // a tool call written although no tools were offered (e.g. the client's last round, when the
+    // history still holds earlier calls) must not leak into the answer as raw <tool_call> markup
+    const bool filter_tools = chat;
     const char* finish = "length";
     bool alive = true;
     ReqStat rsn;
@@ -470,7 +473,7 @@ struct Server {
       text_all += text;
       if (chat) split.feed(text, piece_r, piece_c, final);
       else piece_c = text;
-      if (use_tools) piece_c = tfilter.feed(piece_c, final);
+      if (filter_tools) piece_c = tfilter.feed(piece_c, final);
       reasoning += piece_r;
       content += piece_c;
       if (stream && alive && (!piece_r.empty() || !piece_c.empty())) alive = chunk(piece_r, piece_c, nullptr);
@@ -589,6 +592,13 @@ struct Server {
         live.sum_dec_s += rsn.decode_s;
         if (rsn.decode_tps > live.best_decode.decode_tps) live.best_decode = rsn;
       }
+    }
+    if (!use_tools && tfilter.in_call && content.find_first_not_of(" \t\r\n") == std::string::npos) {
+      // the model wanted to call a tool in a round without tools: say so instead of an empty answer
+      const std::string note = "（検索の回数上限に達したため、ここで回答を終えます。続けて質問すると、これまでの結果を踏まえて答えます）";
+      content += note;
+      if (stream && alive) alive = chunk("", note, nullptr);
+      QE_LOG("[server] %s: tool call without tools offered: dropped\n", id.c_str());
     }
     Json tool_calls;
     if (use_tools && tfilter.in_call) {

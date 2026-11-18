@@ -328,7 +328,7 @@ const WEB_TOOL = {
   type: "function",
   function: {
     name: "web_search",
-    description: "Search the web (DuckDuckGo/Brave) and return the top results with page text. Use it only when the question needs current, external or verifiable facts that you do not reliably know; otherwise answer directly.",
+    description: "Search the web (Yahoo! JAPAN / DuckDuckGo / Brave / Bing) and return the top results with page text. Use it only when the question needs current, external or verifiable facts that you do not reliably know; otherwise answer directly.",
     parameters: { type: "object", properties: { query: { type: "string", description: "search query (keywords)" } }, required: ["query"] },
   },
 };
@@ -358,7 +358,12 @@ async function streamTurn(c, am, withTools, signal) {
     stream: true, temperature: settings.temp, max_tokens: settings.maxTok,
     chat_template_kwargs: { enable_thinking: settings.think },
   };
-  if (withTools) req.tools = [WEB_TOOL];
+  if (withTools) {
+    // today's date in the tool description: queries otherwise carry the model's training-time year
+    const t = JSON.parse(JSON.stringify(WEB_TOOL));
+    t.function.description += ` Today is ${new Date().toISOString().slice(0, 10)}; use this date (not your training cutoff) for words like today / latest / this year.`;
+    req.tools = [t];
+  }
   const paint = () => {
     pending = false;
     if (am.reasoning) {
@@ -446,7 +451,7 @@ async function runTool(tc, turnSources, signal, statusEl) {
     tm.content = res.length
       ? `検索日 ${today}、検索語「${tm.query}」の結果:\n\n` + res.map((x, i) => `[${base + i + 1}] ${x.title}\nURL: ${x.url}\n抜粋: ${x.snippet}` + (x.text ? `\n本文: ${x.text}` : "")).join("\n\n") +
         `\n\n回答で根拠にした結果は [番号] で示してください。`
-      : `検索語「${tm.query}」の結果はありませんでした。`;
+      : `検索語「${tm.query}」の検索結果は 0 件でした（検索サービスが応答しなかった可能性があります）。同じ検索は繰り返さず、手持ちの知識で回答し、最新情報を確認できなかったことを一言添えてください。`;
   } catch (e) {
     if (e.name === "AbortError") throw e;
     tm.content = `検索に失敗しました: ${e.message}`;
