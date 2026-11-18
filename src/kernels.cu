@@ -6,6 +6,9 @@
 
 #include "common.h"
 #include "kernels.h"
+
+#include <map>
+#include <tuple>
 #include "quant.h"
 
 namespace qk {
@@ -25,6 +28,10 @@ static inline int cdiv(int64_t a, int64_t b) { return (int)((a + b - 1) / b); }
 static __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a), "l"(gmem));
+}
+static __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(a), "l"(gmem));
 }
 static __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
@@ -919,6 +926,74 @@ __global__ void __launch_bounds__(MMV_WARPS * 32)
   }
 }
 
+// Pipelined small-batch matvec: each warp owns R rows; the raw weight bytes of the next two 32-sub-
+// block chunks of its rows are in flight (cp.async, 3 stages in shared memory) while the current
+// chunk is decoded and dotted, so the weight stream overlaps the per-token dot work (which grows with
+// B and otherwise serializes behind the loads).
+template <int T, int B, int R>
+__global__ void __launch_bounds__(MMV_WARPS * 32)
+    k_mmv_p(const uint8_t* __restrict__ W, size_t rb, int K, int N, const int8_t* __restrict__ xq,
+            const float* __restrict__ xd, float* __restrict__ y, int ldy, int acc) {
+  using D = QDec<T>;
+  constexpr int CH = 4 * D::BB, CHP = (CH + 15) & ~15, S = 3;
+  extern __shared__ __align__(16) unsigned char pm_smem[];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint8_t* buf = pm_smem + (size_t)warp * S * R * CHP;
+  const int row0 = (blockIdx.x * MMV_WARPS + warp) * R;
+  if (row0 >= N) return;
+  const int nsb = K / 32, nit = nsb / 32;
+  const uint8_t* wr[R];
+#pragma unroll
+  for (int r = 0; r < R; r++) wr[r] = W + (size_t)min(row0 + r, N - 1) * rb;
+  auto issue = [&](int it, int st) {
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+      const uint8_t* src = wr[r] + (size_t)it * CH;
+      uint8_t* dst = buf + (st * R + r) * CHP;
+      for (int i = lane; i < CH / 8; i += 32) cp_async8(dst + 8 * i, src + 8 * i);
+    }
+    cp_async_commit();
+  };
+  float sum[R][B];
+#pragma unroll
+  for (int r = 0; r < R; r++)
+#pragma unroll
+    for (int b = 0; b < B; b++) sum[r][b] = 0.f;
+  issue(0, 0);
+  if (nit > 1) issue(1, 1); else cp_async_commit();
+  for (int it = 0; it < nit; it++) {
+    const int st = it % S;
+    if (it + 2 < nit) issue(it + 2, (it + 2) % S); else cp_async_commit();
+    cp_async_wait<2>();
+    __syncwarp();
+    W32 w[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) D::dec(buf + (st * R + r) * CHP + (lane >> 3) * D::BB, lane & 7, w[r]);
+    const int g = it * 32 + lane;
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+      const int4* xp = (const int4*)(xq + (size_t)b * K + (size_t)g * 32);
+      const int4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
+      const float d = __ldg(xd + (size_t)b * nsb + g);
+#pragma unroll
+      for (int r = 0; r < R; r++) sum[r][b] += dot_w32<D::OFF, D::SCALES>(w[r], x0, x1) * d;
+    }
+    __syncwarp();
+  }
+#pragma unroll
+  for (int r = 0; r < R; r++) {
+    if (row0 + r >= N) break;
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+      const float v = warp_sum(sum[r][b]);
+      if (lane == 0) {
+        float* o = y + (size_t)b * ldy + row0 + r;
+        *o = acc ? *o + v : v;
+      }
+    }
+  }
+}
+
 // f32 / f16 / bf16 weights with f32 activations
 template <int WT, int B>
 __global__ void k_mmv_float(const uint8_t* __restrict__ W, size_t rb, int K, int N,
@@ -1018,27 +1093,24 @@ static int mmv_mode() {
   return m;
 }
 
+// Default small-batch matvec choice (hand-tuned heuristics; variant 0 of the tuner below)
 template <int T>
-static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd,
-                         int B, float* y, int ldy, bool acc, cudaStream_t s) {
-  const uint8_t* w = (const uint8_t*)W;
-  if (launch_mmv_tc<T>(w, rb, K, N, xq, xd, B, y, ldy, acc, s)) return;
+static void mmv_default(const uint8_t* w, size_t rb, int K, int N, const int8_t* xq, const float* xd,
+                        int B, float* y, int ldy, bool acc, cudaStream_t s) {
   const dim3 block(MMV_WARPS * 32);
   constexpr bool smem_ok = !(T == QT_IQ1_S || T == QT_IQ1_M || T == QT_IQ2_XXS);
-  if (mmv_mode() == 0 && smem_ok && B >= 2 && (size_t)B * K <= 24576) {
+  constexpr bool grid_type = T == QT_IQ2_XXS || T == QT_IQ2_XS || T == QT_IQ2_S || T == QT_IQ3_XXS ||
+                             T == QT_IQ3_S || T == QT_IQ1_S || T == QT_IQ1_M;
+  if (mmv_mode() == 0 && smem_ok && B >= 2 && B <= 4 && (size_t)B * K <= 24576) {
     const size_t sh = (size_t)B * K + (size_t)B * (K / 32) * 4;
-    const bool grid_t = T == QT_IQ2_XXS || T == QT_IQ2_XS || T == QT_IQ2_S || T == QT_IQ3_XXS || T == QT_IQ3_S ||
-                        T == QT_IQ1_S || T == QT_IQ1_M;
-    if (B == 2 && !grid_t) {
+    if (B == 2 && !grid_type) {
       k_mmv_x<T, 2, 1><<<cdiv(N, MMV_WARPS), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
       return;
     }
     if (mmv_r4() && B >= 3 && T != QT_IQ4_XS) {
-      switch (B) {
-#define CASE(n) case n: k_mmv_x<T, n, 4><<<cdiv(N, MMV_WARPS * 4), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return;
-        CASE(3) CASE(4)
-#undef CASE
-      }
+      if (B == 3) k_mmv_x<T, 3, 4><<<cdiv(N, MMV_WARPS * 4), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
+      else k_mmv_x<T, 4, 4><<<cdiv(N, MMV_WARPS * 4), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
+      return;
     }
     switch (B) {
 #define CASE(n) case n: k_mmv_x<T, n, 2><<<cdiv(N, MMV_WARPS * 2), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return;
@@ -1054,20 +1126,15 @@ static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* x
     }
   }
   // B >= 2: two rows per warp share the activation loads (B == 1 keeps more warps in flight)
-  constexpr bool grid_type = T == QT_IQ2_XXS || T == QT_IQ2_XS || T == QT_IQ2_S || T == QT_IQ3_XXS ||
-                             T == QT_IQ3_S || T == QT_IQ1_S || T == QT_IQ1_M;
   if (B == 1 || (B == 2 && !grid_type)) {
     if (B == 1) k_mmv<T, 1, 1><<<cdiv(N, MMV_WARPS), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
     else k_mmv<T, 2, 1><<<cdiv(N, MMV_WARPS), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
     return;
   }
-  static const int r4max = getenv("QE_MMV_R4MAX") ? atoi(getenv("QE_MMV_R4MAX")) : 4;
-  if (mmv_r4() && B >= 3 && B <= r4max && T != QT_IQ4_XS) {
-    switch (B) {
-#define CASE(n) case n: k_mmv<T, n, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return;
-      CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
-#undef CASE
-    }
+  if (mmv_r4() && (B == 3 || B == 4) && T != QT_IQ4_XS) {
+    if (B == 3) k_mmv<T, 3, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
+    else k_mmv<T, 4, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc);
+    return;
   }
   const dim3 grid(cdiv(N, MMV_WARPS * 2));
   switch (B) {
@@ -1076,6 +1143,91 @@ static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* x
 #undef CASE
     default: QE_FATAL("matvec: unsupported batch %d", B);
   }
+}
+
+// Variants of the B = 2..8 matvec (same product, different work split); false if not applicable.
+//   0 default, 1 shared-activation R=2, 2 shared-activation R=4, 3 direct R=2, 4 direct R=4,
+//   5 cp.async-pipelined R=2
+constexpr int kMmvVariants = 6;
+template <int T>
+static bool mmv_variant(int v, const uint8_t* w, size_t rb, int K, int N, const int8_t* xq, const float* xd,
+                        int B, float* y, int ldy, bool acc, cudaStream_t s) {
+  const dim3 block(MMV_WARPS * 32);
+  constexpr bool smem_ok = !(T == QT_IQ1_S || T == QT_IQ1_M || T == QT_IQ2_XXS);
+  if (B < 2 || B > 8) return false;
+  switch (v) {
+    case 0: mmv_default<T>(w, rb, K, N, xq, xd, B, y, ldy, acc, s); return true;
+    case 1: case 2: {
+      const size_t sh = (size_t)B * K + (size_t)B * (K / 32) * 4;
+      if (!smem_ok || sh > 99 * 1024 || (v == 2 && B < 3)) return false;
+      if (sh > 48 * 1024) {
+        static bool init = false;
+        if (!init) {
+#define ATTR(n, r) cudaFuncSetAttribute(k_mmv_x<T, n, r>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+          ATTR(2, 2) ATTR(3, 2) ATTR(4, 2) ATTR(5, 2) ATTR(6, 2) ATTR(7, 2) ATTR(8, 2)
+          ATTR(3, 4) ATTR(4, 4) ATTR(5, 4) ATTR(6, 4) ATTR(7, 4) ATTR(8, 4)
+#undef ATTR
+          init = true;
+        }
+      }
+      if (v == 1) {
+        switch (B) {
+#define CASE(n) case n: k_mmv_x<T, n, 2><<<cdiv(N, MMV_WARPS * 2), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return true;
+          CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+        }
+      } else {
+        switch (B) {
+#define CASE(n) case n: k_mmv_x<T, n, 4><<<cdiv(N, MMV_WARPS * 4), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return true;
+          CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+        }
+      }
+      return false;
+    }
+    case 3:
+      switch (B) {
+#define CASE(n) case n: k_mmv<T, n, 2><<<cdiv(N, MMV_WARPS * 2), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return true;
+        CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+      }
+      return false;
+    case 4:
+      switch (B) {
+#define CASE(n) case n: k_mmv<T, n, 4><<<cdiv(N, MMV_WARPS * 4), block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return true;
+        CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+      }
+      return false;
+    case 5: {
+      constexpr int CHP = (4 * QDec<T>::BB + 15) & ~15;
+      if ((K / 32) % 32 != 0 || rb % 8 != 0 || ((uintptr_t)w & 7) != 0 || T == QT_Q8_0) return false;
+      const size_t sh = (size_t)MMV_WARPS * 3 * 2 * CHP;
+      if (sh > 48 * 1024) return false;
+      switch (B) {
+#define CASE(n) case n: k_mmv_p<T, n, 2><<<cdiv(N, MMV_WARPS * 2), block, sh, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); return true;
+        CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+// B >= 3: the shared-activation kernel with 4 rows per warp (variant 2) wherever it applies (its
+// staged activations fit and the type decodes from shared memory well); measured 3-8% faster per
+// decode step than the older per-type choice on the 27B (a per-shape timing autotuner was tried and
+// did not beat it: isolated timings do not predict the in-pass cost).  QE_MMV_VARIANT=v forces one.
+template <int T>
+static void launch_mmv_t(const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd,
+                         int B, float* y, int ldy, bool acc, cudaStream_t s) {
+  const uint8_t* w = (const uint8_t*)W;
+  if (launch_mmv_tc<T>(w, rb, K, N, xq, xd, B, y, ldy, acc, s)) return;
+  static const int force = getenv("QE_MMV_VARIANT") ? atoi(getenv("QE_MMV_VARIANT")) : -1;
+  if (B >= 2 && force >= 0 && mmv_variant<T>(force, w, rb, K, N, xq, xd, B, y, ldy, acc, s)) return;
+  if (B >= 3 && force < 0 && mmv_variant<T>(2, w, rb, K, N, xq, xd, B, y, ldy, acc, s)) return;
+  mmv_default<T>(w, rb, K, N, xq, xd, B, y, ldy, acc, s);
 }
 template <int WT>
 static void launch_mmv_float(const void* W, size_t rb, int K, int N, const float* x, int B,
@@ -1647,10 +1799,6 @@ __global__ void k_gq_xsum(const int8_t* __restrict__ xq, int K, int T, int16_t* 
 static __device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(a), "l"(gmem));
-}
-static __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
-  const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(a), "l"(gmem));
 }
 static __device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
