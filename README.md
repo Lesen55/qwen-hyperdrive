@@ -132,6 +132,15 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 }'
 ```
 
+**262K コンテキスト（オプション）**: `-c 262144`（または `LLM_ENGINE_CTX=262144 llm-engine`）で Qwen3.8-27B のネイティブ上限まで使える。KV（q3）に 3.8 GB を予約する分、GPU 常駐の FFN が減り、短文デコードは約 1 割遅くなるので既定は 131072 のまま。実測（RTX 3080、`--kv q3 --spec-relax 2 --skip-ffn 29,10`、temp 0.7、2026-11-18）:
+
+| 入力 | プリフィル | デコード |
+|---|---|---|
+| 短文（物語 / 日本語 / コード） | – | 53.2 / 52.6 / 105.2 tok/s |
+| 32K | 31.1 s（1054 tok/s） | 66.1 tok/s |
+| 127K | 198.7 s（641 tok/s） | 30.9 tok/s |
+| 254K | 605.2 s（421 tok/s） | 26.0 tok/s |
+
 **WebUI**: ブラウザで `http://<host>:8080/` を開くと、チャット（🌐 Web検索: `web_search` ツールとしてモデルに渡し、必要なときだけモデルが呼び出す。DuckDuckGo / Brave の結果と上位ページ本文、出典リンク付き）と、GPU/CPU の温度・電力・使用率・VRAM・PCIe 帯域、プリフィル/デコード速度（最速・平均つき）・TTFT・MTP 採択率・KV/貸し出し層のリアルタイム表示（`GET /api/stats`）が使えます。
 
 エンドポイント: `POST /v1/chat/completions`（stream 対応、`<think>` 部分は `reasoning_content` に分離、
@@ -146,7 +155,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 | オプション | 既定 | 説明 |
 |---|---|---|
-| `-c` | 131072 | 最大コンテキスト長 |
+| `-c` | 131072 | 最大コンテキスト長（起動ラッパーでは `LLM_ENGINE_CTX`。27B は最大 262144 まで可、下表） |
 | `--kv q4\|q3\|q8\|f16` | q4 | KV キャッシュ形式（アダマール回転付き。q3 は Lloyd-Max 3bit、長文脈デコード約 5% 高速・PPL +1.8%） |
 | `--cpu-frac auto\|0..1` | auto | ストリーミング層の FFN のうち CPU で計算する割合（auto = 層ごとに量子化型別の実測 CPU 速度と PCIe 帯域で均衡） |
 | `--pcie-gbps` | 実測 × 1.5 | auto 均衡で仮定する実効 PCIe 帯域（起動時に計測） |

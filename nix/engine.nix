@@ -138,6 +138,10 @@ let
       fi
     fi
     args=("$@")
+    # context length option: LLM_ENGINE_CTX=262144 (the 27B's native maximum) when -c is not given
+    if [ -n "''${LLM_ENGINE_CTX:-}" ]; then
+      case " $* " in *" -c "*|*" --ctx "*) ;; *) args+=(-c "$LLM_ENGINE_CTX") ;; esac
+    fi
     # draft model for speculative decoding of models without MTP (e.g. Qwen3.5-0.8B for SenseNova-Loop)
     if [ -n "''${LLM_ENGINE_DRAFT_MODEL:-}" ]; then
       case " $* " in *" --draft-model "*) ;; *) args+=(--draft-model "$LLM_ENGINE_DRAFT_MODEL") ;; esac
