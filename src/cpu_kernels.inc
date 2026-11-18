@@ -35,7 +35,7 @@ inline __m256i s16_two(int s0, int s1) { return _mm256_set_m128i(_mm_set1_epi16(
 template <int T> struct Dec;
 
 template <> struct Dec<QT_IQ2_XXS> {
-  static constexpr int BB = 66; static constexpr bool MIN = false;
+  static constexpr int BB = 66; static constexpr bool MIN = false, UNS = false;
   static inline float factor(const uint8_t* b) { return h2f(b) * 0.125f; }
   static inline void dec(const uint8_t* b, int ib, D32& o) {
     const uint32_t a0 = ld32(b + 2 + 8 * ib), a1 = ld32(b + 2 + 8 * ib + 4);
@@ -46,7 +46,7 @@ template <> struct Dec<QT_IQ2_XXS> {
   }
 };
 template <> struct Dec<QT_IQ2_XS> {
-  static constexpr int BB = 74; static constexpr bool MIN = false;
+  static constexpr int BB = 74; static constexpr bool MIN = false, UNS = false;
   static inline float factor(const uint8_t* b) { return h2f(b) * 0.125f; }
   static inline void dec(const uint8_t* b, int ib, D32& o) {
     const uint8_t* q = b + 2 + 8 * ib;
@@ -59,7 +59,7 @@ template <> struct Dec<QT_IQ2_XS> {
   }
 };
 template <> struct Dec<QT_IQ2_S> {
-  static constexpr int BB = 82; static constexpr bool MIN = false;
+  static constexpr int BB = 82; static constexpr bool MIN = false, UNS = false;
   static inline float factor(const uint8_t* b) { return h2f(b) * 0.125f; }
   static inline void dec(const uint8_t* b, int ib, D32& o) {
     const uint8_t* qs = b + 2 + 4 * ib;
@@ -75,7 +75,7 @@ template <> struct Dec<QT_IQ2_S> {
   }
 };
 template <> struct Dec<QT_IQ3_XXS> {
-  static constexpr int BB = 98; static constexpr bool MIN = false;
+  static constexpr int BB = 98; static constexpr bool MIN = false, UNS = false;
   static inline float factor(const uint8_t* b) { return h2f(b) * 0.25f; }
   static inline void dec(const uint8_t* b, int ib, D32& o) {
     const uint8_t* qs = b + 2 + 8 * ib;
@@ -88,7 +88,7 @@ template <> struct Dec<QT_IQ3_XXS> {
   }
 };
 template <> struct Dec<QT_IQ3_S> {
-  static constexpr int BB = 110; static constexpr bool MIN = false;
+  static constexpr int BB = 110; static constexpr bool MIN = false, UNS = false;
   static inline float factor(const uint8_t* b) { return h2f(b); }
   static inline void dec(const uint8_t* b, int ib, D32& o) {
     const uint8_t* qs = b + 2 + 8 * ib;
@@ -104,7 +104,7 @@ template <> struct Dec<QT_IQ3_S> {
   }
 };
 template <> struct Dec<QT_IQ4_XS> {
-  static constexpr int BB = 136; static constexpr bool MIN = false;
+  static constexpr int BB = 136; static constexpr bool MIN = false, UNS = false;
   static inline float factor(const uint8_t* b) { return h2f(b); }
   static inline void dec(const uint8_t* b, int ib, D32& o) {
     const uint32_t sh = ld16(b + 2);
@@ -117,14 +117,15 @@ template <> struct Dec<QT_IQ4_XS> {
     o.s16 = s16_one(ls - 32);
   }
 };
+// UNS: decoded weights are already unsigned (0..15), so maddubs takes them as is (no sign trick)
 template <> struct Dec<QT_Q2_K> {
-  static constexpr int BB = 84; static constexpr bool MIN = true;
+  static constexpr int BB = 84; static constexpr bool MIN = true, UNS = true;
   static inline float factor(const uint8_t* b) { return h2f(b + 80); }
   static inline float min_factor(const uint8_t* b) { return h2f(b + 82); }
-  static inline int min_dot(const uint8_t* b, const int16_t* bs) {  // sum_j m_j * bsum16_j
-    int s = 0;
-    for (int j = 0; j < 16; j++) s += (b[j] >> 4) * bs[j];
-    return s;
+  // mins per 16-value group (int16 lanes, matching x.bs16): sum_j m_j * bsum16_j = madd(min16, bs16)
+  static inline __m256i min16(const uint8_t* b) {
+    const __m128i sc = _mm_loadu_si128((const __m128i*)b);
+    return _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(sc, 4), _mm_set1_epi8(0x0F)));
   }
   static inline void dec(const uint8_t* b, int g, D32& o) {
     const __m256i q = _mm256_loadu_si256((const __m256i*)(b + 16 + (g / 4) * 32));
@@ -134,17 +135,17 @@ template <> struct Dec<QT_Q2_K> {
   }
 };
 template <> struct Dec<QT_Q4_K> {
-  static constexpr int BB = 144; static constexpr bool MIN = true;
+  static constexpr int BB = 144; static constexpr bool MIN = true, UNS = true;
   static inline float factor(const uint8_t* b) { return h2f(b); }
   static inline float min_factor(const uint8_t* b) { return h2f(b + 2); }
-  static inline int min_dot(const uint8_t* b, const int16_t* bs) {
-    int s = 0;
+  static inline __m256i min16(const uint8_t* b) {  // m_g for both 16-value halves of group g
+    alignas(32) int16_t m16[16];
     for (int g = 0; g < 8; g++) {
       uint8_t sc, m;
       q4k_scale_min(g, b + 4, sc, m);
-      s += m * (bs[2 * g] + bs[2 * g + 1]);
+      m16[2 * g] = m16[2 * g + 1] = m;
     }
-    return s;
+    return _mm256_load_si256((const __m256i*)m16);
   }
   static inline void dec(const uint8_t* b, int g, D32& o) {
     uint8_t sc, m;
@@ -170,9 +171,8 @@ void mv(const uint8_t* W, size_t rb, int K, int r0, int r1, const Q8Act& x, floa
   for (int r = r0; r < r1; r++) {
     const uint8_t* wr = W + (size_t)r * rb;
     if (r + 1 < r1) _mm_prefetch((const char*)(wr + rb), _MM_HINT_T0);
-    __m256 acc[B];
-    float macc[B];
-    for (int b = 0; b < B; b++) { acc[b] = _mm256_setzero_ps(); macc[b] = 0.f; }
+    __m256 acc[B], macc[B];
+    for (int b = 0; b < B; b++) { acc[b] = _mm256_setzero_ps(); macc[b] = _mm256_setzero_ps(); }
     for (int j = 0; j < nb; j++) {
       const uint8_t* blk = wr + (size_t)j * D::BB;
       __m256i sumi[B];
@@ -181,21 +181,27 @@ void mv(const uint8_t* W, size_t rb, int K, int r0, int r1, const Q8Act& x, floa
       for (int ib = 0; ib < 8; ib++) {
         D32 w;
         D::dec(blk, ib, w);
-        const __m256i aw = _mm256_sign_epi8(w.w, w.w);
+        const __m256i aw = D::UNS ? w.w : _mm256_sign_epi8(w.w, w.w);
         for (int b = 0; b < B; b++) {
           const __m256i xv = _mm256_loadu_si256((const __m256i*)(x.q.data() + (size_t)b * K + 256 * j + 32 * ib));
-          const __m256i dot = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(xv, w.w));
+          const __m256i dot = _mm256_maddubs_epi16(aw, D::UNS ? xv : _mm256_sign_epi8(xv, w.w));
           sumi[b] = acc_madd(sumi[b], dot, w.s16);
         }
       }
       const float f = D::factor(blk);
+      __m256i mn = _mm256_setzero_si256();
+      float mf = 0.f;
+      if constexpr (D::MIN) { mn = D::min16(blk); mf = D::min_factor(blk); }
       for (int b = 0; b < B; b++) {
         const float xd = x.d[(size_t)b * nb + j];
         acc[b] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi[b]), _mm256_set1_ps(f * xd), acc[b]);
-        if constexpr (D::MIN) macc[b] += D::min_factor(blk) * xd * (float)D::min_dot(blk, x.bs16.data() + (size_t)b * (K / 16) + 16 * j);
+        if constexpr (D::MIN) {
+          const __m256i bs = _mm256_loadu_si256((const __m256i*)(x.bs16.data() + (size_t)b * (K / 16) + 16 * j));
+          macc[b] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(bs, mn)), _mm256_set1_ps(mf * xd), macc[b]);
+        }
       }
     }
-    for (int b = 0; b < B; b++) y[(size_t)b * ldy + r] = hsum(acc[b]) - macc[b];
+    for (int b = 0; b < B; b++) y[(size_t)b * ldy + r] = hsum(_mm256_sub_ps(acc[b], macc[b]));
   }
 }
 
@@ -216,9 +222,12 @@ void mv_b(const uint8_t* W, size_t rb, int K, int r0, int r1, const Q8Act& x, in
 
 template <int B>
 void mv_r4(const int8_t* tabp, const uint8_t* W, int K, int r0, int r1, const Q8Act& x, float* y, int ldy) {
+  // R4 levels are |w| <= 62: stored offset by +64 they are unsigned (2..126), so maddubs takes them
+  // directly (pair sums <= 2*126*127 < 2^15, no saturation) and the offset is removed per block with
+  // one madd of the sub-block scales and the activation 16-sums: sum s*(w+64)*x - 64 * sum s*bsum16.
   const int nb = K / 256;
   const size_t rb = (size_t)nb * R4_BLOCK_BYTES;
-  const __m128i tab = _mm_loadu_si128((const __m128i*)tabp);
+  const __m128i tab = _mm_add_epi8(_mm_loadu_si128((const __m128i*)tabp), _mm_set1_epi8(64));
   const __m128i m4 = _mm_set1_epi8(0x0F);
   for (int r = r0; r < r1; r++) {
     const uint8_t* wr = W + (size_t)r * rb;
@@ -229,19 +238,21 @@ void mv_r4(const int8_t* tabp, const uint8_t* W, int K, int r0, int r1, const Q8
       const uint8_t* blk = wr + (size_t)j * R4_BLOCK_BYTES;
       const uint8_t* sc = blk + 4;
       const uint8_t* q = blk + 20;
+      const __m256i sc16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)sc));
       __m256i sumi[B];
-      for (int b = 0; b < B; b++) sumi[b] = _mm256_setzero_si256();
+      for (int b = 0; b < B; b++) {
+        const __m256i bs = _mm256_loadu_si256((const __m256i*)(x.bs16.data() + (size_t)b * (K / 16) + 16 * j));
+        sumi[b] = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_slli_epi32(_mm256_madd_epi16(bs, sc16), 6));
+      }
 #pragma GCC unroll 8
       for (int ib = 0; ib < 8; ib++) {
         const __m128i qq = _mm_loadu_si128((const __m128i*)(q + 16 * ib));
         const __m128i lo = _mm_and_si128(qq, m4), hi = _mm_and_si128(_mm_srli_epi16(qq, 4), m4);
         const __m256i w = _mm256_set_m128i(_mm_shuffle_epi8(tab, hi), _mm_shuffle_epi8(tab, lo));
-        const __m256i aw = _mm256_sign_epi8(w, w);
         const __m256i s16 = _mm256_set_m128i(_mm_set1_epi16(sc[2 * ib + 1]), _mm_set1_epi16(sc[2 * ib]));
         for (int b = 0; b < B; b++) {
           const __m256i xv = _mm256_loadu_si256((const __m256i*)(x.q.data() + (size_t)b * K + 256 * j + 32 * ib));
-          const __m256i dot = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(xv, w));
-          sumi[b] = acc_madd(sumi[b], dot, s16);
+          sumi[b] = acc_madd(sumi[b], _mm256_maddubs_epi16(w, xv), s16);
         }
       }
       float f;
@@ -252,4 +263,3 @@ void mv_r4(const int8_t* tabp, const uint8_t* W, int K, int r0, int r1, const Q8
     for (int b = 0; b < B; b++) y[(size_t)b * ldy + r] = hsum(acc[b]);
   }
 }
-
