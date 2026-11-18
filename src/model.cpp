@@ -1499,11 +1499,23 @@ int Model::mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf,
 
 int Model::mtp_chain(int token, int pos, float* conf, float* logits_host) {
   const Config& c = cfg_;
+  static const bool tprof = getenv("QE_MTP_PROF") != nullptr;  // wall time per chained draft step
+  static double t_acc = 0, t_blk = 0;
+  static long t_n = 0;
+  const double t0 = tprof ? qe_now() : 0;
   ensure_kv(pos + 2);
   float* hsafe = hsafe_;
   CUDA_CHECK(cudaMemcpyAsync(hsafe, mtp_h_, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
   mtp_block(hsafe, &token, 1, pos);
-  return mtp_finish(1, conf, logits_host);
+  if (tprof) { CUDA_CHECK(cudaStreamSynchronize(stream_)); t_blk += qe_now() - t0; }
+  const int d = mtp_finish(1, conf, logits_host);
+  if (tprof) {
+    t_acc += qe_now() - t0;
+    if (++t_n % 200 == 0)
+      fprintf(stderr, "[mtp] chained step %.3f ms (block %.3f ms, head+sync %.3f ms) at pos %d\n", t_acc / t_n * 1e3,
+              t_blk / t_n * 1e3, (t_acc - t_blk) / t_n * 1e3, pos);
+  }
+  return d;
 }
 
 // ---------------------------------------------------------------------------------------------
