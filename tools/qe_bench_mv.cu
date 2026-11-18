@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     void* W; CUDA_CHECK(cudaMalloc(&W, t->nbytes));
     CUDA_CHECK(cudaMemcpy(W, t->data, t->nbytes, cudaMemcpyHostToDevice));
     printf("%-28s %-8s %6d x %6d %7.1f MB:", n, qtype_info(t->type).name, N, K, t->nbytes / 1e6);
-    for (int B : {1, 2, 4}) {
+    for (int B : {1, 2, 4, 5, 8}) {
       qk::quantize_q8(x, xq, xd, K, B, 0);
       qk::matvec(t->type, W, rb, K, N, xq, xd, x, B, y, N, false, 0);
       cudaEventRecord(e0);
