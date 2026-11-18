@@ -511,6 +511,8 @@ void Generator::step(std::vector<int>& out) {
     ng_run_ = 0.7 * ng_run_ + 0.3 * a;  // recent accepted run length -> n-gram draft cap
   } else {
     update_policy(nd, a, qe_now() - t0);
+    st_.mtp_len[std::min(nd, 8)]++;
+    for (int k = 0; k < nd && k < 8 && k <= a; k++) { st_.mtp_reach[k]++; st_.mtp_acc[k] += k < a; }
   }
   static const bool m2 = getenv("QE_MEASURE_TOP2") != nullptr;
   static long m2_rej = 0, m2_hit[4] = {0, 0, 0, 0};

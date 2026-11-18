@@ -139,6 +139,11 @@ int main(int argc, char** argv) {
            (st.generated - 1) / st.t_decode, st.accepted, st.drafted);
     printf("time: verify %.2f s, sample %.2f s, mtp+rollback %.2f s\n", st.t_verify, st.t_sample, st.t_mtp);
     printf("n-gram drafted steps %d: accepted %d/%d\n", st.ng_steps, st.ng_accepted, st.ng_drafted);
+    printf("mtp chain lengths:");
+    for (int n = 0; n <= 8; n++) if (st.mtp_len[n]) printf(" %d:%d", n, st.mtp_len[n]);
+    printf("  acceptance by depth:");
+    for (int k = 0; k < 8; k++) if (st.mtp_reach[k]) printf(" %d:%.2f", k + 1, st.mtp_acc[k] / (double)st.mtp_reach[k]);
+    printf("\n");
     printf("steps %d, accepted-per-step histogram: 0:%d 1:%d 2:%d 3:%d  (%.2f tok/step)\n", st.steps, st.acc_hist[0],
            st.acc_hist[1], st.acc_hist[2], st.acc_hist[3], (st.generated - 1) / (double)std::max(1, st.steps));
   }

@@ -42,6 +42,8 @@ struct GenStats {
   int steps = 0, drafted = 0, accepted = 0, generated = 0;
   int acc_hist[4] = {0, 0, 0, 0};  // steps by number of accepted drafts
   int ng_steps = 0, ng_drafted = 0, ng_accepted = 0;  // n-gram drafted steps
+  // MTP / draft-model steps: chain lengths, and per depth k how often it was reached / accepted
+  int mtp_len[9] = {}, mtp_reach[8] = {}, mtp_acc[8] = {};
   double t_prefill = 0, t_decode = 0;
   double t_verify = 0, t_mtp = 0, t_sample = 0;
 };
