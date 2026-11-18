@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -12,6 +13,13 @@
 namespace cpu {
 
 bool type_supported(uint32_t t);
+
+// Instruction set of the int8 matvec kernels, detected at first use (QE_CPU_ISA overrides)
+enum class Isa { AVX2, VNNI, AVX512 };
+Isa isa();
+const char* isa_name(Isa i);
+std::string cpu_features();              // inference-relevant x86 extensions the CPU reports
+const std::vector<int>& core_order();    // one logical CPU per physical core, fastest cores first
 
 // int8 activations, one scale per 256-block (q8_K style) + int16 sums per 16 (for min formats).
 // Weight sub-block scales are applied in the integer domain; one float multiply per 256 block.

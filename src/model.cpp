@@ -158,6 +158,7 @@ void Model::calibrate_host() {
   }
   QE_LOG("[hw] CPU %d threads, PCIe H2D %.1f GB/s (balancer %.1f), DRAM read %.1f GB/s\n", opt_.cpu_threads,
          measured_pcie_ > 0 ? measured_pcie_ : opt_.pcie_gbps, opt_.pcie_gbps, opt_.dram_gbps);
+  QE_LOG("[hw] CPU kernels: %s (features: %s)\n", cpu::isa_name(cpu::isa()), cpu::cpu_features().c_str());
 }
 
 Model::~Model() {

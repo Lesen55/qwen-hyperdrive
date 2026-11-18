@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
 option(QE_CUDA "CUDA backend (NVIDIA)" ON)
 option(QE_VULKAN "Vulkan backend (AMD Radeon, Intel Arc, NVIDIA, ...)" OFF)
+# Portable by default (x86-64-v3 + run-time selection of AVX-VNNI / AVX-512 VNNI kernels);
+# QE_NATIVE=ON tunes everything for the build machine (-march=native)
+option(QE_NATIVE "build for this machine's CPU (-march=native)" OFF)
 if(QE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   # local builds: the GPU in this machine; the Nix package builds every supported generation
   set(CMAKE_CUDA_ARCHITECTURES native)
@@ -21,6 +24,9 @@ find_package(Threads REQUIRED)
 
 # x86-64-v3 host code: AVX2 + FMA + F16C + BMI2. No -march=native so the Nix build is reproducible.
 set(QE_CPU_FLAGS -mavx2 -mfma -mf16c -mbmi2 -mtune=znver3)
+if(QE_NATIVE)
+  set(QE_CPU_FLAGS -march=native -mtune=native)
+endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 
@@ -136,6 +142,12 @@ if(QE_VULKAN)
   target_compile_options(qevk PRIVATE ${QE_CPU_FLAGS} -Wall -Wno-unused-function)
   target_link_libraries(qevk PUBLIC qecommon Vulkan::Vulkan)
   qe_frontends("-vk" qevk)
+  if(NOT QE_CUDA)  # CPU kernel test (the CUDA build has it among its tools)
+    add_executable(qe_test_cpu tools/qe_test_cpu.cpp)
+    target_link_libraries(qe_test_cpu PRIVATE qecommon)
+    target_compile_options(qe_test_cpu PRIVATE ${QE_CPU_FLAGS})
+    install(TARGETS qe_test_cpu RUNTIME DESTINATION bin)
+  endif()
   add_executable(qe_vk_test tools/qe_vk_test.cpp)
   target_include_directories(qe_vk_test PRIVATE ${CMAKE_BINARY_DIR}/spv)
   target_link_libraries(qe_vk_test PRIVATE qevk)

@@ -47,7 +47,7 @@
 | 量子化 | IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 / BF16 / F16 / F32（Q4_K_M・Q5_K_M・Q8_0・IQ 系の混在 GGUF をそのまま読める） |
 | GPU（CUDA） | NVIDIA Ampere 以降（compute 8.0 以上: RTX 30 / 40 系、A100、H100 など）。Nix パッケージは sm_80 / 86 / 89 / 90 の機械語と PTX を同梱。VRAM 容量に合わせて常駐・ストリーミング・KV を自動配置。NVIDIA ではこちらが最速 |
 | GPU（Vulkan） | Vulkan 1.2 の GPU なら何でも: AMD Radeon（RADV / AMDVLK）、Intel Arc（ANV）、NVIDIA など。必要なのはバッファデバイスアドレス、8 レーン以上のサブグループ（算術・クラスタ演算）、32 KiB の共有メモリだけ。`VK_KHR_cooperative_matrix` があればプリフィルの行列積を行列演算器（RDNA3 WMMA / Arc XMX / Tensor Core）で行う（起動時に自己テストし、合わなければスカラーに戻る） |
-| CPU | x86-64-v3（AVX2 / FMA / F16C / BMI2）。物理コア数・PCIe 帯域・DRAM 帯域は起動時に実測して CPU/GPU 分担に使う（`-t` / `--pcie-gbps` で上書き可） |
+| CPU | x86-64-v3（AVX2 / FMA / F16C / BMI2）が最低限。CPU カーネルは AVX2・AVX-VNNI・AVX-512 VNNI 版を同梱し、起動時に CPU を判定して選ぶ（`[hw] CPU kernels: ...`、`QE_CPU_ISA=avx2/vnni/avx512` で指定）。スレッドは物理コアごとに 1 本、Intel のハイブリッド CPU では P コア優先で配置する。物理コア数・PCIe 帯域・DRAM 帯域は起動時に実測して CPU/GPU 分担に使う（`-t` / `--pcie-gbps` で上書き可）。手元向けに最適化するビルドは `cmake -DQE_NATIVE=ON`（`-march=native`） |
 
 検証済み: Huihui-Qwen3.8-27B IQ3_XXS-mtp（10 GB に収まらないためストリーミング + CPU 併用）、Qwen3.5-9B Q4_K_M MTP（全層 VRAM 常駐）。
 Qwen3.5-9B Q4_K_M（RTX 3080）: 短い文脈のデコード 141〜259 tok/s、32K プリフィル 9.7 秒（3376 tok/s）。
@@ -82,10 +82,19 @@ Qwen3.5-9B Q4_K_M（RTX 3080）: 短い文脈のデコード 141〜259 tok/s、3
 
 自動チューナーは、そのモデルの行列で候補を実測し、結果を `~/.cache/qwen-hyperdrive/vk-tune-<vendor>-<device>-<driver>-<形状>.txt` に保存する。2 回目以降の起動はこの保存値を読むだけ。`QE_VK_RETUNE=1` で測り直し、`QE_VK_TUNE=teams,rows,subgroup,multi_teams,multi_rows,gemm` で手動指定できる。行列演算の各形は起動時に自己テストし、結果が合わない形は使わない。
 
-確認範囲: Arc 130V と 7900 XTX の実機ではまだ測っていない。仕組み自体はこのマシンで検証済み。
-- RTX 3080: 4 形状 × 3 行列演算形を実測し、手調整と同じ設定を選んだ。16×8×16 / 16×8×8 も自己テストに合格。
-- lavapipe: 8 レーン、8×8×8 の行列演算で自己テストと選択が動き、出力が一致した。
-- f16 KV の自動選択、ページキャッシュ解放（9B で 5.9 GB → 0.8 GB）も確認した。
+Arc 130V（ThinkPad T14 Gen 6、Core Ultra 5 228V、LPDDR5X 32 GB、Mesa ANV）での実測:
+
+| | 最初 | 調整後 |
+|---|---|---|
+| Qwen3.5-9B Q4_K_M デコード（MTP なし / あり） | 8.2 / 5.0 tok/s | 12.0 / 14.5 tok/s |
+| 行列ベクトル積の実効帯域（Q8_0 / Q4_K / Q6_K） | 52 / 41 / 28 GB/s | 91 / 60 / 72 GB/s |
+| MTP 検証（4 トークン）の重さ（1 トークン比） | 4.5〜6.5 倍 | 1.6〜1.8 倍 |
+| Qwen3.8-27B IQ3_XXS | プリフィルで GPU リセット | 5.5〜6.2 tok/s（MTP あり）、RAM は 17.6 GB 空き |
+
+- 効いたのは、32 レーンで 1 つのスーパーブロックを協調して展開する行列ベクトル積（`mvc_*`）。Intel では、レーンごとにばらけたブロックを読む汎用カーネルが遅かった。
+- プリフィルは、9B では XMX（8×16×16）が選ばれる（64 ms、スカラー版 104 ms）。
+- 27B が落ちたのは、1 回の投入が Xe ドライバのジョブ時間制限を超えていたため。投入を分割して直した。
+- RX 7900 XTX の実機ではまだ測っていない。
 
 Qwen3.8-27B IQ3_XXS も Vulkan で CUDA と同じ出力になる。10 GB では FFN 5 層がシステム RAM 側になるが、MTP で 9.2 → 16.3 tok/s。帯域が足りない環境ほど MTP が効く（Arc 130V もこのケース）。NVIDIA では CUDA 版を使うこと。
 

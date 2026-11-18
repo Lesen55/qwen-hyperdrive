@@ -10,6 +10,9 @@
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: qe_test_cpu model.gguf [threads]\n"); return 1; }
   GGUFFile f(argv[1]);
+  printf("CPU kernels: %s (features: %s); threads on cores:", cpu::isa_name(cpu::isa()), cpu::cpu_features().c_str());
+  for (int c : cpu::core_order()) printf(" %d", c);
+  printf("\n");
   const int nth = argc > 2 ? atoi(argv[2]) : 6;
   cpu::ThreadPool pool(nth);
   std::map<uint32_t, const GGUFTensor*> pick;
