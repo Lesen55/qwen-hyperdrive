@@ -2553,6 +2553,30 @@ static __device__ __forceinline__ uint4 kv_read8h(const uint8_t* rec, int c) {
       op[k] = *(uint32_t*)&h;
     }
     return o;
+  } else if constexpr (KT == KV_Q3) {
+    // Lloyd-Max levels +-{0.2451, 0.7560, 1.3439, 2.1520} as f16, picked with byte permutes:
+    // field q (3 bits): q >= 4 -> +mag[q & 3], q < 4 -> -mag[(q & 3) ^ 3]
+    const uint32_t* w = (const uint32_t*)rec;
+    const int off = 16 + 3 * c, wi = off >> 2;
+    const uint32_t u = __funnelshift_r(w[wi], w[min(wi + 1, 27)], (off & 3) * 8);
+    const uint32_t nb2 = (~u >> 2) & 0x249249u;     // 1 where the field is negative (bit 2 clear)
+    const uint32_t x = u ^ (nb2 * 3);               // low two bits of each field = magnitude index
+    constexpr uint32_t T0 = 0x3a0c33d8u;            // f16(0.7560) << 16 | f16(0.2451)
+    constexpr uint32_t T1 = 0x404e3d60u;            // f16(2.1520) << 16 | f16(1.3439)
+    const __half r = ((const __half*)rec)[c >> 2];
+    const __half2 r2 = __halves2half2(r, r);
+    uint4 o;
+    uint32_t* op = (uint32_t*)&o;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+      const uint32_t m0 = (x >> (6 * k)) & 3, m1 = (x >> (6 * k + 3)) & 3;
+      const uint32_t sel = (m0 | (m1 << 8)) * 0x22u + 0x1010u;
+      uint32_t h = __byte_perm(T0, T1, sel);
+      h ^= ((nb2 >> (6 * k)) & 1) << 15 | ((nb2 >> (6 * k + 3)) & 1) << 31;
+      __half2 hv = __hmul2(*(__half2*)&h, r2);
+      op[k] = *(uint32_t*)&hv;
+    }
+    return o;
   } else {
     float v[8];
     kv_read8<KT>(rec, c, v);
@@ -2877,24 +2901,32 @@ __global__ void k_fa_prep_q(const float* __restrict__ q, int qhs, int qts, int n
 }
 
 template <int KT>
-__global__ void __launch_bounds__(128, 1)
+__global__ void __launch_bounds__(128, 2)  // Q in registers: 2 CTAs / SM overlap one's dequant with the other's MMA
     k_fa(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
          const __half* __restrict__ q16, float* __restrict__ out, int nh, int nkv, int pos0, int T,
          int recb, KVMap bs) {
   extern __shared__ __align__(16) unsigned char fa_smem[];
-  __half* Qs = (__half*)fa_smem;             // [64][FA_QLD]
-  __half* Ks = Qs + FA_BM * FA_QLD;          // [32][FA_QLD]
+  __half* Ks = (__half*)fa_smem;             // [32][FA_QLD]
   __half* Vs = Ks + FA_BN * FA_QLD;          // [32][FA_QLD] (row-major, read with ldmatrix.trans)
   const int h = blockIdx.y, kvh = h / (nh / nkv);
   const int row0 = blockIdx.x * FA_BM;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, tq = lane & 3;
 
-  for (int i = tid; i < FA_BM * (FA_D / 8); i += 128) {
-    const int r = i / (FA_D / 8), c = i % (FA_D / 8);
-    uint4 v = make_uint4(0, 0, 0, 0);
-    if (row0 + r < T) v = *(const uint4*)(q16 + ((size_t)(row0 + r) * nh + h) * FA_D + 8 * c);
-    *(uint4*)(Qs + r * FA_QLD + 8 * c) = v;
+  // Q fragments of this warp's 16 rows (16 k-steps x 4 regs), straight from global
+  uint32_t qa[16][4];
+  {
+    const int ra = row0 + warp * 16 + g, rb = ra + 8;
+    const bool va = ra < T, vb = rb < T;
+    const __half* qa_p = q16 + ((size_t)min(ra, T - 1) * nh + h) * FA_D + tq * 2;
+    const __half* qb_p = q16 + ((size_t)min(rb, T - 1) * nh + h) * FA_D + tq * 2;
+#pragma unroll
+    for (int kk = 0; kk < 16; kk++) {
+      qa[kk][0] = va ? *(const uint32_t*)(qa_p + kk * 16) : 0u;
+      qa[kk][1] = vb ? *(const uint32_t*)(qb_p + kk * 16) : 0u;
+      qa[kk][2] = va ? *(const uint32_t*)(qa_p + kk * 16 + 8) : 0u;
+      qa[kk][3] = vb ? *(const uint32_t*)(qb_p + kk * 16 + 8) : 0u;
+    }
   }
 
   float o[32][4];
@@ -2960,16 +2992,10 @@ __global__ void __launch_bounds__(128, 1)
 #pragma unroll
       for (int k4 = 0; k4 < 4; k4++) {
         const int kk = kc * 4 + k4;
-        uint32_t a[4];
-        const __half* qa = Qs + (warp * 16 + g) * FA_QLD + kk * 16 + tq * 2;
-        a[0] = *(const uint32_t*)(qa);
-        a[1] = *(const uint32_t*)(qa + 8 * FA_QLD);
-        a[2] = *(const uint32_t*)(qa + 8);
-        a[3] = *(const uint32_t*)(qa + 8 * FA_QLD + 8);
 #pragma unroll
         for (int nt = 0; nt < 4; nt++) {
           const __half* kb = Ks + (nt * 8 + g) * FA_QLD + kk * 16 + tq * 2;
-          mma16816_h(hc[nt], a, *(const uint32_t*)kb, *(const uint32_t*)(kb + 8));
+          mma16816_h(hc[nt], qa[kk], *(const uint32_t*)kb, *(const uint32_t*)(kb + 8));
         }
       }
 #pragma unroll
@@ -3230,7 +3256,7 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   QE_ASSERT(hd == FA_D);
   __half* q16 = (__half*)work;
   const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
-  const size_t sh = ((size_t)(FA_BM + 2 * FA_BN) * FA_QLD) * sizeof(__half) +
+  const size_t sh = ((size_t)(2 * FA_BN) * FA_QLD) * sizeof(__half) +
                     (kvtype == KV_Q4 ? (size_t)2 * 2 * FA_BN * 144 : kvtype == KV_Q3 ? (size_t)2 * 2 * FA_BN * 112 : 0);
   const float sl2 = scale * 1.4426950408889634f;
   const dim3 grid(cdiv(T, FA_BM), nh);
@@ -3272,14 +3298,15 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
 constexpr int AD_BN = 32;
 constexpr int AD_QLD = FA_D + 8;
 
-template <int KT>
-__global__ void __launch_bounds__(128, 1)
+template <int KT, int MT>  // MT m-tiles of 16 query rows (G*T <= 16*MT), 2*MT warps
+__global__ void __launch_bounds__(64 * MT, 1)
     k_attn_dec_mma(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
                    const float* __restrict__ q, int qhs, int qts, int nh, int nkv, int pos0, int T,
                    float scale_log2, float* __restrict__ work, KVMap bs, int recb, int split) {
   extern __shared__ __align__(16) unsigned char ad_smem[];
-  __half* Qs = (__half*)ad_smem;          // [32][AD_QLD]
-  __half* Ks = Qs + 32 * AD_QLD;          // [64][AD_QLD]
+  constexpr int NTH = 64 * MT, NR = 16 * MT;
+  __half* Qs = (__half*)ad_smem;          // [NR][AD_QLD]
+  __half* Ks = Qs + NR * AD_QLD;          // [32][AD_QLD]
   __half* Vs = Ks + AD_BN * AD_QLD;       // [32][AD_QLD] row-major (ldmatrix.trans)
   uint8_t* raw = (uint8_t*)(Vs + AD_BN * AD_QLD);  // Q4: [stage][K|V][32 records] (cp.async prefetch)
   const int G = nh / nkv, NQ = G * T;
@@ -3290,7 +3317,7 @@ __global__ void __launch_bounds__(128, 1)
   const int pend = min(p_begin + split, pos0 + T) - 1;
 
   // queries: rotate (quantized caches), scale by softmax scale * log2(e), f16
-  for (int qi = warp; qi < 32; qi += 4) {
+  for (int qi = warp; qi < NR; qi += 2 * MT) {
     float x[8];
     if (qi < NQ) {
       const int t = qi / G, gg = qi % G;
@@ -3308,7 +3335,7 @@ __global__ void __launch_bounds__(128, 1)
     *(uint4*)(Qs + qi * AD_QLD + 8 * lane) = pk;
   }
 
-  const int mt = warp & 1, ph = warp >> 1;
+  const int mt = warp % MT, ph = warp / MT;
   const bool active = mt * 16 < NQ;
   const int r_lo = mt * 16 + g, r_hi = r_lo + 8;
   const int lim_lo = r_lo < NQ ? pos0 + r_lo / G : -1;
@@ -3325,7 +3352,7 @@ __global__ void __launch_bounds__(128, 1)
   constexpr int RAWB = AD_BN * RECB;
   auto issue = [&](int kt, int st) {
     const int nch = min(AD_BN, pend - kt + 1) * (RECB / 16);
-    for (int i = tid; i < nch; i += 128) {
+    for (int i = tid; i < nch; i += NTH) {
       cp_async16(raw + (st * 2 + 0) * RAWB + i * 16, kb + (size_t)kt * recb + i * 16);
       cp_async16(raw + (st * 2 + 1) * RAWB + i * 16, vb + (size_t)kt * recb + i * 16);
     }
@@ -3340,7 +3367,7 @@ __global__ void __launch_bounds__(128, 1)
       cp_async_wait<1>();
     }
     __syncthreads();
-    for (int i = tid; i < AD_BN * (FA_D / 8); i += 128) {
+    for (int i = tid; i < AD_BN * (FA_D / 8); i += NTH) {
       const int pi = i % AD_BN, c = i / AD_BN;
       const int p = kt + pi;
       uint4 pkk = make_uint4(0, 0, 0, 0), pkv = make_uint4(0, 0, 0, 0);
@@ -3432,7 +3459,7 @@ __global__ void __launch_bounds__(128, 1)
   // merge the two position halves of each m-tile (through shared memory), write the partials
   __syncthreads();
   float* xm = (float*)Ks;  // [mt][16 rows][2]  m, l
-  float* xo = xm + 2 * 16 * 2;  // [mt][16 rows][256]
+  float* xo = xm + MT * 16 * 2;  // [mt][16 rows][256]
   if (active && ph == 1) {
     if (tq == 0) {
       xm[(mt * 16 + g) * 2 + 0] = m0; xm[(mt * 16 + g) * 2 + 1] = l0;
@@ -3495,28 +3522,38 @@ size_t attn_decode_work_bytes_auto(int max_ctx, int nh, int nkv, int hd, int tok
 void attn_decode_mma(int kvtype, const void* kcache, const void* vcache, const float* q, int qhs, int qts,
                      float* out, int nh, int nkv, int hd, int pos0, int T, float scale, float* work,
                      size_t work_bytes, KVMap bs, cudaStream_t s) {
-  QE_ASSERT(hd == FA_D && nh / nkv * T <= 32);
+  QE_ASSERT(hd == FA_D && nh / nkv * T <= 48);
   const int L = pos0 + T;
   const int split = mma_split(L, nkv);
   const int nsplit = (L + split - 1) / split;
   QE_ASSERT((size_t)nsplit * nh * T * 258 * sizeof(float) <= work_bytes);
   const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
-  const size_t sh = ((size_t)(32 + 2 * AD_BN) * AD_QLD) * sizeof(__half) +
+  const int NQ = nh / nkv * T;
+  const int MT = NQ > 32 ? 3 : 2;
+  // Q rows + K/V tiles + raw staging; the end-of-kernel merge reuses everything after Q
+  const size_t sh_tile = ((size_t)(16 * MT + 2 * AD_BN) * AD_QLD) * sizeof(__half) +
                     (kvtype == KV_Q4 ? (size_t)2 * 2 * AD_BN * 144 : kvtype == KV_Q3 ? (size_t)2 * 2 * AD_BN * 112 : 0);
+  const size_t sh_merge = (size_t)16 * MT * AD_QLD * sizeof(__half) + (size_t)MT * 16 * (2 + 256) * sizeof(float);
+  const size_t sh = std::max(sh_tile, sh_merge);
   const float sl2 = scale * 1.4426950408889634f;
   const dim3 grid(nkv, nsplit);
   const uint8_t* kc = (const uint8_t*)kcache;
   const uint8_t* vc = (const uint8_t*)vcache;
-  const int NQ = nh / nkv * T;
   switch (kvtype) {
 #define CASE(KT)                                                                                                       \
   case KT: {                                                                                                           \
     static bool init = false;                                                                                          \
     if (!init) {                                                                                                       \
-      CUDA_CHECK(cudaFuncSetAttribute(k_attn_dec_mma<KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh));      \
+      const int mx = (int)std::max((size_t)(48 + 2 * AD_BN) * AD_QLD * 2 + 2 * 2 * AD_BN * 144,                       \
+                                   (size_t)48 * AD_QLD * 2 + 48 * (2 + 256) * 4);                                       \
+      CUDA_CHECK(cudaFuncSetAttribute(k_attn_dec_mma<KT, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, mx));        \
+      CUDA_CHECK(cudaFuncSetAttribute(k_attn_dec_mma<KT, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, mx));        \
       init = true;                                                                                                     \
     }                                                                                                                  \
-    k_attn_dec_mma<KT><<<grid, 128, sh, s>>>(kc, vc, q, qhs, qts, nh, nkv, pos0, T, sl2, work, bs, recb, split);       \
+    if (MT == 2)                                                                                                       \
+      k_attn_dec_mma<KT, 2><<<grid, 128, sh, s>>>(kc, vc, q, qhs, qts, nh, nkv, pos0, T, sl2, work, bs, recb, split);  \
+    else                                                                                                               \
+      k_attn_dec_mma<KT, 3><<<grid, 192, sh, s>>>(kc, vc, q, qhs, qts, nh, nkv, pos0, T, sl2, work, bs, recb, split);  \
     k_attn_combine<KT><<<nkv * NQ, 256, 0, s>>>(work, out, nh, nkv, T, NQ, pos0, split);                              \
     break;                                                                                                             \
   }

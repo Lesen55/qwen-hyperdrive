@@ -381,7 +381,7 @@ void Model::plan_and_load() {
   w16_elems_ = 48ull * MiB;                    // f16 dequant buffer for GEMM (96 MiB)
   ws += w16_elems_ * 2;
   ws += (size_t)T * maxw * 2;                  // c16 (fp16 GEMM output)
-  const int attT = 4;  // attn_decode handles T <= 4 (verify passes); larger T uses the prefill FA kernel
+  const int attT = attn_dec_T();  // attn_decode handles verify passes up to this; larger T: prefill FA kernel
   attn_work_bytes_ = qk::attn_decode_work_bytes_auto(opt_.ctx, c.n_head, c.n_kv, c.hd, attT);
   ws += attn_work_bytes_;
   ws += (size_t)kCpuMaxB * c.n_embd * 4;
@@ -1079,7 +1079,7 @@ void Model::layer_attn(int il, int T, int pos0) {
   qk::kv_store(opt_.kv_type, L.kcache, L.vcache, k, v, pos_dev_, c.n_kv, c.hd, T, kvw, kvw, kvmap(), s);
   float* o = t2_;
   const float scale = 1.f / std::sqrt((float)c.hd);
-  const int attT = 4;  // attn_decode handles T <= 4 (verify passes); larger T uses the prefill FA kernel
+  const int attT = attn_dec_T();  // attn_decode handles verify passes up to this; larger T: prefill FA kernel
   if (T <= attT && !getenv("QE_FORCE_FA")) {
     qk::attn_decode(opt_.kv_type, L.kcache, L.vcache, qg, 2 * c.hd, qw, o, c.n_head, c.n_kv, c.hd, pos0, T,
                     scale, attn_work_, attn_work_bytes_, kvmap(), s);

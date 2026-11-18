@@ -7,6 +7,8 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 #include "common.h"
@@ -98,6 +100,12 @@ class Model : public IModel {
   int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr) override;
   int draft_max() const override { return spec_ ? opt_.draft_max : 0; }
   bool spec_ = true;  // verify passes with rollback (MTP or n-gram drafts)
+  // tokens per decode-attention launch: G*T query rows <= 48 (3 m-tiles), at most 8; the SIMT kernel
+  // (QE_ATT=0) handles 4
+  int attn_dec_T() const {
+    static const bool simt = getenv("QE_ATT") && atoi(getenv("QE_ATT")) == 0;
+    return simt ? 4 : std::clamp(48 / std::max(1, cfg_.n_head / cfg_.n_kv), 1, 8);
+  }
   bool rope_table_ = false;  // RoPE from the (YaRN) frequency table
   bool state_save() override;
   void state_restore() override;
