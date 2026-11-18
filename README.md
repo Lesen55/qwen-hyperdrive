@@ -4,6 +4,8 @@
 
 `Huihui-Qwen3.8-27B-abliterated-GSQ-RCO-IQ3_XXS-mtp.gguf` を、このPC（RTX 3080 10GB + Ryzen 5 5600X + DDR4 32GB）で
 **128K (131072) トークンのコンテキスト**を確保したまま実用速度で動かすために、C++/CUDA でゼロから書いた推論エンジンです。
+今は Qwen3.5 / 3.8 系の GGUF 全般に対応し、NVIDIA 向けの CUDA バックエンドに加えて、AMD Radeon / Intel Arc なども動く Vulkan バックエンドを持ちます
+（Intel Arc 130V の実機で調整済み、[対応範囲](#対応範囲)）。
 既存エンジンのラッパーではありません（llama.cpp は精度・速度比較用のリファレンスとしてのみ flake に入っています）。
 
 ## 結果（128K コンテキスト設定、同一マシン、hazkey-server 停止時）
@@ -150,6 +152,18 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 開発: `nix develop` → `cmake -S . -B build -G Ninja && ninja -C build`。
 CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）。
 
+Vulkan（AMD / Intel など）:
+
+```sh
+nix build .#vulkan -o hd                     # CUDA を含まないパッケージ
+LLM_ENGINE_BACKEND=vulkan ./hd/bin/llm-engine -m model.gguf --port 8080
+./hd/bin/vk-device-report model.gguf ./hd/bin   # 自動調整 + 単体テスト + 速度の報告を 1 ファイルに
+# 開発（CUDA をダウンロードしない）: nix develop .#vulkan → cmake -DQE_CUDA=OFF -DQE_VULKAN=ON
+```
+
+主な環境変数: `QE_VK_DEVICE`（GPU 番号）、`QE_VK_RETUNE=1`（自動調整のやり直し）、`QE_VK_PROF=1`（シェーダーごとの GPU 時間）、
+`QE_VK_HYBRID=0/1`（ユニファイドメモリでの CPU/GPU 同時実行）、`QE_CPU_ISA=avx2/vnni/avx512`（CPU カーネル）。
+
 ## 設計
 
 ハードの実測値（`tools/hwprobe.cu`）: DRAM 読み出し 46 GB/s、PCIe H2D 25.6 GB/s、GPU DRAM 703 GB/s。
@@ -182,7 +196,9 @@ CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）
 |---|---|
 | `scripts/check_dequant.py` | 全量子化型の逆量子化を gguf-py と照合（ビット一致） |
 | `qe_test_kernels` | GPU matvec / f16 展開を参照実装と照合（全 12 型, B=1..8） |
-| `qe_test_cpu` | CPU AVX2 matvec の照合と型別スループット |
+| `qe_test_cpu` | CPU matvec（AVX2 / AVX-VNNI / AVX-512 VNNI、`QE_CPU_ISA` で切替）の照合と型別スループット |
+| `qe_vk_test` | Vulkan シェーダーの照合（全 17 型の逆量子化はビット一致、matvec / GEMM / 協調カーネル）。`QE_VK_TEST_BENCH=1` でバッチ幅ごとの速度とメモリ帯域 |
+| `vk-device-report` | 対象 GPU で自動調整・単体テスト・デコード / プリフィル速度・シェーダー別時間を測ってファイルにまとめる |
 | `qe_bench_attn` | 128K KV に対するデコード/プリフィル・アテンションの速度 |
 | `qe_tokenize` | トークナイズ/デコード（llama-tokenize との突き合わせ用） |
 | `QE_DEBUG_SUMS=1` | 層ごとの中間テンソルを llama.cpp の eval-callback と同形式で出力 |
@@ -193,7 +209,10 @@ CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）
 
 ## 制限
 
-- 対象アーキテクチャは `qwen35`（Qwen3.5/3.8 系 dense ハイブリッド）のみ。ハード定数（sm_86, AVX2）に最適化。
+- 対象アーキテクチャは `qwen35`（Qwen3.5/3.8 系 dense ハイブリッド、注意ヘッド次元 256・DeltaNet 状態 128）のみ。
+- 動作環境は Linux（x86-64-v3 以上）のみ。
+- Vulkan 版は CPU への FFN 分担（ストリーミング + CPU 計算）を持たない。ただしユニファイドメモリでの同時実行はある。KV は q8 / f16 のみ。
+- RX 7900 XTX など AMD GPU は、仕組み（判別・自動調整）だけで実機未確認。
 - 同時処理は 1 リクエスト（サーバーは直列化、WebUI は順番待ち中に「待機中」と表示）。
 - プリフィルは FlashAttention と GEMM 律速。128K の一括投入には約 3.5 分かかります（会話の続きはプロンプトキャッシュで差分のみ）。
 - VRAM の空きが減るとストリーミング量が増えて遅くなります（例: hazkey-server が約 0.8 GB 使用中。止めればその分常駐が増えます）。
