@@ -726,6 +726,9 @@ void Model::plan_and_load() {
   carve(ws_small_, qk::kMaxB, false);
   select_ws(true);
   hsafe_ = (float*)dalloc((size_t)qk::kMaxB * c.n_embd * 4);
+  // per-256 activations of the tensor-core small-batch matvec (verify passes)
+  xq256_ = (int8_t*)dalloc((size_t)qk::kMaxB * kTqMaxK);
+  xd256_ = (float*)dalloc((size_t)qk::kMaxB * (kTqMaxK / 256) * 4);
   if (spec_ && !getenv("QE_NO_BATCH_RB")) {
     std::vector<qk::GdnBatch> tab;
     for (auto& L : layers_)
@@ -973,7 +976,7 @@ void Model::prepare_input(const float* x, int K, int T, cudaStream_t s, int fmt)
   if (prepared_ == x && prepared_K_ == K && prepared_T_ == T) return;
   if (T <= qk::kMaxB || mmq_gs_ == 32) qk::quantize_q8(x, xq_, xd_, K, T, s);
   else qk::quantize_q8_256(x, xq_, xd_, K, T, s);
-  prepared_ = x;
+  prep256_ = nullptr; prepared_ = x;
   prepared_K_ = K;
   prepared_T_ = T;
 }
@@ -983,6 +986,14 @@ void Model::linear(Layer* L, Mat& m, const float* x, int T, float* y, int ldy, b
   const void* W = mat_ptr(L, m, s);
   const bool is_float = m.type == QT_F32 || m.type == QT_F16 || m.type == QT_BF16;
   if (T <= qk::kMaxB) {
+    if (!is_float && use_tq(m, T)) {
+      if (prep256_ != x || prep256_K_ != m.K || prep256_T_ != T) {
+        qk::quantize_q8_256(x, xq256_, xd256_, m.K, T, s);
+        prep256_ = x; prep256_K_ = m.K; prep256_T_ = T;
+      }
+      qk::matvec_tq(m.type, W, m.row_bytes, m.K, m.N, xq256_, xd256_, T, y, ldy, acc, s);
+      return;
+    }
     if (!is_float) prepare_input(x, m.K, T, s);
     qk::matvec(m.type, W, m.row_bytes, m.K, m.N, xq_, xd_, x, T, y, ldy, acc, s);
     return;
@@ -1099,10 +1110,10 @@ void Model::layer_attn(int il, int T, int pos0) {
   }
   if (fuse_ && T <= qk::kMaxB) {
     qk::gate_sigmoid(o, qg, c.hd, c.n_head, T, s, nullptr, xq_, xd_);
-    prepared_ = o; prepared_K_ = c.n_head * c.hd; prepared_T_ = T; prep16_ = nullptr; gqp_ = nullptr;
+    prep256_ = nullptr; prepared_ = o; prepared_K_ = c.n_head * c.hd; prepared_T_ = T; prep16_ = nullptr; gqp_ = nullptr;
   } else {
     qk::gate_sigmoid(o, qg, c.hd, c.n_head, T, s);
-    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+    prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   }
   linear(&L, L.wo, o, T, t4_, c.n_embd, false, s);
   residual(t4_, T);
@@ -1116,11 +1127,11 @@ void Model::norm_in(const float* w, float* y, int T, bool quant) {
     if (fuse_ && T <= qk::kMaxB) {
       qk::add_rmsnorm_q8(mhc_branch_, nullptr, w, y, c.n_embd, T, c.eps, quant ? xq_ : nullptr, quant ? xd_ : nullptr, stream_);
       prep16_ = nullptr; gqp_ = nullptr;
-      if (quant) { prepared_ = y; prepared_K_ = c.n_embd; prepared_T_ = T; }
-      else prepared_ = nullptr;
+      if (quant) { prep256_ = nullptr; prepared_ = y; prepared_K_ = c.n_embd; prepared_T_ = T; }
+      else prep256_ = nullptr; prepared_ = nullptr;
     } else {
       qk::rmsnorm(mhc_branch_, w, y, c.n_embd, T, c.eps, stream_);
-      prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+      prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
     }
     return;
   }
@@ -1128,13 +1139,13 @@ void Model::norm_in(const float* w, float* y, int T, bool quant) {
     qk::add_rmsnorm_q8(x_, pend_, w, y, c.n_embd, T, c.eps, quant ? xq_ : nullptr, quant ? xd_ : nullptr, stream_);
     pend_ = nullptr;
     prep16_ = nullptr; gqp_ = nullptr;
-    if (quant) { prepared_ = y; prepared_K_ = c.n_embd; prepared_T_ = T; }
-    else prepared_ = nullptr;
+    if (quant) { prep256_ = nullptr; prepared_ = y; prepared_K_ = c.n_embd; prepared_T_ = T; }
+    else prep256_ = nullptr; prepared_ = nullptr;
     return;
   }
   if (pend_) { qk::add_inplace(x_, pend_, (int64_t)T * c.n_embd, stream_); pend_ = nullptr; }
   qk::rmsnorm(x_, w, y, c.n_embd, T, c.eps, stream_);
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
 }
 void Model::residual(const float* src, int T) {
   if (mhc_on_) { mhc_out_ = src; return; }  // merged into the streams by the caller
@@ -1193,8 +1204,8 @@ void Model::layer_gdn(int il, int T) {
   }
   qe_debug_dump("final_output", il, o, T, c.d_inner, s);
   prep16_ = nullptr; gqp_ = nullptr;
-  if (fuse_ && T <= qk::kMaxB && c.dv % 32 == 0) { prepared_ = o; prepared_K_ = c.d_inner; prepared_T_ = T; }  // quantized by gated_norm
-  else prepared_ = nullptr;
+  if (fuse_ && T <= qk::kMaxB && c.dv % 32 == 0) { prep256_ = nullptr; prepared_ = o; prepared_K_ = c.d_inner; prepared_T_ = T; }  // quantized by gated_norm
+  else prep256_ = nullptr; prepared_ = nullptr;
   linear(&L, L.wssm_out, o, T, t4_, c.n_embd, false, s);
   qe_debug_dump("linear_attn_out", il, t4_, T, c.n_embd, s);
   residual(t4_, T);
@@ -1211,10 +1222,10 @@ void Model::layer_ffn(int il, int T) {
     linear(&L, L.ffn_up, xn_, T, t1_, c.n_ff, false, s);
     if (fuse_ && T <= qk::kMaxB && c.n_ff % 32 == 0) {
       qk::silu_mul_q8(t0_, t1_, t0_, (int64_t)T * c.n_ff, xq_, xd_, s);
-      prepared_ = t0_; prepared_K_ = c.n_ff; prepared_T_ = T; prep16_ = nullptr; gqp_ = nullptr;
+      prep256_ = nullptr; prepared_ = t0_; prepared_K_ = c.n_ff; prepared_T_ = T; prep16_ = nullptr; gqp_ = nullptr;
     } else {
       qk::silu_mul(t0_, t1_, t0_, (int64_t)T * c.n_ff, s);
-      prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+      prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
     }
     linear(&L, L.ffn_down, t0_, T, t4_, c.n_embd, false, s);
     residual(t4_, T);
@@ -1240,14 +1251,14 @@ void Model::layer_ffn(int il, int T) {
     linear(&L, L.gate_c, xn_, T, hc, r, false, s);
     linear(&L, L.up_c, xn_, T, uc, r, false, s);
     qk::silu_mul(hc, uc, hc, (int64_t)T * r, s);
-    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+    prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
     linear(&L, L.down_c, hc, T, t4_, c.n_embd, false, s);
     if (Ng > 0) {
-      prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+      prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
       linear(&L, L.down_g, hg, T, t4_, c.n_embd, true, s);
     }
   } else {
-    prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+    prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
     if (Ng > 0) linear(&L, L.down_g, hg, T, t4_, c.n_embd, false, s);
     else CUDA_CHECK(cudaMemsetAsync(t4_, 0, (size_t)T * c.n_embd * 4, s));
   }
@@ -1360,7 +1371,7 @@ void Model::mtp_block(const float* hrows, const int* tokens, int T, int pos0) {
   float* cat = t0_;  // [T][2*n_embd]
   CUDA_CHECK(cudaMemcpy2DAsync(cat, 2 * c.n_embd * 4, e, c.n_embd * 4, c.n_embd * 4, T, cudaMemcpyDeviceToDevice, s));
   CUDA_CHECK(cudaMemcpy2DAsync(cat + c.n_embd, 2 * c.n_embd * 4, hn, c.n_embd * 4, c.n_embd * 4, T, cudaMemcpyDeviceToDevice, s));
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   linear(&L, L.eh_proj, cat, T, x_, c.n_embd, false, s);
   const bool snap_save = snapshot_;
   snapshot_ = false;
@@ -1427,7 +1438,7 @@ int Model::mtp_finish(int n, float* conf, float* logits_host) {
   const Config& c = cfg_;
   // keep the normed MTP output of the last row for chaining
   CUDA_CHECK(cudaMemcpyAsync(mtp_h_, xn_ + (size_t)(n - 1) * c.n_embd, (size_t)c.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   const float* hrow = xn_ + (size_t)(n - 1) * c.n_embd;
   const bool sub = !dv_host_.empty() && output_.dev;
   const int nl = sub ? (int)dv_host_.size() : c.n_vocab;
@@ -1804,7 +1815,7 @@ void Model::select_ws(bool big) {
   x_ = w.x; xn_ = w.xn; t0_ = w.t0; t1_ = w.t1; t2_ = w.t2; t3_ = w.t3; t4_ = w.t4;
   g_ = w.g; beta_ = w.beta; xq_ = w.xq; xd_ = w.xd; hid_ = w.hid;
   if (big) { a16_ = w.a16; c16_ = w.c16; w16_ = w.w16; fa_work_ = w.fa; }
-  prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+  prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
   ws_is_big_ = big;
 }
 
@@ -2067,7 +2078,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     if ((logits || argmax) && r_begin < r_end) {
       for (int r = r_begin; r < r_end; r += qk::kMaxB) {
         const int nb = std::min(qk::kMaxB, r_end - r);
-        prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+        prep256_ = nullptr; prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
         linear(nullptr, output_, hid_ + (size_t)(r - b0) * c.n_embd, nb, logits_dev_, c.n_vocab, false, stream_);
         if (r + nb == n) {
           qe_debug_dump("result_norm", -1, hid_ + (size_t)(r + nb - 1 - b0) * c.n_embd, 1, c.n_embd, stream_);
