@@ -1,11 +1,13 @@
-# Benchmark (2026-11-18, NVIDIA GeForce RTX 3080, ctx 131072)
+# Benchmark (short context 2026-11-19, long context 2026-11-18; NVIDIA GeForce RTX 3080, ctx 131072)
 
 ## Short-context decode (tok/s; 500 generated tokens; prompts: ja / story / code; greedy + temp 0.7 x 3 seeds)
 
 | config | max | mean | min |
 |---|---|---|---|
-| 速度優先 (`--kv q3 --spec-relax 2 --skip-ffn 29,10`) | 103.4 | 71.9 | 57.8 |
-| 厳密 (q4 KV, exact sampling) | 104.9 | 69.7 | 49.7 |
+| 速度優先 (`--kv q3 --spec-relax 2 --skip-ffn 29,10`) | 107.2 | 76.0 | 57.0 |
+| 厳密 (q4 KV, exact sampling) | 105.2 | 70.0 | 51.9 |
+
+Raw (ja x4, story x4, code x4; greedy, temp 0.7 seeds 1-3): speed 57.03 60.43 62.02 66.17 / 58.54 60.15 63.48 69.03 / 103.17 105.21 99.14 107.16; exact 59.34 57.46 55.01 52.18 / 55.55 58.50 51.93 53.70 / 99.24 97.21 105.20 95.22.
 
 ## Prefill and long-context decode (速度優先 config, temp 0.7, 200 generated tokens)
 
