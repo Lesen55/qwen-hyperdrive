@@ -80,6 +80,8 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   gguf_ = std::make_unique<GGUFFile>(opt.model_path);
   cfg_ = load_qwen35_config(*gguf_);
   const Config& c = cfg_;
+  if (c.mhc_streams || c.rope_mscale != 1.f)
+    QE_FATAL("%s (looped blocks / mHC residual streams / YaRN) runs on the CUDA backend only for now", c.arch.c_str());
   if (c.n_head / c.n_kv > 32) QE_FATAL("vulkan backend: GQA group of %d heads > 32", c.n_head / c.n_kv);
   vk_ = std::make_unique<VkCtx>();
   const size_t MiB = 1 << 20;

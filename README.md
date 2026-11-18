@@ -51,8 +51,11 @@
 | GPU（Vulkan） | Vulkan 1.2 の GPU なら何でも: AMD Radeon（RADV / AMDVLK）、Intel Arc（ANV）、NVIDIA など。必要なのはバッファデバイスアドレス、8 レーン以上のサブグループ（算術・クラスタ演算）、32 KiB の共有メモリだけ。`VK_KHR_cooperative_matrix` があればプリフィルの行列積を行列演算器（RDNA3 WMMA / Arc XMX / Tensor Core）で行う（起動時に自己テストし、合わなければスカラーに戻る） |
 | CPU | x86-64-v3（AVX2 / FMA / F16C / BMI2）が最低限。CPU カーネルは AVX2・AVX-VNNI・AVX-512 VNNI 版を同梱し、起動時に CPU を判定して選ぶ（`[hw] CPU kernels: ...`、`QE_CPU_ISA=avx2/vnni/avx512` で指定）。スレッドは物理コアごとに 1 本、Intel のハイブリッド CPU では P コア優先で配置する。物理コア数・PCIe 帯域・DRAM 帯域は起動時に実測して CPU/GPU 分担に使う（`-t` / `--pcie-gbps` で上書き可）。手元向けに最適化するビルドは `cmake -DQE_NATIVE=ON`（`-march=native`） |
 
+| ループモデル | `sensenova_loop`（[SenseNova-Loop-9B GGUF](https://huggingface.co/guideboardlabs/SenseNova-Loop-9B-GGUF)、CUDA のみ）: 32 層中 24 層を 2 回通す 56 段の実行（2 回目は 1 回目の重みを共有し VRAM は 1 回分、DeltaNet 状態と KV は実行位置ごと）、2 本の残差ストリームと各サブレイヤーのルーター（mHC: RMS → 8 ロジット → 入力ゲート / 出力ゲート / Sinkhorn 20 回の 2×2 混合）、YaRN RoPE。MTP が無いので n-gram 投機デコードで高速化 |
+
 検証済み: Huihui-Qwen3.8-27B IQ3_XXS-mtp（10 GB に収まらないためストリーミング + CPU 併用）、Qwen3.5-9B Q4_K_M MTP（全層 VRAM 常駐）。
 Qwen3.5-9B Q4_K_M（RTX 3080）: 短い文脈のデコード 141〜259 tok/s、32K プリフィル 9.7 秒（3376 tok/s）。
+SenseNova-Loop-9B Q4_K_M（RTX 3080、CUDA）: デコード 57 tok/s（56 段ぶんの重みを毎トークン読む）、n-gram 投機込みでコードの書き換え 75 tok/s・サーバーの会話 64〜65 tok/s、プリフィル 400〜1200 tok/s。ループ 2 回目を外すと PPL が 8.4 → 17.7、最後の 4 層を外すと 481 になることで構造の正しさを確認（参照実装 GuideboardLabs/llama.cpp-sensenova-loop の route / merge と一致させた実装）。
 
 ### Vulkan バックエンド
 

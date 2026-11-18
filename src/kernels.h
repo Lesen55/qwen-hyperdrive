@@ -163,4 +163,11 @@ void topk_rows(const float* logits, int n, int rows, int k, int* ids, float* val
                cudaStream_t s);
 size_t topk_work_bytes(int n, int rows);
 
+// RoPE frequency table (YaRN): angle of pair i = pos * freq[i], cos / sin scaled by mscale
+void set_rope_table(const double* freq, int half, float mscale);
+// sensenova_loop residual streams (2-stream mHC router / merge / leave)
+void mhc_route(const float* a, const float* b, const float* w, const float* bias, int d, int T, float* branch, float* pk,
+               cudaStream_t s);
+void mhc_merge(float* a, float* b, const float* x, const float* pk, int d, int T, cudaStream_t s);
+void mhc_leave(float* y, const float* a, const float* b, int64_t n, cudaStream_t s);
 }  // namespace qk

@@ -61,9 +61,7 @@ static void qe_debug_dump(const char* nm, int il, const float* p, int T, int W, 
 Model::Model(const EngineOptions& opt) : opt_(opt) {
   g_verbose = opt.verbose;
   gguf_ = std::make_unique<GGUFFile>(opt.model_path);
-  if (gguf_->get_str("general.architecture", "") != "qwen35")
-    QE_FATAL("unsupported architecture '%s' (need qwen35)", gguf_->get_str("general.architecture", "").c_str());
-  load_config();
+  load_config();  // checks the architecture
   // don't burn a CPU core spinning in cudaStreamSynchronize: the cores belong to the CPU FFN pool.
   // Must be set before the primary context is created (i.e. before cudaSetDevice on CUDA 12+).
   if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) {
@@ -319,6 +317,10 @@ void Model::plan_and_load() {
   for (int il = 0; il < nL; il++) {
     Layer& L = layers_[il];
     L.attn = c.is_attn(il);
+    if (c.aliased(il)) {  // second visit of a loop: takes the first visit's weights after planning
+      L.ffn_skip = true;  // (keeps the planner from placing / streaming an FFN it does not own)
+      continue;
+    }
     if (L.attn) {
       L.wq = make_mat(bn(il, "attn_q.weight"));
       L.wk = make_mat(bn(il, "attn_k.weight"));
@@ -354,7 +356,9 @@ void Model::plan_and_load() {
   const int n_gdn = nL - n_attn;
   state16_ = !getenv("QE_STATE16") || atoi(getenv("QE_STATE16")) != 0;  // fp16 state by default (PPL +0.06% in decode)
   size_t ssm_bytes = (size_t)n_gdn * (state_bytes() + 3 * (size_t)c.conv_dim() * 4);
-  if (has_mtp()) {
+  // speculative verify passes (MTP or n-gram drafts): keep their recurrence inputs for rollback
+  spec_ = !getenv("QE_NO_SPEC");
+  if (spec_) {
     opt_.draft_max = std::clamp(opt_.draft_max, 1, qk::kMaxB - 1);
     // saved recurrence inputs of the verified tokens (the accepted prefix is recomputed in place after
     // verification, so no second copy of the state is needed); legacy fp16-GEMM mode keeps a backup
@@ -634,29 +638,55 @@ void Model::plan_and_load() {
   output_norm_ = upload_f32("output_norm.weight");
   for (int il = 0; il < nL; il++) {
     Layer& L = layers_[il];
-    L.attn_norm = upload_f32(bn(il, "attn_norm.weight"));
-    L.post_norm = upload_f32(bn(il, "post_attention_norm.weight"));
+    const bool al = c.aliased(il);  // weights come from the first loop visit (below)
+    if (!al) {
+      L.attn_norm = upload_f32(bn(il, "attn_norm.weight"));
+      L.post_norm = upload_f32(bn(il, "post_attention_norm.weight"));
+      if (c.mhc(il)) {
+        L.mhc_attn_w = upload_f32(bn(il, "mhc_attn.weight"));
+        L.mhc_attn_b = upload_f32(bn(il, "mhc_attn.bias"));
+        L.mhc_ffn_w = upload_f32(bn(il, "mhc_ffn.weight"));
+        L.mhc_ffn_b = upload_f32(bn(il, "mhc_ffn.bias"));
+      }
+    }
     if (L.attn) {
-      L.q_norm = upload_f32(bn(il, "attn_q_norm.weight"));
-      L.k_norm = upload_f32(bn(il, "attn_k_norm.weight"));
+      if (!al) {
+        L.q_norm = upload_f32(bn(il, "attn_q_norm.weight"));
+        L.k_norm = upload_f32(bn(il, "attn_k_norm.weight"));
+      }
       L.kcache = kv_pool_ + (size_t)(2 * attn_idx) * c.n_kv * qk::KV_BLOCK * recb;
       L.vcache = kv_pool_ + (size_t)(2 * attn_idx + 1) * c.n_kv * qk::KV_BLOCK * recb;
       attn_idx++;
     } else {
-      L.conv_w = upload_f32(bn(il, "ssm_conv1d.weight"));
-      L.dt_bias = upload_f32(bn(il, "ssm_dt.bias"));
-      L.ssm_a = upload_f32(bn(il, "ssm_a"));
-      L.ssm_norm = upload_f32(bn(il, "ssm_norm.weight"));
+      if (!al) {
+        L.conv_w = upload_f32(bn(il, "ssm_conv1d.weight"));
+        L.dt_bias = upload_f32(bn(il, "ssm_dt.bias"));
+        L.ssm_a = upload_f32(bn(il, "ssm_a"));
+        L.ssm_norm = upload_f32(bn(il, "ssm_norm.weight"));
+      }
       L.conv_state = (float*)dalloc(3 * (size_t)c.conv_dim() * 4);
       L.ssm_state = (float*)dalloc(state_bytes());
       L.gdn_idx = n_gdn_++;
-      if (has_mtp()) {
+      if (spec_) {
         if (legacy16_) L.ssm_alt = (float*)dalloc(state_bytes());
         L.sv_qkv = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.conv_dim() * 4);
         L.sv_g = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.nv * 4);
         L.sv_beta = (float*)dalloc((size_t)(opt_.draft_max + 1) * c.nv * 4);
         L.conv_hist = (float*)dalloc((3 + qk::kMaxB) * (size_t)c.conv_dim() * 4);
       }
+    }
+    if (al) {  // own runtime state (KV / recurrent state above), the first visit's weights
+      const Layer& S = layers_[c.wl(il)];
+      L.attn_norm = S.attn_norm; L.post_norm = S.post_norm; L.q_norm = S.q_norm; L.k_norm = S.k_norm;
+      L.conv_w = S.conv_w; L.dt_bias = S.dt_bias; L.ssm_a = S.ssm_a; L.ssm_norm = S.ssm_norm;
+      L.mhc_attn_w = S.mhc_attn_w; L.mhc_attn_b = S.mhc_attn_b; L.mhc_ffn_w = S.mhc_ffn_w; L.mhc_ffn_b = S.mhc_ffn_b;
+      L.wq = S.wq; L.wk = S.wk; L.wv = S.wv; L.wo = S.wo;
+      L.wqkv = S.wqkv; L.wgate = S.wgate; L.walpha = S.walpha; L.wbeta = S.wbeta; L.wssm_out = S.wssm_out;
+      L.ffn_gate = S.ffn_gate; L.ffn_up = S.ffn_up; L.ffn_down = S.ffn_down;
+      L.ffn_skip = S.ffn_skip; L.ffn_streamed = S.ffn_streamed; L.cpu_rows = S.cpu_rows; L.cpu_r4 = S.cpu_r4;
+      L.gate_g = S.gate_g; L.up_g = S.up_g; L.down_g = S.down_g; L.gate_c = S.gate_c; L.up_c = S.up_c; L.down_c = S.down_c;
+      L.stream_bytes_gpu = S.stream_bytes_gpu; L.stream_bytes_full = S.stream_bytes_full; L.stream_host = S.stream_host;
+      L.hyb_on = S.hyb_on;
     }
     if (il >= c.n_layer) {
       L.enorm = upload_f32(bn(il, "nextn.enorm.weight"));
@@ -696,7 +726,7 @@ void Model::plan_and_load() {
   carve(ws_small_, qk::kMaxB, false);
   select_ws(true);
   hsafe_ = (float*)dalloc((size_t)qk::kMaxB * c.n_embd * 4);
-  if (has_mtp() && !getenv("QE_NO_BATCH_RB")) {
+  if (spec_ && !getenv("QE_NO_BATCH_RB")) {
     std::vector<qk::GdnBatch> tab;
     for (auto& L : layers_)
       if (L.sv_qkv) tab.push_back({L.sv_qkv, L.sv_g, L.sv_beta, L.ssm_state, L.conv_state, L.conv_hist});
@@ -760,7 +790,7 @@ void Model::plan_and_load() {
   if (copy_stream_ && !getenv("QE_NO_TAIL")) {
     std::vector<int> cand;
     for (int il = 0; il < c.n_layer; il++)
-      if (layers_[il].ffn_streamed && !layers_[il].borrowed_dev && !layers_[il].ffn_skip) cand.push_back(il);
+      if (layers_[il].ffn_streamed && !layers_[il].borrowed_dev && !layers_[il].ffn_skip && !c.aliased(il)) cand.push_back(il);
     std::sort(cand.begin(), cand.end(), [&](int a, int b) { return layers_[a].stream_bytes_full > layers_[b].stream_bytes_full; });
     int n = 0;
     size_t tb = 0;
@@ -774,9 +804,17 @@ void Model::plan_and_load() {
       n++;
       tb += b;
     }
+    for (int il = 0; il < c.n_layer; il++)
+      if (c.aliased(il)) layers_[il].borrowed_dev = layers_[c.wl(il)].borrowed_dev;
     if (n) refresh_streamed();
     QE_LOG("[plan] arena tail %.0f MiB: %d streamed FFN layers made resident (%.0f MiB)\n", free0 / (double)MiB, n, tb / (double)MiB);
   }
+  if (c.mhc_streams) {  // two residual streams, the routed sublayer input, router outputs (per token)
+    for (float** p : {&mhc_a_, &mhc_b_, &mhc_branch_}) *p = (float*)dalloc((size_t)Tmax_ * c.n_embd * 4);
+    mhc_pk_ = (float*)dalloc((size_t)Tmax_ * 8 * 4);
+  }
+  if ((c.rope_mscale != 1.f || c.arch != "qwen35") && !getenv("QE_ROPE_PLAIN"))  // QE_ROPE_PLAIN: experiments
+    qk::set_rope_table(c.rope_freq.data(), (int)c.rope_freq.size(), c.rope_mscale);
   reset();
   size_t fr = 0;
   CUDA_CHECK(cudaMemGetInfo(&fr, &total_b));
@@ -1073,6 +1111,18 @@ void Model::layer_attn(int il, int T, int pos0) {
 // the result is quantized for the matvec kernels in the same kernel.
 void Model::norm_in(const float* w, float* y, int T, bool quant) {
   const Config& c = cfg_;
+  if (mhc_on_) {  // mHC sublayer: the input is the routed mix of the two streams, no pending residual
+    if (fuse_ && T <= qk::kMaxB) {
+      qk::add_rmsnorm_q8(mhc_branch_, nullptr, w, y, c.n_embd, T, c.eps, quant ? xq_ : nullptr, quant ? xd_ : nullptr, stream_);
+      prep16_ = nullptr; gqp_ = nullptr;
+      if (quant) { prepared_ = y; prepared_K_ = c.n_embd; prepared_T_ = T; }
+      else prepared_ = nullptr;
+    } else {
+      qk::rmsnorm(mhc_branch_, w, y, c.n_embd, T, c.eps, stream_);
+      prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
+    }
+    return;
+  }
   if (fuse_ && T <= qk::kMaxB) {
     qk::add_rmsnorm_q8(x_, pend_, w, y, c.n_embd, T, c.eps, quant ? xq_ : nullptr, quant ? xd_ : nullptr, stream_);
     pend_ = nullptr;
@@ -1086,6 +1136,7 @@ void Model::norm_in(const float* w, float* y, int T, bool quant) {
   prepared_ = nullptr; prep16_ = nullptr; gqp_ = nullptr;
 }
 void Model::residual(const float* src, int T) {
+  if (mhc_on_) { mhc_out_ = src; return; }  // merged into the streams by the caller
   QE_ASSERT(!pend_);
   if (fuse_ && T <= qk::kMaxB) pend_ = src;
   else qk::add_inplace(x_, src, (int64_t)T * cfg_.n_embd, stream_);
@@ -1830,7 +1881,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
   static double h_layers = 0;
   QE_ASSERT(n_logits <= n);
   QE_ASSERT(!snapshot || n <= opt_.draft_max + 1);
-  snapshot_ = snapshot && has_mtp() && n > 1;
+  snapshot_ = snapshot && spec_ && n > 1;
   snap_valid_ = snapshot_;
   snap_T_ = n;
   ensure_kv(pos0 + n + 4);
@@ -1927,6 +1978,37 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     auto dsum = [&](const char* nm, int il, const float* p, size_t cnt) { qe_debug_dump(nm, il, p, T, (int)(cnt / T), stream_); };
     for (int il = 0; il < c.n_layer; il++) {
       if (gprof_on_) CUDA_CHECK(cudaEventRecord(sec_ev(il, 0), stream_));
+      static const int skip_lo = getenv("QE_SKIP_BLOCKS") ? atoi(getenv("QE_SKIP_BLOCKS")) : -1;  // experiments: "lo"
+      static const int skip_hi = getenv("QE_SKIP_BLOCKS_HI") ? atoi(getenv("QE_SKIP_BLOCKS_HI")) : -1;  // .. "hi" excl.
+      if (il >= skip_lo && il < skip_hi) continue;
+      const int kind = c.mhc(il);
+      if (kind) {
+        // two residual streams (sensenova_loop): each sublayer reads a routed mix of them and its
+        // output is merged back with the router's gates and 2x2 mixing matrix
+        Layer& L = layers_[il];
+        const size_t nb = (size_t)T * c.n_embd * 4;
+        if (kind == 1 || kind == 3) {  // enter: both streams start as the single residual
+          if (pend_) { qk::add_inplace(x_, pend_, (int64_t)T * c.n_embd, stream_); pend_ = nullptr; }
+          CUDA_CHECK(cudaMemcpyAsync(mhc_a_, x_, nb, cudaMemcpyDeviceToDevice, stream_));
+          CUDA_CHECK(cudaMemcpyAsync(mhc_b_, x_, nb, cudaMemcpyDeviceToDevice, stream_));
+        }
+        for (int sub = 0; sub < 2; sub++) {
+          qk::mhc_route(mhc_a_, mhc_b_, sub ? L.mhc_ffn_w : L.mhc_attn_w, sub ? L.mhc_ffn_b : L.mhc_attn_b, c.n_embd, T,
+                        mhc_branch_, mhc_pk_, stream_);
+          mhc_on_ = true;
+          mhc_out_ = nullptr;
+          if (sub) { ProfScope ps(2, stream_); layer_ffn(il, T); }
+          else if (L.attn) { ProfScope ps(0, stream_); layer_attn(il, T, p0); }
+          else { ProfScope ps(1, stream_); layer_gdn(il, T); }
+          mhc_on_ = false;
+          qk::mhc_merge(mhc_a_, mhc_b_, mhc_out_, mhc_pk_, c.n_embd, T, stream_);
+        }
+        if (kind == 2 || kind == 3) qk::mhc_leave(x_, mhc_a_, mhc_b_, (int64_t)T * c.n_embd, stream_);
+        else CUDA_CHECK(cudaMemcpyAsync(x_, mhc_a_, nb, cudaMemcpyDeviceToDevice, stream_));  // stream 0 = the residual
+        if (gprof_on_) { CUDA_CHECK(cudaEventRecord(sec_ev(il, 1), stream_)); CUDA_CHECK(cudaEventRecord(sec_ev(il, 2), stream_)); }
+        dsum("l_out", il, x_, (size_t)T * c.n_embd);
+        continue;
+      }
       if (layers_[il].attn) { ProfScope ps(0, stream_); layer_attn(il, T, p0); }
       else { ProfScope ps(1, stream_); layer_gdn(il, T); }
       dsum("attn_residual", il, x_, (size_t)T * c.n_embd);

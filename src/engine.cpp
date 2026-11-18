@@ -357,6 +357,21 @@ void Generator::step(std::vector<int>& out) {
   const bool g = sampler_.greedy();
   st_.steps++;
   if (!mtp_) {
+    // no MTP head: n-gram (prompt / history lookup) drafts when the continuation repeats earlier text
+    drafts_.clear();
+    dq_.clear();
+    last_ng_ = false;
+    std::vector<int> ng;
+    if (ngram_on_ && m_.draft_max() > 0 && ngram_lookup(ng)) {
+      const int cap = std::clamp((int)std::lround(ng_run_ + 2.0), 2, m_.draft_max());
+      for (int i = 0; i < (int)ng.size() && i < cap; i++) {
+        drafts_.push_back(ng[i]);
+        if (!g) dq_.push_back(Dist{{ng[i], 1.f}});  // deterministic proposal: q = point mass
+      }
+      last_ng_ = !drafts_.empty();
+    }
+  }
+  if (!mtp_ && drafts_.empty()) {
     int next;
     if (g) m_.forward(&last_, 1, pos_, nullptr, 1, &next);
     else {
@@ -457,6 +472,13 @@ void Generator::step(std::vector<int>& out) {
   static const bool hp = getenv("QE_HPROF") != nullptr;
   static double hp_rb = 0, hp_d1 = 0, hp_ch = 0, hp_n = 0;
   if (nd > 0) m_.rollback(a + 1);  // commit the accepted prefix of the verify pass
+  if (!mtp_) {  // n-gram only: commit and stop (no MTP head to draft from)
+    pos_ += a + 1;
+    last_ = s;
+    st_.generated += a + 1;
+    st_.t_decode += qe_now() - t0;
+    return;
+  }
   m_.set_carry_row(a);
   if (hp) { m_.sync(); hp_rb += qe_now() - tv; }
   const double hp1 = qe_now();

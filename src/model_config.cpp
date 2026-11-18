@@ -3,13 +3,17 @@
 #include "gguf.h"
 #include "imodel.h"
 
+#include <algorithm>
+#include <cmath>
 #include <string>
 
 Config load_qwen35_config(const GGUFFile& g) {
-  if (g.get_str("general.architecture", "") != "qwen35")
-    QE_FATAL("unsupported architecture '%s' (need qwen35)", g.get_str("general.architecture", "").c_str());
+  const std::string arch = g.get_str("general.architecture", "");
+  if (arch != "qwen35" && arch != "sensenova_loop")
+    QE_FATAL("unsupported architecture '%s' (need qwen35 or sensenova_loop)", arch.c_str());
   Config c{};
-  const std::string a = "qwen35.";
+  c.arch = arch;
+  const std::string a = arch + ".";
   c.n_embd = (int)g.get_int(a + "embedding_length", 0);
   const int blocks = (int)g.get_int(a + "block_count", 0);
   c.n_mtp = (int)g.get_int(a + "nextn_predict_layers", 0);
@@ -31,8 +35,67 @@ Config load_qwen35_config(const GGUFFile& g) {
   if (c.hd != 256 || c.dk != 128 || c.conv_k != 4 || c.d_inner != c.nv * c.dv || c.n_head % c.n_kv || c.nv % c.nk)
     QE_FATAL("unsupported qwen35 dimensions: attention head %d (need 256), GDN state %d (need 128), conv %d (need 4), "
              "heads %d/%d, GDN heads %d/%d", c.hd, c.dk, c.conv_k, c.n_head, c.n_kv, c.nk, c.nv);
-  QE_LOG("[model] qwen35: %d layers (+%d MTP), embd %d, ff %d, heads %d/%d x %d, GDN %d/%d x %d, vocab %d\n",
+  auto int_array = [&](const std::string& key) {
+    std::vector<int64_t> v;
+    if (const GGUFValue* f = g.get(key))
+      for (const auto& e : f->arr) v.push_back(e.as_int());
+    return v;
+  };
+  // per-block layer types (recurrent = Gated DeltaNet), when the file lists them
+  const std::vector<int64_t> rec = int_array(a + "attention.recurrent_layers");
+  if ((int)rec.size() >= c.n_layer)
+    for (int il = 0; il < c.n_layer; il++) c.attn_at.push_back(rec[il] ? 0 : 1);
+  // looped model: residual-stream kinds, and the second loop visit re-using the first visit's weights
+  c.mhc_streams = (int)g.get_int(a + "mhc.streams", 0);
+  if (c.mhc_streams) {
+    if (c.mhc_streams != 2) QE_FATAL("mHC with %d residual streams is not supported (2 are)", c.mhc_streams);
+    const std::vector<int64_t> k = int_array(a + "mhc.layer_kinds");
+    if ((int)k.size() < c.n_layer) QE_FATAL("mhc.layer_kinds has %zu entries for %d blocks", k.size(), c.n_layer);
+    for (int il = 0; il < c.n_layer; il++) c.mhc_kind.push_back((uint8_t)k[il]);
+    int first = -1, start2 = -1;  // as the reference loader: the second "enter" marks the second visit
+    for (int il = 0; il < c.n_layer && start2 < 0; il++)
+      if (c.mhc_kind[il] == 1) (first < 0 ? first : start2) = il;
+    c.wlayer.resize(c.n_layer);
+    for (int il = 0; il < c.n_layer; il++) c.wlayer[il] = il;
+    if (start2 > 0) {
+      const int shift = start2 - first;
+      for (int il = start2; il < start2 + shift && il < c.n_layer; il++) c.wlayer[il] = il - shift;
+    }
+  }
+  // RoPE frequencies, YaRN folded in (ggml's rope_yarn: ramp between the correction dims, ext_factor 1,
+  // attention factor 1 + 0.1 ln(scale))
+  {
+    const int half = c.rope_dims / 2;
+    const std::string st = g.get_str(a + "rope.scaling.type", "");
+    const double factor = g.get_float(a + "rope.scaling.factor", 1.0);
+    const bool yarn = st == "yarn" && factor > 1.0;
+    const double fs = yarn ? 1.0 / factor : 1.0;
+    double low = 0, high = 0;
+    if (yarn) {
+      const double n_orig = (double)g.get_int(a + "rope.scaling.original_context_length", 262144);
+      const double beta_fast = g.get_float(a + "rope.scaling.yarn_beta_fast", 32.0);
+      const double beta_slow = g.get_float(a + "rope.scaling.yarn_beta_slow", 1.0);
+      auto corr = [&](double nr) { return c.rope_dims * std::log(n_orig / (nr * 2 * M_PI)) / (2 * std::log((double)c.rope_base)); };
+      low = std::max(0.0, std::floor(corr(beta_fast)));
+      high = std::min((double)c.rope_dims - 1, std::ceil(corr(beta_slow)));
+      c.rope_mscale = (float)(g.get_float(a + "rope.scaling.attn_factor", 1.0) * (1.0 + 0.1 * std::log(1.0 / fs)));
+    }
+    for (int i = 0; i < half; i++) {
+      const double f = std::pow((double)c.rope_base, -2.0 * i / c.rope_dims);
+      double mix = 0;  // 1: extrapolate (original frequency), 0: interpolate (frequency * fs)
+      if (yarn) mix = 1.0 - std::min(1.0, std::max(0.0, (i - low) / std::max(0.001, high - low)));
+      c.rope_freq.push_back(yarn ? f * (fs * (1 - mix) + mix) : f);
+    }
+    if (yarn) QE_LOG("[model] RoPE: YaRN x%.1f (original context %lld), attention factor %.4f\n", factor,
+                     (long long)g.get_int(a + "rope.scaling.original_context_length", 0), c.rope_mscale);
+  }
+  int n_alias = 0, n_mhc = 0;
+  for (int il = 0; il < c.n_layer; il++) { n_alias += c.aliased(il); n_mhc += c.mhc(il) != 0; }
+  QE_LOG("[model] %s: %d layers (+%d MTP), embd %d, ff %d, heads %d/%d x %d, GDN %d/%d x %d, vocab %d\n", arch.c_str(),
          c.n_layer, c.n_mtp, c.n_embd, c.n_ff, c.n_head, c.n_kv, c.hd, c.nk, c.nv, c.dk, c.n_vocab);
+  if (c.mhc_streams)
+    QE_LOG("[model] looped: %d executed blocks, %d of them re-use earlier weights, %d in the %d-stream mHC residual\n",
+           c.n_layer, n_alias, n_mhc, c.mhc_streams);
   return c;
 }
 

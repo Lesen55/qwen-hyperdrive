@@ -38,8 +38,27 @@ struct Config {
   float rope_base, eps;
   int conv_k, dk, dv, nk, nv, d_inner, attn_interval;
   int n_mtp;
+  std::string arch;               // qwen35 | sensenova_loop
+  std::vector<uint8_t> attn_at;   // per executed block: full attention (else Gated DeltaNet)
+  // RoPE: per rotated pair i the angle is pos * rope_freq[i] and cos / sin are scaled by rope_mscale
+  // (plain NeoX: base^(-2i/rot), 1; YaRN folds its interpolation ramp and attention factor in here)
+  std::vector<double> rope_freq;
+  float rope_mscale = 1.f;
+  // looped models (sensenova_loop): executed block il uses the weights of block wlayer[il] (the loop's
+  // second visit has none of its own) and mhc_kind[il] says how it sits in the two residual streams:
+  // 0 plain residual, 1 enters the streams, 2 leaves them, 3 both, 4 inside
+  std::vector<int> wlayer;
+  std::vector<uint8_t> mhc_kind;
+  int mhc_streams = 0;
   int conv_dim() const { return 2 * nk * dk + nv * dv; }
-  bool is_attn(int il) const { return il >= n_layer || (il + 1) % attn_interval == 0; }
+  bool is_attn(int il) const {
+    if (il >= n_layer) return true;
+    if (il < (int)attn_at.size()) return attn_at[il];
+    return (il + 1) % attn_interval == 0;
+  }
+  int wl(int il) const { return il < (int)wlayer.size() ? wlayer[il] : il; }
+  bool aliased(int il) const { return wl(il) != il; }
+  int mhc(int il) const { return il < (int)mhc_kind.size() ? mhc_kind[il] : 0; }
 };
 
 struct KvInfo {

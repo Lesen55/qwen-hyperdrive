@@ -62,6 +62,8 @@ struct Layer {
   int gdn_idx = -1;                      // index among GDN layers (checkpoint layout)
   bool ffn_skip = false;                 // FFN dropped (--skip-ffn)
   bool hyb_on = true;                    // decode: CPU computes its row slice (else whole layer streamed)
+  // sensenova_loop: residual-stream routers of the attention / FFN sublayers (fp32 [8][2E] + [8])
+  float *mhc_attn_w = nullptr, *mhc_attn_b = nullptr, *mhc_ffn_w = nullptr, *mhc_ffn_b = nullptr;
 };
 
 class Model : public IModel {
@@ -94,7 +96,8 @@ class Model : public IModel {
                 bool head = true) override;
   // Chained draft: pair (MTP output hidden of the previous mtp_* call, token) at MTP position pos.
   int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr) override;
-  int draft_max() const override { return opt_.draft_max; }
+  int draft_max() const override { return spec_ ? opt_.draft_max : 0; }
+  bool spec_ = true;  // verify passes with rollback (MTP or n-gram drafts)
   void set_carry_row(int row) override;  // carried hidden := row of the last forward (for prefix continuation)
   // ---- paged KV sequences + recurrent-state checkpoints (prompt caching across conversations) ----
   int seq_create() override;
@@ -112,6 +115,10 @@ class Model : public IModel {
   // topk rows (forward: row j of the requested logits; MTP: row kMaxB) instead of the full rows
   void set_topk(int K) override { topk_K_ = K; }
   void sync() override { CUDA_CHECK(cudaStreamSynchronize(stream_)); }
+  // sensenova_loop residual streams
+  float *mhc_a_ = nullptr, *mhc_b_ = nullptr, *mhc_branch_ = nullptr, *mhc_pk_ = nullptr;
+  bool mhc_on_ = false;
+  const float* mhc_out_ = nullptr;
   int top2_[4] = {-1, -1, -1, -1};  // QE_MEASURE_TOP2: top-4 ids of the last MTP head output
   int topk_K() const override { return topk_K_; }
   const int* topk_idx(int row) const override { return topk_i_h_ + (size_t)row * kTopKMax; }

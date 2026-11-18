@@ -2221,6 +2221,22 @@ void rmsnorm_heads(float* x, const float* w, int hd, int nh, int hstride, int to
   k_rmsnorm_heads<<<cdiv(nh * tokens, 8), 256, 0, s>>>(x, w, hd, nh, hstride, tokens, tstride, eps);
 }
 
+// RoPE frequency table (per rotated pair) and cos / sin scale; set by set_rope_table (YaRN models).
+// Without a table the plain NeoX frequencies base^(-2i/rot) are used.
+__constant__ double c_rope_freq[64];
+__constant__ float c_rope_mscale = 1.f;
+__constant__ int c_rope_tab = 0;
+void set_rope_table(const double* freq, int half, float mscale) {
+  QE_ASSERT(half <= 64);
+  const int on = 1;
+  CUDA_CHECK(cudaMemcpyToSymbol(c_rope_freq, freq, half * sizeof(double)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_rope_mscale, &mscale, sizeof(float)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_rope_tab, &on, sizeof(int)));
+}
+static __device__ __forceinline__ double rope_freq(int i, int rot, float log2_base) {
+  return c_rope_tab ? c_rope_freq[i] : exp2(-(double)log2_base * (2.0 * i / rot));
+}
+
 __global__ void k_rope_neox(float* x, const int* __restrict__ pos, int hd, int nh, int hstride,
                             int tokens, int tstride, int rot, float log2_base) {
   const int half = rot / 2;
@@ -2232,10 +2248,10 @@ __global__ void k_rope_neox(float* x, const int* __restrict__ pos, int hd, int n
   float* p = x + (size_t)t * tstride + (size_t)h * hstride;
   // theta_i = pos * base^(-2i/rot)
   // double precision: at pos ~1e5 the angle is ~1e5 rad and fast-math sincosf would be noise
-  const double freq = exp2(-(double)log2_base * (2.0 * i / rot));
+  const double freq = rope_freq(i, rot, log2_base);
   double sd, cd;
   sincos((double)pos[t] * freq, &sd, &cd);
-  const float sn = (float)sd, cs = (float)cd;
+  const float sn = (float)sd * c_rope_mscale, cs = (float)cd * c_rope_mscale;
   const float a = p[i], b = p[i + half];
   p[i] = a * cs - b * sn;
   p[i + half] = a * sn + b * cs;
@@ -2315,11 +2331,11 @@ __global__ void k_qk_norm_rope(float* q, const float* __restrict__ qw, int qhs, 
   __shared__ float cs[64], sn[64];
   const int t = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, half = rot / 2;
   if (threadIdx.x < half) {
-    const double freq = exp2(-(double)log2_base * (2.0 * threadIdx.x / rot));
+    const double freq = rope_freq(threadIdx.x, rot, log2_base);
     double sd, cd;
     sincos((double)pos[t] * freq, &sd, &cd);
-    cs[threadIdx.x] = (float)cd;
-    sn[threadIdx.x] = (float)sd;
+    cs[threadIdx.x] = (float)cd * c_rope_mscale;
+    sn[threadIdx.x] = (float)sd * c_rope_mscale;
   }
   __syncthreads();
   if (warp >= nhq + nhk) return;
@@ -3810,4 +3826,87 @@ void argmax_prob(const float* logits, int n, int* idx, float* prob, cudaStream_t
   k_max_prob<<<1, 1024, 0, s>>>(logits, n, idx, prob);
 }
 
+
+// =============================================================================================
+// sensenova_loop residual streams (mHC, two streams).  route: RMS over the two streams together,
+// 8 router logits (fp32 weights [8][2E] + bias): sublayer input pre0*a + pre1*b (sigmoids), output
+// gates post = 2*sigmoid, and a 2x2 mixing matrix made doubly stochastic by 20 log-space Sinkhorn
+// passes.  merge: a' = m00 a + m01 b + post0 x, b' = m10 a + m11 b + post1 x.  (GuideboardLabs'
+// ggml_mhc_route / ggml_mhc_merge, one block per token.)
+// =============================================================================================
+__global__ void k_mhc_route(const float* __restrict__ a, const float* __restrict__ b, const float* __restrict__ w,
+                            const float* __restrict__ bias, int d, float* __restrict__ branch, float* __restrict__ pk) {
+  const int t = blockIdx.x;
+  const float* va = a + (size_t)t * d;
+  const float* vb = b + (size_t)t * d;
+  float acc[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};  // sum of squares, 8 dots
+  for (int i = threadIdx.x; i < d; i += blockDim.x) {
+    const float xa = va[i], xb = vb[i];
+    acc[0] += xa * xa + xb * xb;
+#pragma unroll
+    for (int k = 0; k < 8; k++) acc[1 + k] += w[(size_t)k * 2 * d + i] * xa + w[(size_t)k * 2 * d + d + i] * xb;
+  }
+  __shared__ float red[9][32];
+  __shared__ float g[4];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+#pragma unroll
+  for (int k = 0; k < 9; k++) {
+    const float v = warp_sum(acc[k]);
+    if (lane == 0) red[k][warp] = v;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float tot[9];
+    for (int k = 0; k < 9; k++) {
+      tot[k] = 0.f;
+      for (int j = 0; j < nw; j++) tot[k] += red[k][j];
+    }
+    const float rms = 1.f / sqrtf(tot[0] / (2.f * d) + 1e-6f);
+    float lg[8];
+    for (int k = 0; k < 8; k++) lg[k] = tot[1 + k] * rms + bias[k];
+    float m[2][2] = {{lg[4], lg[5]}, {lg[6], lg[7]}};
+    for (int it = 0; it < 20; it++) {
+      for (int r = 0; r < 2; r++) {
+        const float mx = fmaxf(m[r][0], m[r][1]), lse = mx + logf(expf(m[r][0] - mx) + expf(m[r][1] - mx));
+        m[r][0] -= lse; m[r][1] -= lse;
+      }
+      for (int cc = 0; cc < 2; cc++) {
+        const float mx = fmaxf(m[0][cc], m[1][cc]), lse = mx + logf(expf(m[0][cc] - mx) + expf(m[1][cc] - mx));
+        m[0][cc] -= lse; m[1][cc] -= lse;
+      }
+    }
+    g[0] = 1.f / (1.f + expf(-lg[0]));
+    g[1] = 1.f / (1.f + expf(-lg[1]));
+    float* p = pk + (size_t)t * 8;
+    p[0] = 2.f / (1.f + expf(-lg[2]));
+    p[1] = 2.f / (1.f + expf(-lg[3]));
+    p[2] = expf(m[0][0]); p[3] = expf(m[0][1]); p[4] = expf(m[1][0]); p[5] = expf(m[1][1]);
+  }
+  __syncthreads();
+  const float p0 = g[0], p1 = g[1];
+  for (int i = threadIdx.x; i < d; i += blockDim.x) branch[(size_t)t * d + i] = p0 * va[i] + p1 * vb[i];
+}
+void mhc_route(const float* a, const float* b, const float* w, const float* bias, int d, int T, float* branch, float* pk,
+               cudaStream_t s) {
+  k_mhc_route<<<T, 512, 0, s>>>(a, b, w, bias, d, branch, pk);
+}
+__global__ void k_mhc_merge(float* a, float* b, const float* __restrict__ x, const float* __restrict__ pk, int d, int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float* p = pk + (i / d) * 8;
+  const float va = a[i], vb = b[i], vx = x ? x[i] : 0.f;
+  a[i] = p[2] * va + p[3] * vb + p[0] * vx;
+  b[i] = p[4] * va + p[5] * vb + p[1] * vx;
+}
+void mhc_merge(float* a, float* b, const float* x, const float* pk, int d, int T, cudaStream_t s) {
+  const int64_t n = (int64_t)T * d;
+  k_mhc_merge<<<cdiv(n, 256), 256, 0, s>>>(a, b, x, pk, d, n);
+}
+__global__ void k_mhc_leave(float* y, const float* __restrict__ a, const float* __restrict__ b, int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = 0.5f * (a[i] + b[i]);
+}
+void mhc_leave(float* y, const float* a, const float* b, int64_t n, cudaStream_t s) {
+  k_mhc_leave<<<cdiv(n, 256), 256, 0, s>>>(y, a, b, n);
+}
 }  // namespace qk
