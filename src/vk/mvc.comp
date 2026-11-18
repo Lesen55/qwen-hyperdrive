@@ -1,0 +1,149 @@
+// variants: mvc_q4_k:QT=12 mvc_q5_k:QT=13 mvc_q6_k:QT=14 mvc_q8_0:QT=8 mvci_q4_k:QT=12,I8=1 mvci_q5_k:QT=13,I8=1 mvci_q6_k:QT=14,I8=1 mvci_q8_0:QT=8,I8=1
+// Cooperative matvec for K-quants / Q8_0: a 32-lane team decodes one 256-weight super block together,
+// lane j taking the j-th 32-bit word of the quant bits (8 weights) -> the weight reads of a team are
+// contiguous (one or two cache lines per load) and the scales are broadcast loads.  The scattered
+// per-lane block reads of the generic kernel (mv_*) were the limit on Intel Xe2 (Arc 130V: 50 GB/s on
+// Q8_0).  A team owns R rows (constant 0), TEAMS = local_size_x / 32 (constant 1); T > 1 tokens
+// (MULTI, constant 2) reuse the 8R decoded weights of a super block for every token.
+// I8 variants (mvci_*): the activations come pre-quantized to int8 per 32-element block (x = codes,
+// tab = block scales) and each half is a packed 4 x 8-bit integer dot product (DP4A).
+#version 450
+#include "common.glsl"
+#ifdef I8
+#extension GL_EXT_integer_dot_product : require
+#endif
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer F32x4 { vec4 d[]; };
+layout(local_size_x_id = 1, local_size_x = 128) in;
+layout(constant_id = 0) const uint R = 2u;
+layout(constant_id = 2) const bool MULTI = false;
+layout(constant_id = 3) const uint U = 1u;  // super blocks in flight per lane (loads issued before use)
+layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
+const uint WGS = gl_WorkGroupSize.x;
+const uint TEAMS = WGS / 32u;
+shared float red[8][TEAMS * R][33];  // 8 * rows * 33 floats (the autotuner keeps it within the device limit)
+
+// lane j's share of a super block in factored form: its 8 quant values qa (x[e0 .. e0+3]) and qb
+// (x[e1 .. e1+3]) as floats, and per half a multiplier / offset, so that the contribution is
+//   ma * dot(qa, xa) - oa * sum(xa) + mb * dot(qb, xb) - ob * sum(xb)
+// (one multiply per 4 weights instead of one per weight; branch-free so SIMD lanes do not diverge)
+struct Lane { vec4 qa, qb; uint pa, pb; float ma, oa, mb, ob; uint e0, e1; };
+vec4 u8x4(uint q) { return vec4(uvec4(q, q >> 8, q >> 16, q >> 24) & 0xffu); }
+Lane lane_load(U32 w, uint sb, uint j) {
+  Lane L;
+#if QT == QT_Q4_K || QT == QT_Q5_K
+  const uint p = j / 8u, c = (j % 8u) * 4u;  // pair of groups (2p, 2p+1), column
+  const uint w0 = sb >> 2;
+  const vec2 dd = unpackHalf2x16(w.d[w0]);
+  const uint s0 = w.d[w0 + 1u], s1 = w.d[w0 + 2u], s2 = w.d[w0 + 3u];
+  // 6-bit scale / min of groups 2p, 2p+1: groups 0..3 low 6 bits of bytes g, g+4; groups 4..7 the
+  // nibbles of bytes g+4 plus the top 2 bits of bytes g-4, g (q4k_scale_min), as selects
+  const uint k = (2u * p) & 3u;
+  const bool lo = p < 2u;
+  const uint a0 = byte_of(s0, k), a1 = byte_of(s0, k + 1u), b0 = byte_of(s1, k), b1 = byte_of(s1, k + 1u);
+  const uint c0 = byte_of(s2, k), c1 = byte_of(s2, k + 1u);
+  const uint sc0 = lo ? a0 & 63u : (c0 & 0xFu) | ((a0 >> 6) << 4);
+  const uint mn0 = lo ? b0 & 63u : (c0 >> 4) | ((b0 >> 6) << 4);
+  const uint sc1 = lo ? a1 & 63u : (c1 & 0xFu) | ((a1 >> 6) << 4);
+  const uint mn1 = lo ? b1 & 63u : (c1 >> 4) | ((b1 >> 6) << 4);
+#if QT == QT_Q4_K
+  const uint q = w.d[w0 + 4u + 8u * p + (c >> 2)];
+  const uint ql = q & 0x0F0F0F0Fu, qh = (q >> 4) & 0x0F0F0F0Fu;
+#else
+  const uint q = w.d[w0 + 12u + 8u * p + (c >> 2)];
+  const uint h = w.d[w0 + 4u + (c >> 2)];
+  const uint ql = (q & 0x0F0F0F0Fu) | (((h >> (2u * p)) & 0x01010101u) << 4);
+  const uint qh = ((q >> 4) & 0x0F0F0F0Fu) | (((h >> (2u * p + 1u)) & 0x01010101u) << 4);
+#endif
+  L.pa = ql; L.pb = qh;
+#ifndef I8
+  L.qa = u8x4(ql); L.qb = u8x4(qh);
+#endif
+  L.ma = dd.x * float(sc0); L.oa = dd.y * float(mn0);
+  L.mb = dd.x * float(sc1); L.ob = dd.y * float(mn1);
+  L.e0 = 64u * p + c;
+  L.e1 = 64u * p + 32u + c;
+#elif QT == QT_Q6_K
+  const uint h = j / 16u, rl = (j % 16u) / 8u, l0 = (j % 8u) * 4u;  // ql bytes 4j..4j+3
+  const uint ql = ld32(w, sb + 4u * j);
+  const uint qh = ld32(w, sb + 128u + 32u * h + l0);
+  const float d = ldh(w, sb + 208u);
+  const uint ga = 4u * h + rl, gb = ga + 2u;  // groups of the low / high nibbles
+  L.ma = d * float(sbyte_of(ld8(w, sb + 192u + 2u * ga + l0 / 16u), 0u));
+  L.mb = d * float(sbyte_of(ld8(w, sb + 192u + 2u * gb + l0 / 16u), 0u));
+  L.oa = 32.0 * L.ma; L.ob = 32.0 * L.mb;  // values are q - 32
+  L.pa = (ql & 0x0F0F0F0Fu) | (((qh >> (2u * rl)) & 0x03030303u) << 4);
+  L.pb = ((ql >> 4) & 0x0F0F0F0Fu) | (((qh >> (2u * rl + 4u)) & 0x03030303u) << 4);
+#ifndef I8
+  L.qa = u8x4(L.pa); L.qb = u8x4(L.pb);
+#endif
+  L.e0 = 32u * ga + l0;
+  L.e1 = 32u * gb + l0;
+#elif QT == QT_Q8_0
+  const uint blk = sb + 34u * (j / 4u), c = (j % 4u) * 8u;
+  const float d = ldh(w, blk);
+  const uint q0 = ld32(w, blk + 2u + c), q1 = ld32(w, blk + 6u + c);
+  L.pa = q0; L.pb = q1;
+#ifndef I8
+  L.qa = vec4(sbyte_of(q0, 0u), sbyte_of(q0, 1u), sbyte_of(q0, 2u), sbyte_of(q0, 3u));
+  L.qb = vec4(sbyte_of(q1, 0u), sbyte_of(q1, 1u), sbyte_of(q1, 2u), sbyte_of(q1, 3u));
+#endif
+  L.ma = d; L.mb = d; L.oa = 0.0; L.ob = 0.0;
+  L.e0 = 32u * (j / 4u) + c;
+  L.e1 = L.e0 + 4u;
+#endif
+  return L;
+}
+float lane_dot(Lane L, vec4 xa, vec4 xb) {
+  return L.ma * dot(L.qa, xa) - L.oa * dot(xa, vec4(1.0)) + L.mb * dot(L.qb, xb) - L.ob * dot(xb, vec4(1.0));
+}
+
+void main() {
+  const uint tid = gl_LocalInvocationID.x, lane = tid % 32u, team = tid / 32u;
+  const uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+  const uint row0 = wg * TEAMS * R + team * R;
+  U32 w = U32(pc.w); F32x4 x = F32x4(pc.x); F32 y = F32(pc.y);
+#ifdef I8
+  U32 xq = U32(pc.x); F32 xd = F32(pc.tab);
+#endif
+  const uint nsb = pc.K / 256u;
+  float s[R][8];
+  for (uint r = 0u; r < R; r++) for (uint t = 0u; t < 8u; t++) s[r][t] = 0.0;
+  for (uint b0 = 0u; b0 < nsb; b0 += U) {
+    Lane L[U][R];
+    for (uint u = 0u; u < U; u++)
+      for (uint r = 0u; r < R; r++)
+        L[u][r] = lane_load(w, min(row0 + r, pc.N - 1u) * pc.rb + min(b0 + u, nsb - 1u) * BB, lane);
+    for (uint u = 0u; u < U; u++) {
+      const uint b = b0 + u;
+      if (b >= nsb) break;
+      const uint tn = MULTI ? pc.T : 1u;
+      for (uint t = 0u; t < tn; t++) {
+#ifdef I8
+        const uint eb = t * pc.ldx + b * 256u;
+        const uint xa = xq.d[(eb + L[u][0].e0) / 4u], xc = xq.d[(eb + L[u][0].e1) / 4u];
+        const float da = xd.d[(eb + L[u][0].e0) / 32u], dc = xd.d[(eb + L[u][0].e1) / 32u];
+        const int sa = dotPacked4x8EXT(0x01010101, int(xa)), sc = dotPacked4x8EXT(0x01010101, int(xc));  // signed x signed
+        for (uint r = 0u; r < R; r++)
+          s[r][t] += da * (L[u][r].ma * float(dotPacked4x8EXT(int(L[u][r].pa), int(xa))) - L[u][r].oa * float(sa)) +
+                     dc * (L[u][r].mb * float(dotPacked4x8EXT(int(L[u][r].pb), int(xc))) - L[u][r].ob * float(sc));
+#else
+        const uint xb = (t * pc.ldx + b * 256u) / 4u;
+        const vec4 xa = x.d[xb + L[u][0].e0 / 4u], xc = x.d[xb + L[u][0].e1 / 4u];
+        for (uint r = 0u; r < R; r++) s[r][t] += lane_dot(L[u][r], xa, xc);
+#endif
+      }
+    }
+  }
+  for (uint r = 0u; r < R; r++)
+    for (uint t = 0u; t < pc.T; t++) red[t][team * R + r][lane] = s[r][t];
+  barrier();
+  for (uint e = tid; e < TEAMS * R * pc.T; e += WGS) {
+    const uint rr = e % (TEAMS * R), t = e / (TEAMS * R), row = wg * TEAMS * R + rr;
+    float a = 0.0;
+    for (uint i = 0u; i < 32u; i++) a += red[t][rr][i];
+    if (row < pc.N) {
+      const uint o = t * pc.ldy + row;
+      y.d[o] = pc.acc != 0u ? y.d[o] + a : a;
+    }
+  }
+}

@@ -70,13 +70,19 @@ int main(int argc, char** argv) {
       for (auto& v : x) v = nd(rng);
       VBuf dx = vk.alloc(x.size() * 4, Mem::Host), dout = vk.alloc((size_t)T * N * 4, Mem::Host);
       memcpy(dx.map, x.data(), x.size() * 4);
-      for (int wide = 0; wide < (T <= 8 ? 2 : 1); wide++) {
+      const bool has_c = vk.has_pipeline((std::string("mvc_") + tag(type)).c_str());
+      for (int wide = 0; wide < (T <= 8 ? (has_c ? 3 : 2) : 1); wide++) {
         MvPC pc{dw.addr, dx.addr, dout.addr, dtab.addr, (uint32_t)K, (uint32_t)N, (uint32_t)T, (uint32_t)rb, (uint32_t)K,
                 (uint32_t)N, 0, (uint32_t)wide, (uint32_t)(K / 32)};
         vk.begin();
         PipeOpt po;
         po.spec2 = T > 1;
-        if (T <= 8) vk.dispatch((std::string("mv_") + tag(type)).c_str(), &pc, sizeof pc, wide ? N : (N + 15) / 16, 1, 1, true, po);
+        if (T <= 8 && wide == 2) {  // cooperative super-block kernel (2 rows x 4 teams by default)
+          pc.wide = 0;
+          po.spec0 = 2;
+          po.spec1 = 128;
+          vk.dispatch((std::string("mvc_") + tag(type)).c_str(), &pc, sizeof pc, (N + 7) / 8, 1, 1, true, po);
+        } else if (T <= 8) vk.dispatch((std::string("mv_") + tag(type)).c_str(), &pc, sizeof pc, wide ? N : (N + 15) / 16, 1, 1, true, po);
         else vk.dispatch((std::string("mm_") + tag(type)).c_str(), &pc, sizeof pc, (N + 63) / 64, (T + 63) / 64);
         vk.submit();
         double rms = 0, e = 0;
@@ -91,7 +97,8 @@ int main(int argc, char** argv) {
         rms = std::sqrt(rms / ref.size()) + 1e-30;
         for (size_t i = 0; i < ref.size(); i++) e = std::max(e, std::fabs(((float*)dout.map)[i] - ref[i]) / rms);
         // T in 2..8 stages the activations as f16 (verify passes): 4x looser than the fp32 paths
-        (T > 1 && T <= 8 && !wide ? worst16 : worst) = std::max(T > 1 && T <= 8 && !wide ? worst16 : worst, e);
+        const bool f16s = T > 1 && T <= 8 && wide == 0;
+        (f16s ? worst16 : worst) = std::max(f16s ? worst16 : worst, e);
       }
       vk.free(dx);
       vk.free(dout);
@@ -105,6 +112,21 @@ int main(int argc, char** argv) {
   }
   // QE_VK_TEST_BENCH=1: matvec time vs batch size T (speculative verify cost), largest matrix per type
   if (getenv("QE_VK_TEST_BENCH")) {
+    {  // memory bandwidth ceiling: device-local buffer copy (read + write)
+      const size_t n = 256u << 20;
+      VBuf a = vk.alloc(n, Mem::Device), b = vk.alloc(n, Mem::Device);
+      double best = 1e30;
+      for (int rep = 0; rep < 6; rep++) {
+        vk.begin();
+        for (int i = 0; i < 4; i++) vk.copy(a, 0, b, 0, n);
+        const double t0 = qe_now();
+        vk.submit();
+        if (rep) best = std::min(best, (qe_now() - t0) / 4);
+      }
+      printf("buffer copy: %.1f GB/s (read + write %.1f GB/s)\n", n / best / 1e9, 2 * n / best / 1e9);
+      vk.free(a);
+      vk.free(b);
+    }
     std::map<uint32_t, const GGUFTensor*> big;
     for (auto& t : f.tensors())
       if (t.ne.size() == 2 && t.ne[0] % 256 == 0 && tag(t.type) && t.type != QT_F32 && t.type != QT_BF16 &&
@@ -127,20 +149,29 @@ int main(int argc, char** argv) {
         MvPC pc{dw.addr, dx.addr, dout.addr, dtab.addr, (uint32_t)K, (uint32_t)N, (uint32_t)T, (uint32_t)rb, (uint32_t)K,
                 (uint32_t)N, 0, 0, (uint32_t)(K / 32)};
         double best = 1e30;
+        const int nrep = getenv("QE_VK_BENCH_REPS") ? atoi(getenv("QE_VK_BENCH_REPS")) : 10;
         for (int rep = 0; rep < 4; rep++) {
           vk.begin();
           PipeOpt po;
           po.spec2 = T > 1;
           int teams = 4, rr = 4;
           if (T > 1 && getenv("QE_VK_MULTI")) sscanf(getenv("QE_VK_MULTI"), "%d,%d", &teams, &rr);
+          std::string pipe = std::string("mv_") + tag(type);
+          if (const char* c = getenv("QE_VK_COOP"))
+            if (vk.has_pipeline(("mvc_" + std::string(tag(type))).c_str())) {
+              sscanf(c, "%d,%d", &teams, &rr);
+              pipe = std::string("mvc_") + tag(type);
+            }
           po.spec0 = rr;
           po.spec1 = 32 * teams;
+          if (getenv("QE_VK_SG")) po.subgroup = (uint32_t)atoi(getenv("QE_VK_SG"));
+          if (getenv("QE_VK_UNROLL")) po.spec3 = atoi(getenv("QE_VK_UNROLL"));
           const int rows = teams * rr;
-          for (int i = 0; i < 10; i++)
-            vk.dispatch((std::string("mv_") + tag(type)).c_str(), &pc, sizeof pc, (N + rows - 1) / rows, 1, 1, true, po);
+          for (int i = 0; i < nrep; i++)
+            vk.dispatch(pipe.c_str(), &pc, sizeof pc, (N + rows - 1) / rows, 1, 1, true, po);
           const double t0 = qe_now();
           vk.submit();
-          if (rep) best = std::min(best, (qe_now() - t0) / 10);
+          if (rep) best = std::min(best, (qe_now() - t0) / nrep);
         }
         if (T == 1) t1 = best;
         printf("  T%d %.0fus(%.2fx)", T, best * 1e6, best / t1);

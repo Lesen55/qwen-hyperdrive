@@ -1,4 +1,4 @@
-// variants: silu_mul:OP_SILU=1 gate:OP_GATE=1 gdn_gb:OP_GB=1 ksum:OP_KSUM=1 to_f16:OP_F16=1
+// variants: silu_mul:OP_SILU=1 gate:OP_GATE=1 gdn_gb:OP_GB=1 ksum:OP_KSUM=1 to_f16:OP_F16=1 quant_q8:OP_Q8=1
 // small element-wise ops
 #version 450
 #include "common.glsl"
@@ -30,6 +30,19 @@ void main() {
   // activations f32 [T][K] -> packed f16 words, rows past T zero (cooperative-matrix tiles): p0 = valid words
   F32 a = F32(pc.a); U32 b = U32(pc.b);
   b.d[i] = i < pc.p0 ? packHalf2x16(vec2(a.d[2u * i], a.d[2u * i + 1u])) : 0u;
+#elif defined(OP_Q8)
+  // activations f32 -> int8 per 32-element block (DP4A matvec): one invocation per block, i = block;
+  // a = x, b = codes (8 words per block), c = block scales
+  F32 a = F32(pc.a); U32 b = U32(pc.b); F32 c = F32(pc.c);
+  float amax = 0.0;
+  for (uint k = 0u; k < 32u; k++) amax = max(amax, abs(a.d[32u * i + k]));
+  const float d = amax / 127.0, id = d > 0.0 ? 1.0 / d : 0.0;
+  for (uint k = 0u; k < 8u; k++) {
+    uint wv = 0u;
+    for (uint j = 0u; j < 4u; j++) wv |= (uint(clamp(int(round(a.d[32u * i + 4u * k + j] * id)), -127, 127)) & 0xffu) << (8u * j);
+    b.d[8u * i + k] = wv;
+  }
+  c.d[i] = d;
 #elif defined(OP_KSUM)
   // split-K GEMM: b[i] (+)= sum over p0 slices of a[s*n + i]; p1 = accumulate
   F32 a = F32(pc.a); F32 b = F32(pc.b);

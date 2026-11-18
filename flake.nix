@@ -78,7 +78,19 @@
         };
       };
 
-      devShells.${system}.default = (pkgs.mkShell.override { stdenv = cuda.backendStdenv; }) {
+      devShells.${system} = {
+      vulkan = pkgs.mkShell {
+        packages = [
+          pkgs.cmake
+          pkgs.ninja
+          pkgs.shaderc
+          pkgs.vulkan-headers
+          pkgs.vulkan-loader
+          pkgs.vulkan-tools
+          (pkgs.python3.withPackages (ps: [ ps.numpy ps.gguf ]))
+        ];
+      };
+      default = (pkgs.mkShell.override { stdenv = cuda.backendStdenv; }) {
         packages = [
           cuda.cuda_nvcc
           cuda.cuda_cudart
@@ -97,6 +109,7 @@
           export LD_LIBRARY_PATH=/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
           export CUDA_PATH=${cuda.cuda_nvcc}
         '';
+      };
       };
     };
 }

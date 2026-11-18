@@ -15,12 +15,13 @@ enum class Mem { Device, Host, Readback, DeviceMapped };
 // per-pipeline options: specialization constants 0 / 1 (-1 = shader default) and a required subgroup
 // size (0 = driver's choice; ignored without VK_EXT_subgroup_size_control)
 struct PipeOpt {
-  int spec0 = -1, spec1 = -1, spec2 = -1;
+  int spec0 = -1, spec1 = -1, spec2 = -1, spec3 = -1;
   uint32_t subgroup = 0;
   bool operator<(const PipeOpt& o) const {
     if (spec0 != o.spec0) return spec0 < o.spec0;
     if (spec1 != o.spec1) return spec1 < o.spec1;
     if (spec2 != o.spec2) return spec2 < o.spec2;
+    if (spec3 != o.spec3) return spec3 < o.spec3;
     return subgroup < o.subgroup;
   }
 };
@@ -74,6 +75,9 @@ class VkCtx {
   uint32_t sg_min = 0, sg_max = 0;
   uint32_t vendor_id = 0, device_id = 0, driver_version = 0;
   uint32_t compute_units = 0;     // CUs (AMD) / SMs (NVIDIA) when the driver tells, else 0
+  uint32_t max_shared = 0, max_wg_invocations = 0;
+  bool int_dot = false;           // VK_KHR_shader_integer_dot_product (packed 4 x 8-bit dot, DP4A)
+  uint64_t ops() const { return ops_; }  // dispatches / copies recorded so far
   bool rebar = false;             // a CPU-mappable device-local type spans the VRAM heap
   bool has_cm(uint32_t M, uint32_t N, uint32_t K) const;
 
@@ -98,6 +102,7 @@ class VkCtx {
   int vram_heap_ = -1;
   size_t vram_total_ = 0, vram_used_ = 0;
   bool recording_ = false;
+  uint64_t ops_ = 0;
   // QE_VK_PROF: GPU time per pipeline (timestamps around every dispatch)
   VkQueryPool qpool_ = VK_NULL_HANDLE;
   float ts_period_ = 1.f;

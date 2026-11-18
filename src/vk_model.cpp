@@ -94,6 +94,8 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
          vk_->rebar ? "resizable BAR / mapped VRAM, " : "",
          vk_->coopmat ? "cooperative matrices" : "no cooperative matrices");
   ub_ = std::clamp(opt.ubatch, 64, 512);
+  submit_layers_ = vk_->integrated ? 1 : 8;
+  if (const char* e = getenv("QE_VK_SUBMIT_LAYERS")) submit_layers_ = std::max(1, atoi(e));
   // weights this backend will place on the GPU (trunk layers, output head; not token_embd / MTP)
   size_t wbytes = 0, ffn_bytes = 0;
   for (const auto& t : gguf_->tensors()) {
@@ -154,9 +156,11 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
       }
     }
     w16_ = vk_->alloc(mx, Mem::Device, true);
-    if (vk_->coopmat) {
-      const int kmax = std::max({c.n_embd, c.n_ff, c.d_inner, c.n_head * c.hd});
-      x16_ = vk_->alloc((size_t)ub_ * kmax * 2, Mem::Device, true);
+    const int kmax = std::max({2 * c.n_embd, c.n_ff, c.d_inner, c.n_head * c.hd});
+    if (vk_->coopmat) x16_ = vk_->alloc((size_t)ub_ * kmax * 2, Mem::Device, true);
+    if (vk_->int_dot) {
+      xq8_ = vk_->alloc((size_t)kMaxTok * kmax, Mem::Device, true);
+      xd8_ = vk_->alloc((size_t)kMaxTok * kmax / 32 * 4, Mem::Device, true);
     }
   }
   emb_h_ = vk_->alloc(U * E * 4, Mem::Host);
@@ -299,6 +303,10 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   vk_->warm_pipelines();
   autotune();
   if (const char* g = getenv("QE_VK_GEMM")) tune_.gemm = g;  // fused | gemm16 | cm_gemm_MxNxK
+  if (const char* f = getenv("QE_VK_FORCE_COOP")) {  // 0 generic, 1 cooperative, 2 cooperative + int8 dot
+    tune_.coop = atoi(f) >= 1;
+    tune_.i8 = atoi(f) >= 2 && vk_->int_dot;
+  }
   reset();
   QE_LOG("[plan] loaded in %.1f s\n", qe_now() - t_start);
 }
@@ -397,9 +405,10 @@ bool VkModel::cm_selftest(const std::string& pipe, uint32_t M, uint32_t N) {
   grid1d(ep.n, ex, ey);
   vk_->dispatch("to_f16", &ep, sizeof ep, ex, ey);
   unsigned m_ = M, n_ = N, k_ = 0;
-  sscanf(pipe.c_str(), "cm_gemm_%ux%ux%u", &m_, &n_, &k_);
+  const bool staged = pipe.rfind("cms_", 0) == 0;
+  sscanf(pipe.c_str(), staged ? "cms_gemm_%ux%ux%u" : "cm_gemm_%ux%ux%u", &m_, &n_, &k_);
   MvPC pc{bw.addr, x16_.addr, by.addr, tab_.addr, (uint32_t)K, (uint32_t)NR, (uint32_t)T, 0, (uint32_t)K, (uint32_t)NR,
-          0, 0, (uint32_t)(K / k_)};
+          0, 0, (uint32_t)(K / (staged ? 32 : k_))};
   vk_->dispatch(pipe.c_str(), &pc, sizeof pc, NR / (8 * N), (T + 4 * M - 1) / (4 * M), 1);
   vk_->submit();
   double e = 0, rms = 0;
@@ -440,7 +449,7 @@ void VkModel::autotune() {
     if (L.ffn_gate.valid() && L.ffn_gate.buf.device_local && L.ffn_down.buf.device_local) { L0 = &L; break; }
   const VMat* mats[2] = {L0 ? &L0->ffn_gate : &output_, L0 ? &L0->ffn_down : &output_};
   char key[256];
-  snprintf(key, sizeof key, "vk-tune-v2-%x-%x-%x-%s%dx%d-%s%dx%d-ub%d", vk_->vendor_id, vk_->device_id,
+  snprintf(key, sizeof key, "vk-tune-v4-%x-%x-%x-%s%dx%d-%s%dx%d-ub%d", vk_->vendor_id, vk_->device_id,
            vk_->driver_version, type_tag(mats[0]->type), mats[0]->N, mats[0]->K, type_tag(mats[1]->type), mats[1]->N,
            mats[1]->K, ub_);
   const char* home = getenv("HOME");
@@ -469,15 +478,21 @@ void VkModel::autotune() {
     if (FILE* f = fopen(path.c_str(), "r")) {
       char g[64] = "";
       Tune t;
-      const int n = fscanf(f, "%d %d %u %d %d %63s", &t.mv_teams, &t.mv_r, &t.mv_sg, &t.mm_teams, &t.mm_r, g);
+      int coop = 0, i8 = 0;
+      const int n = fscanf(f, "%d %d %u %d %d %d %d %d %d %d %d %63s", &t.mv_teams, &t.mv_r, &t.mv_sg, &t.mm_teams, &t.mm_r,
+                           &coop, &t.c_teams, &t.c_r, &t.cm_teams, &t.cm_r, &i8, g);
       fclose(f);
       t.gemm = g;
-      const bool cm_ok = t.gemm.rfind("cm_", 0) != 0 || std::find(cms.begin(), cms.end(), t.gemm) != cms.end();
-      if (n == 6 && t.mv_teams > 0 && t.mv_r > 0 && t.mm_teams > 0 && t.mm_r > 0 && cm_ok) {
+      t.coop = coop != 0;
+      t.i8 = i8 != 0 && vk_->int_dot;
+      const std::string base = t.gemm.rfind("cms_", 0) == 0 ? "cm" + t.gemm.substr(3) : t.gemm;
+      const bool cm_ok = base.rfind("cm_", 0) != 0 || std::find(cms.begin(), cms.end(), base) != cms.end();
+      if (n == 12 && t.mv_teams > 0 && t.mv_r > 0 && t.mm_teams > 0 && t.mm_r > 0 && cm_ok) {
         tune_ = t;
-        QE_LOG("[tune] cached: matvec %d teams x %d rows, subgroup %s, T=4 %d x %d; prefill GEMM %s\n", tune_.mv_teams,
-               tune_.mv_r, tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default", tune_.mm_teams, tune_.mm_r,
-               tune_.gemm.c_str());
+        QE_LOG("[tune] cached: matvec %d teams x %d rows, subgroup %s, T=4 %d x %d; cooperative K-quant kernel %s "
+               "(%d x %d, T=4 %d x %d); prefill GEMM %s\n", tune_.mv_teams, tune_.mv_r,
+               tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default", tune_.mm_teams, tune_.mm_r,
+               tune_.coop ? (tune_.i8 ? "on, int8 dot" : "on") : "off", tune_.c_teams, tune_.c_r, tune_.cm_teams, tune_.cm_r, tune_.gemm.c_str());
         return;
       }
     }
@@ -529,12 +544,76 @@ void VkModel::autotune() {
   }
   tune_ = bt;
   const double mm_us = best / 8 * 1e6;
+  // ---- cooperative super-block kernel (K-quants / Q8_0): its own shapes; kept when it beats the
+  // generic kernel on this device (Intel Xe2: scattered per-lane block reads are slow there)
+  bool any_c = false;
+  for (const VMat* m : mats) any_c |= vk_->has_pipeline((std::string("mvc_") + type_tag(m->type)).c_str());
+  double c1 = 1e30, c4 = 1e30;
+  if (any_c) {
+    const int cshapes[][2] = {{16, 1}, {8, 2}, {32, 1}, {8, 1}, {16, 2}, {4, 2}};
+    tune_.coop = true;
+    for (int multi = 0; multi < 2; multi++)
+      for (auto& sh : cshapes) {
+        const size_t shmem = 8u * sh[0] * sh[1] * 33 * 4;
+        if (shmem > vk_->max_shared || 32u * sh[0] > vk_->max_wg_invocations) continue;
+        (multi ? tune_.cm_teams : tune_.c_teams) = sh[0];
+        (multi ? tune_.cm_r : tune_.c_r) = sh[1];
+        const uint32_t T = multi ? 4 : 1;
+        const double t = bench([&] {
+          for (int i = 0; i < (multi ? 4 : 8); i++)
+            for (const VMat* m : mats) {
+              MvPC pc{m->buf.addr, m == mats[0] ? xn_.addr : t1_.addr, t0_.addr, tab_.addr, (uint32_t)m->K,
+                      (uint32_t)m->N, T, (uint32_t)m->rb, (uint32_t)m->K, (uint32_t)m->N, 0, 0, (uint32_t)(m->K / 32)};
+              matvec(*m, pc, true);
+            }
+        }, 3) / (multi ? 8 : 16) * 1e6;
+        QE_DBG("[tune] cooperative %s %d teams x %d rows: %.1f us\n", multi ? "T=4" : "T=1", sh[0], sh[1], t);
+        double& b = multi ? c4 : c1;
+        if (t < b * 0.98) {
+          b = t;
+          if (multi) { bt.cm_teams = sh[0]; bt.cm_r = sh[1]; }
+          else { bt.c_teams = sh[0]; bt.c_r = sh[1]; }
+        }
+        (multi ? tune_.cm_teams : tune_.c_teams) = multi ? bt.cm_teams : bt.c_teams;
+        (multi ? tune_.cm_r : tune_.c_r) = multi ? bt.cm_r : bt.c_r;
+      }
+    // decode is ~all T = 1 and verify passes (T ~ 3-4) are its other half: weigh both
+    bt.coop = c1 + c4 < (mv_us + mm_us) * 0.97;
+    // int8 activations + packed integer dot products with the shapes found above
+    bool any_i = false;
+    for (const VMat* m : mats) any_i |= vk_->has_pipeline((std::string("mvci_") + type_tag(m->type)).c_str());
+    if (bt.coop && any_i && xq8_.buf) {
+      tune_ = bt;
+      tune_.i8 = true;
+      double i1 = 0, i4 = 0;
+      for (int multi = 0; multi < 2; multi++) {
+        const uint32_t T = multi ? 4 : 1;
+        (multi ? i4 : i1) = bench([&] {
+          for (int i = 0; i < (multi ? 4 : 8); i++)
+            for (const VMat* m : mats) {
+              MvPC pc{m->buf.addr, m == mats[0] ? xn_.addr : t1_.addr, t0_.addr, tab_.addr, (uint32_t)m->K,
+                      (uint32_t)m->N, T, (uint32_t)m->rb, (uint32_t)m->K, (uint32_t)m->N, 0, 0, (uint32_t)(m->K / 32)};
+              xq_mark_ = ~0ull;  // quantize every time: as in decode, where each input is new
+              matvec(*m, pc, true);
+            }
+        }, 3) / (multi ? 8 : 16) * 1e6;
+      }
+      QE_DBG("[tune] cooperative int8 dot: T=1 %.1f us, T=4 %.1f us (float: %.1f / %.1f)\n", i1, i4, c1, c4);
+      bt.i8 = i1 + i4 < (c1 + c4) * 0.97;
+      if (bt.i8) { c1 = i1; c4 = i4; }
+    }
+  }
+  tune_ = bt;
   // ---- prefill GEMM
   std::vector<std::string> methods = {"fused", "gemm16"};
   for (auto& nm : cms) {
     unsigned M, N, K;
     sscanf(nm.c_str(), "cm_gemm_%ux%ux%u", &M, &N, &K);
     if (cm_selftest(nm, M, N)) methods.push_back(nm);
+    // shared-memory staged variant (operands from on-chip memory), when its tiles fit
+    const std::string st = "cms" + nm.substr(2);
+    const size_t shm = (size_t)(4 * M + 8 * N) * 40 * 2 + (size_t)4 * M * 8 * N * 4;
+    if (vk_->has_pipeline(st.c_str()) && shm <= vk_->max_shared && cm_selftest(st, M, N)) methods.push_back(st);
   }
   best = 1e30;
   std::string bg = "gemm16";
@@ -551,13 +630,19 @@ void VkModel::autotune() {
   }
   tune_.gemm = bg;
   QE_LOG("[tune] measured in %.1f s: matvec %d teams x %d rows, subgroup %s (%.0f us/matrix), T=4 %d x %d (%.0f us); "
-         "prefill GEMM %s (%.1f ms per %d-token pair)\n",
+         "cooperative K-quant kernel %s; prefill GEMM %s (%.1f ms per %d-token pair)\n",
          qe_now() - t_start, tune_.mv_teams, tune_.mv_r, tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default",
-         mv_us, tune_.mm_teams, tune_.mm_r, mm_us, tune_.gemm.c_str(), best * 1e3, ub_);
+         mv_us, tune_.mm_teams, tune_.mm_r, mm_us,
+         !any_c ? "n/a (no K-quant / Q8_0 matrices)"
+                : (std::string(tune_.coop ? (tune_.i8 ? "on, int8 dot" : "on") : "off") + " (" + std::to_string(tune_.c_teams) + " x " +
+                   std::to_string(tune_.c_r) + ": " + std::to_string((int)c1) + " us, T=4 " + std::to_string(tune_.cm_teams) + " x " +
+                   std::to_string(tune_.cm_r) + ": " + std::to_string((int)c4) + " us)").c_str(),
+         tune_.gemm.c_str(), best * 1e3, ub_);
   if (!path.empty()) {
     (void)!system(("mkdir -p '" + path.substr(0, path.rfind('/')) + "'").c_str());
     if (FILE* f = fopen(path.c_str(), "w")) {
-      fprintf(f, "%d %d %u %d %d %s\n", tune_.mv_teams, tune_.mv_r, tune_.mv_sg, tune_.mm_teams, tune_.mm_r, tune_.gemm.c_str());
+      fprintf(f, "%d %d %u %d %d %d %d %d %d %d %d %s\n", tune_.mv_teams, tune_.mv_r, tune_.mv_sg, tune_.mm_teams, tune_.mm_r,
+              tune_.coop ? 1 : 0, tune_.c_teams, tune_.c_r, tune_.cm_teams, tune_.cm_r, tune_.i8 ? 1 : 0, tune_.gemm.c_str());
       fclose(f);
     }
   }
@@ -775,6 +860,49 @@ void VkModel::matvec(const VMat& m, const MvPC& pc0, bool bar) {
   MvPC pc = pc0;
   pc.wide = m.N < 2048;  // few rows: one row per workgroup so the GPU is filled
   const bool multi = pc.T > 1;
+  const std::string ctag = std::string("mvc_") + type_tag(m.type);
+  // the cooperative kernel also serves the small K/V projections (1024 rows), which the generic kernel
+  // runs in its slow one-row-per-workgroup mode
+  const std::string itag = std::string("mvci_") + type_tag(m.type);
+  if (tune_.coop && tune_.i8 && m.N >= 256 && xq8_.buf && vk_->has_pipeline(itag.c_str())) {
+    // int8 activations: quantize once per input (q/k/v, gate/up share it), then DP4A
+    if (!(pc.x == xq_src_ && pc.T == xq_T_ && pc.K == xq_K_ && vk_->ops() == xq_mark_)) {
+      ElemPC ep{pc.x, xq8_.addr, xd8_.addr, 0, 0, 0, pc.T * pc.K / 32, 0, 0};
+      uint32_t ex, ey;
+      grid1d(ep.n, ex, ey);
+      vk_->dispatch("quant_q8", &ep, sizeof ep, ex, ey);
+      xq_src_ = pc.x; xq_T_ = pc.T; xq_K_ = pc.K;
+    }
+    pc.wide = 0;
+    pc.x = xq8_.addr;
+    pc.tab = xd8_.addr;
+    const int teams = multi ? tune_.cm_teams : tune_.c_teams, rr = multi ? tune_.cm_r : tune_.c_r;
+    const uint32_t rows = (uint32_t)(teams * rr);
+    uint32_t gx, gy;
+    grid_wg((m.N + rows - 1) / rows, gx, gy);
+    PipeOpt po;
+    po.spec0 = rr;
+    po.spec1 = 32 * teams;
+    po.spec2 = multi ? 1 : 0;
+    po.subgroup = tune_.mv_sg;
+    vk_->dispatch(itag.c_str(), &pc, sizeof pc, gx, gy, 1, bar, po);
+    xq_mark_ = vk_->ops();  // only further matvecs on the same input may reuse the codes
+    return;
+  }
+  if (tune_.coop && m.N >= 256 && vk_->has_pipeline(ctag.c_str())) {
+    pc.wide = 0;
+    const int teams = multi ? tune_.cm_teams : tune_.c_teams, rr = multi ? tune_.cm_r : tune_.c_r;
+    const uint32_t rows = (uint32_t)(teams * rr);
+    uint32_t gx, gy;
+    grid_wg((m.N + rows - 1) / rows, gx, gy);
+    PipeOpt po;
+    po.spec0 = rr;
+    po.spec1 = 32 * teams;
+    po.spec2 = multi ? 1 : 0;
+    po.subgroup = tune_.mv_sg;
+    vk_->dispatch(ctag.c_str(), &pc, sizeof pc, gx, gy, 1, bar, po);
+    return;
+  }
   const int teams = multi ? tune_.mm_teams : tune_.mv_teams, rr = multi ? tune_.mm_r : tune_.mv_r;
   const uint32_t rows = (uint32_t)(teams * rr);
   uint32_t gx, gy;
@@ -804,8 +932,9 @@ void VkModel::gemm(const VMat& m, MvPC pc, const std::string& method, bool bar) 
   const std::string tag = type_tag(m.type);
   const bool two = method != "fused" && (size_t)m.N * m.K * 2 <= w16_.size;  // output head: fused
   unsigned M = 0, N = 0, K = 0;
-  const bool cm = two && sscanf(method.c_str(), "cm_gemm_%ux%ux%u", &M, &N, &K) == 3 && m.N % (8 * N) == 0 &&
-                  x16_.buf;
+  const bool staged = method.rfind("cms_", 0) == 0;  // shared-memory staged variant: 32-wide k steps
+  const bool cm = two && sscanf(method.c_str(), staged ? "cms_gemm_%ux%ux%u" : "cm_gemm_%ux%ux%u", &M, &N, &K) == 3 &&
+                  m.N % (8 * N) == 0 && x16_.buf;
   if (two) {
     MvPC dq = pc;
     dq.y = w16_.addr;
@@ -827,8 +956,8 @@ void VkModel::gemm(const VMat& m, MvPC pc, const std::string& method, bool bar) 
     pc.x = x16_.addr;
     gx = m.N / (8 * N);
     gy = (T + 4 * M - 1) / (4 * M);
-    nsteps = m.K / K;
-    min_steps = 256 / K;
+    nsteps = m.K / (staged ? 32 : K);
+    min_steps = 256 / (staged ? 32 : K);
     align = 1;
     pipe = method;
   } else {
@@ -1012,10 +1141,18 @@ void VkModel::forward_chunk(const int* tokens, int T, int pos0) {
   vk_->begin();
   vk_->copy(emb_h_, 0, x_, 0, (size_t)T * c.n_embd * 4);
   pend_ = false;
+  // prefill: split the pass into several submissions so no single one runs for seconds (GPU drivers
+  // reset jobs that exceed their timeout: Xe / i915 / amdgpu; an iGPU runs a 27B layer in ~0.1 s)
+  const int every = T > kMaxTok ? submit_layers_ : 1 << 30;
+  int nl = 0;
   for (auto& L : layers_) {
     if (L.attn) layer_attn(L, T, pos0);
     else layer_gdn(L, T);
     layer_ffn(L, T);
+    if (++nl % every == 0 && nl < (int)layers_.size()) {
+      vk_->submit();
+      vk_->begin();
+    }
   }
   norm_in(output_norm_, T);
   if (mtp_on_ && T <= kMaxTok) vk_->copy(xn_, 0, hid_, 0, (size_t)T * c.n_embd * 4);  // rows for mtp_draft

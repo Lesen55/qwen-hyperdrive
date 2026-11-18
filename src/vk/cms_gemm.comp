@@ -1,0 +1,94 @@
+// variants: cms_gemm_16x16x16:CM_M=16,CM_N=16,CM_K=16 cms_gemm_8x16x16:CM_M=8,CM_N=16,CM_K=16 cms_gemm_16x8x16:CM_M=16,CM_N=8,CM_K=16 cms_gemm_8x8x16:CM_M=8,CM_N=8,CM_K=16 cms_gemm_8x8x8:CM_M=8,CM_N=8,CM_K=8 cms_gemm_16x8x8:CM_M=16,CM_N=8,CM_K=8
+// Prefill GEMM on matrix hardware with shared-memory staging (cm_gemm loads the fragments straight
+// from global memory; matrix units such as Intel XMX want their operands from on-chip memory).
+// Per 32-wide k step the workgroup copies the activation tile (4M tokens x 32, f16) and the weight
+// tile (8N rows x 32, f16) into shared memory with coalesced loads; subgroups then run the MMAs on
+// 2M x 4N blocks (2 x 4 accumulators) from there.  Same split-K / bounds handling as cm_gemm; kg is
+// in units of 32-wide k steps.
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "common.glsl"
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer H16x2 { f16vec2 d[]; };
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
+#define CBT (2u * CM_M)
+#define CBR (4u * CM_N)
+#define CTT (2u * CBT)
+#define CTR (2u * CBR)
+#define KS 32u
+#define LDS 40u  // padded row length (halves) of the staged tiles
+shared float16_t As[CTT * LDS];
+shared float16_t Bs[CTR * LDS];
+shared float Cs[CTT * CTR];
+#define ACC coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator>
+void main() {
+  H16x2 W = H16x2(pc.w);
+  H16x2 X = H16x2(pc.x);
+  F32 y = F32(pc.y);
+  const uint tid = gl_LocalInvocationID.x;
+  const uint r0 = gl_WorkGroupID.x * CTR, c0 = gl_WorkGroupID.y * CTT;
+  const uint nk = pc.K / KS;
+  const uint ks = gl_WorkGroupID.z * pc.kg, ke = min(nk, ks + pc.kg);
+  const uint KW = pc.K / 2u;  // f16 pairs per row
+  // each subgroup keeps the accumulators of the blocks it owns (blocks b = sg, sg + nsg, ...): at
+  // most 4 blocks; with >= 4 subgroups (128 threads / subgroup <= 32) exactly one
+  const uint nsg = gl_NumSubgroups, sg = gl_SubgroupID;
+  ACC c[2][4];
+  ACC c2[2][4];  // second block when there are only 2 subgroups (wave64)
+  for (uint i = 0u; i < 2u; i++) for (uint j = 0u; j < 4u; j++) { c[i][j] = ACC(0.0); c2[i][j] = ACC(0.0); }
+  for (uint k = ks; k < ke; k++) {
+    barrier();
+    for (uint e = tid; e < CTT * 16u; e += 128u) {  // activation tile: CTT rows x 16 pairs
+      const uint r = e / 16u, q = e % 16u;
+      const f16vec2 v = X.d[(c0 + r) * KW + k * 16u + q];
+      As[r * LDS + 2u * q] = v.x;
+      As[r * LDS + 2u * q + 1u] = v.y;
+    }
+    for (uint e = tid; e < CTR * 16u; e += 128u) {  // weight tile: CTR rows x 16 pairs
+      const uint r = e / 16u, q = e % 16u;
+      const f16vec2 v = r0 + r < pc.N ? W.d[(r0 + r) * KW + k * 16u + q] : f16vec2(0.0);
+      Bs[r * LDS + 2u * q] = v.x;
+      Bs[r * LDS + 2u * q + 1u] = v.y;
+    }
+    barrier();
+    for (uint pass = 0u; pass < 2u; pass++) {
+      const uint b = sg + pass * nsg;
+      if (b >= 4u || (pass == 1u && nsg > 2u)) break;
+      const uint bt = (b / 2u) * CBT, br = (b % 2u) * CBR;
+      for (uint kk = 0u; kk < KS; kk += CM_K) {
+        coopmat<float16_t, gl_ScopeSubgroup, CM_M, CM_K, gl_MatrixUseA> a[2];
+        coopmat<float16_t, gl_ScopeSubgroup, CM_K, CM_N, gl_MatrixUseB> bm[4];
+        for (uint i = 0u; i < 2u; i++)
+          coopMatLoad(a[i], As, (bt + CM_M * i) * LDS + kk, LDS, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint j = 0u; j < 4u; j++)
+          coopMatLoad(bm[j], Bs, (br + CM_N * j) * LDS + kk, LDS, gl_CooperativeMatrixLayoutColumnMajor);
+        if (pass == 0u)
+          for (uint i = 0u; i < 2u; i++) for (uint j = 0u; j < 4u; j++) c[i][j] = coopMatMulAdd(a[i], bm[j], c[i][j]);
+        else
+          for (uint i = 0u; i < 2u; i++) for (uint j = 0u; j < 4u; j++) c2[i][j] = coopMatMulAdd(a[i], bm[j], c2[i][j]);
+      }
+    }
+  }
+  for (uint pass = 0u; pass < 2u; pass++) {
+    const uint b = sg + pass * nsg;
+    if (b >= 4u || (pass == 1u && nsg > 2u)) break;
+    const uint bt = (b / 2u) * CBT, br = (b % 2u) * CBR;
+    for (uint i = 0u; i < 2u; i++)
+      for (uint j = 0u; j < 4u; j++)
+        coopMatStore(pass == 0u ? c[i][j] : c2[i][j], Cs, (bt + CM_M * i) * CTR + br + CM_N * j, CTR,
+                     gl_CooperativeMatrixLayoutRowMajor);
+  }
+  barrier();
+  const bool split = gl_NumWorkGroups.z > 1u;
+  const uint yoff = gl_WorkGroupID.z * pc.T * pc.ldy;
+  for (uint e = tid; e < CTT * CTR; e += 128u) {
+    const uint t = c0 + e / CTR, n = r0 + e % CTR;
+    if (t >= pc.T || n >= pc.N) continue;
+    const uint o = t * pc.ldy + n;
+    const float v = Cs[e];
+    if (split) y.d[yoff + o] = v;
+    else y.d[o] = pc.acc != 0u ? y.d[o] + v : v;
+  }
+}

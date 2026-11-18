@@ -82,6 +82,9 @@ class VkModel : public IModel {
   struct Tune {
     int mv_teams = 4, mv_r = 4;  // decode matvec: 32-lane teams per workgroup x rows per team
     int mm_teams = 4, mm_r = 2;  // T = 2..8 (speculative verify) matvec
+    bool coop = false;           // cooperative super-block kernel (mvc_*) for K-quants / Q8_0
+    int c_teams = 16, c_r = 1, cm_teams = 16, cm_r = 1;  // its shapes for T = 1 / T > 1
+    bool i8 = false;             // ... with int8 activations and packed integer dot products
     uint32_t mv_sg = 0;          // required subgroup size (0: driver default)
     std::string gemm = "gemm16"; // prefill: fused | gemm16 | cm_gemm_MxNxK
   };
@@ -121,12 +124,16 @@ class VkModel : public IModel {
   std::vector<VLayer> layers_;
   VMat output_, tok_embd_;
   VBuf output_norm_, tab_;
-  int ub_ = 512, ctx_len_ = 0;
+  int ub_ = 512, ctx_len_ = 0, submit_layers_ = 8;
   bool kv_q8_ = true;
   size_t kv_row_bytes_ = 0;  // bytes per (position, kv head)
   // activations
   VBuf x_, xn_, t0_, t1_, t2_, t3_, t4_, g_, beta_, logits_, part_, argmax_, ksplit_, w16_;
   VBuf x16_;
+  VBuf xq8_, xd8_;                 // int8 activations of the current matvec input (DP4A kernels)
+  VkDeviceAddress xq_src_ = 0;     // ... quantized from this address, still valid while ops() == xq_mark_
+  uint32_t xq_T_ = 0, xq_K_ = 0;
+  uint64_t xq_mark_ = ~0ull;
   VBuf emb_h_, rope_h_, logits_h_, argmax_h_, staging_;
   VBuf ssm_, conv_;
   size_t ssm_bytes_ = 0, conv_bytes_ = 0;
