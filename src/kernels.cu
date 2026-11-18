@@ -2222,7 +2222,8 @@ void rmsnorm_heads(float* x, const float* w, int hd, int nh, int hstride, int to
 }
 
 // RoPE frequency table (per rotated pair) and cos / sin scale; set by set_rope_table (YaRN models).
-// Without a table the plain NeoX frequencies base^(-2i/rot) are used.
+// A launch uses it when the caller passes base < 0 (log2_base < 0 here), else the plain NeoX
+// frequencies base^(-2i/rot): several models in one process (target + draft) each pick their own.
 __constant__ double c_rope_freq[64];
 __constant__ float c_rope_mscale = 1.f;
 __constant__ int c_rope_tab = 0;
@@ -2234,7 +2235,7 @@ void set_rope_table(const double* freq, int half, float mscale) {
   CUDA_CHECK(cudaMemcpyToSymbol(c_rope_tab, &on, sizeof(int)));
 }
 static __device__ __forceinline__ double rope_freq(int i, int rot, float log2_base) {
-  return c_rope_tab ? c_rope_freq[i] : exp2(-(double)log2_base * (2.0 * i / rot));
+  return (c_rope_tab && log2_base < 0) ? c_rope_freq[i] : exp2(-(double)log2_base * (2.0 * i / rot));
 }
 
 __global__ void k_rope_neox(float* x, const int* __restrict__ pos, int hd, int nh, int hstride,
@@ -2251,7 +2252,8 @@ __global__ void k_rope_neox(float* x, const int* __restrict__ pos, int hd, int n
   const double freq = rope_freq(i, rot, log2_base);
   double sd, cd;
   sincos((double)pos[t] * freq, &sd, &cd);
-  const float sn = (float)sd * c_rope_mscale, cs = (float)cd * c_rope_mscale;
+  const float ms = log2_base < 0 ? c_rope_mscale : 1.f;
+  const float sn = (float)sd * ms, cs = (float)cd * ms;
   const float a = p[i], b = p[i + half];
   p[i] = a * cs - b * sn;
   p[i + half] = a * sn + b * cs;
@@ -2260,7 +2262,7 @@ __global__ void k_rope_neox(float* x, const int* __restrict__ pos, int hd, int n
 void rope_neox(float* x, const int* pos, int hd, int nh, int hstride, int tokens, int tstride,
                int rot, float base, cudaStream_t s) {
   const int64_t n = (int64_t)tokens * nh * (rot / 2);
-  k_rope_neox<<<cdiv(n, 256), 256, 0, s>>>(x, pos, hd, nh, hstride, tokens, tstride, rot, log2f(base));
+  k_rope_neox<<<cdiv(n, 256), 256, 0, s>>>(x, pos, hd, nh, hstride, tokens, tstride, rot, base < 0 ? -1.f : log2f(base));
 }
 
 // small host->device transfers done by the SMs (zero-copy reads of pinned host memory) so they do
@@ -2334,8 +2336,9 @@ __global__ void k_qk_norm_rope(float* q, const float* __restrict__ qw, int qhs, 
     const double freq = rope_freq(threadIdx.x, rot, log2_base);
     double sd, cd;
     sincos((double)pos[t] * freq, &sd, &cd);
-    cs[threadIdx.x] = (float)cd * c_rope_mscale;
-    sn[threadIdx.x] = (float)sd * c_rope_mscale;
+    const float ms = log2_base < 0 ? c_rope_mscale : 1.f;
+    cs[threadIdx.x] = (float)cd * ms;
+    sn[threadIdx.x] = (float)sd * ms;
   }
   __syncthreads();
   if (warp >= nhq + nhk) return;
@@ -2356,7 +2359,7 @@ __global__ void k_qk_norm_rope(float* q, const float* __restrict__ qw, int qhs, 
 bool qk_norm_rope(float* q, const float* qw, int qhs, int qts, int nhq, float* k, const float* kw, int khs, int kts,
                   int nhk, const int* pos, int hd, int tokens, int rot, float base, float eps, cudaStream_t s) {
   if ((nhq + nhk) * 32 > 1024 || rot > 128) return false;
-  k_qk_norm_rope<<<tokens, (nhq + nhk) * 32, 0, s>>>(q, qw, qhs, qts, nhq, k, kw, khs, kts, nhk, pos, hd, rot, log2f(base), eps);
+  k_qk_norm_rope<<<tokens, (nhq + nhk) * 32, 0, s>>>(q, qw, qhs, qts, nhq, k, kw, khs, kts, nhk, pos, hd, rot, base < 0 ? -1.f : log2f(base), eps);
   return true;
 }
 

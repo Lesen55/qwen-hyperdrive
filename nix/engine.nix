@@ -138,6 +138,10 @@ let
       fi
     fi
     args=("$@")
+    # draft model for speculative decoding of models without MTP (e.g. Qwen3.5-0.8B for SenseNova-Loop)
+    if [ -n "''${LLM_ENGINE_DRAFT_MODEL:-}" ]; then
+      case " $* " in *" --draft-model "*) ;; *) args+=(--draft-model "$LLM_ENGINE_DRAFT_MODEL") ;; esac
+    fi
     case " $* " in
       *" -m "*|*" --model "*) ;;
       *)

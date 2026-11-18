@@ -113,6 +113,9 @@ class IModel {
   virtual const int* topk_idx(int) const { return nullptr; }
   virtual const float* topk_val(int) const { return nullptr; }
   virtual void sync() {}
+  // one fast (device-side) copy of the recurrent state, for rewinding a draft model
+  virtual bool state_save() { return false; }
+  virtual void state_restore() {}
   // telemetry
   virtual KvInfo kv_info() const { return {}; }
   virtual PlanStats plan_stats() const { return {}; }

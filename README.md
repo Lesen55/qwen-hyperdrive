@@ -55,7 +55,16 @@
 
 検証済み: Huihui-Qwen3.8-27B IQ3_XXS-mtp（10 GB に収まらないためストリーミング + CPU 併用）、Qwen3.5-9B Q4_K_M MTP（全層 VRAM 常駐）。
 Qwen3.5-9B Q4_K_M（RTX 3080）: 短い文脈のデコード 141〜259 tok/s、32K プリフィル 9.7 秒（3376 tok/s）。
-SenseNova-Loop-9B Q4_K_M（RTX 3080、CUDA）: デコード 57 tok/s（56 段ぶんの重みを毎トークン読む）、n-gram 投機込みでコードの書き換え 75 tok/s・サーバーの会話 64〜65 tok/s、プリフィル 400〜1200 tok/s。ループ 2 回目を外すと PPL が 8.4 → 17.7、最後の 4 層を外すと 481 になることで構造の正しさを確認（参照実装 GuideboardLabs/llama.cpp-sensenova-loop の route / merge と一致させた実装）。
+SenseNova-Loop-9B Q4_K_M（RTX 3080、CUDA）: デコード 57 tok/s（56 段ぶんの重みを毎トークン読む）、プリフィル 400〜1200 tok/s。MTP ヘッドが無いので、同じトークナイザの小さいモデルを下書きにする投機デコード（`--draft-model`、起動ラッパーでは `LLM_ENGINE_DRAFT_MODEL`）に対応:
+
+| SenseNova-Loop-9B（RTX 3080） | 下書きなし（n-gram のみ） | + Qwen3.5-0.8B Q8_0 下書き |
+|---|---|---|
+| 物語（greedy / temp 0.7） | 57.6 / 56.5 tok/s | 75.2 / 68.7 tok/s |
+| 日本語の解説 | 59.0 / 55.7 tok/s | 71.7 / 72.5 tok/s |
+| コードの書き換え | 74.9 / 73.5 tok/s | 117.3 / 114.6 tok/s |
+| サーバーの会話 | 64〜65 tok/s | 66〜88 tok/s |
+
+下書きモデルは本体より先に必要な分だけ VRAM を取り（0.8B で約 1 GB）、下書き前の DeltaNet 状態を GPU 内に退避して外れた分を巻き戻す。検証は MTP と同じ仕組み（温度ありでは下書きの分布 q による厳密な棄却サンプリング）。Qwen3.5-2B を下書きにすると、1 トークンが重い分かえって遅かった。ループ 2 回目を外すと PPL が 8.4 → 17.7、最後の 4 層を外すと 481 になることで構造の正しさを確認（参照実装 GuideboardLabs/llama.cpp-sensenova-loop の route / merge と一致させた実装）。
 
 ### Vulkan バックエンド
 

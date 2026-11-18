@@ -238,6 +238,7 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
     else last_ = sampler_.sample(logits_.data(), m_.cfg().n_vocab, history_);
   }
   committed().assign(prompt.begin(), prompt.end());
+  if (dm_) dm_sync(prompt);
   QE_DBG("[gen] start: lookup/restore %.1f ms, prepare_context %.1f ms, prefill %.1f ms (%d tokens)\n",
          (t_lookup - t0) * 1e3, (t_prep - t_lookup) * 1e3, (qe_now() - t_prep) * 1e3, n - p0);
   pos_ = n;
@@ -254,6 +255,65 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
   st_.t_prefill = qe_now() - t0;
   st_.generated = 1;
   return last_;
+}
+
+// Draft model: bring it to the committed prompt (prefix reuse when it continues what it has read,
+// else from scratch: a recurrent state cannot be rewound).
+void Generator::dm_sync(const std::vector<int>& toks) {
+  if (dm_seq_ < 0 || !dm_->seq_alive(dm_seq_)) {
+    dm_seq_ = dm_->seq_create();
+    dm_hist_.clear();
+  }
+  dm_->seq_select(dm_seq_);
+  dm_todo_.clear();
+  size_t l = 0;
+  while (l < dm_hist_.size() && l < toks.size() && dm_hist_[l] == toks[l]) l++;
+  if (l < dm_hist_.size()) {
+    dm_->reset();
+    dm_hist_.clear();
+    l = 0;
+  }
+  if (l < toks.size()) {
+    dm_->prepare_context((int)toks.size() + 16);
+    dm_->forward(toks.data() + l, (int)(toks.size() - l), (int)l, nullptr, 0);
+    dm_hist_.assign(toks.begin(), toks.end());
+  }
+}
+
+// Draft model proposals: read the pending committed tokens and last_ in one pass (its argmax / sample
+// is d1), save the state, then chain single-token passes for d2..dk.  Sampled mode keeps each draft's
+// distribution q so verification is exact rejection sampling.
+void Generator::dm_make_drafts(bool sampled) {
+  const int V = m_.cfg().n_vocab;
+  const int k = std::max(1, std::min({want_drafts_, m_.draft_max(), mtp_cap()}));
+  if (sampled && (int)dm_logits_.size() < V) dm_logits_.resize(V);
+  std::vector<int> in = dm_todo_;
+  in.push_back(last_);
+  std::vector<int> hist = history_;
+  auto next = [&](const int* toks, int n, int pos) {
+    int d = -1;
+    if (!sampled) {
+      dm_->forward(toks, n, pos, nullptr, 1, &d);
+    } else {
+      dm_->forward(toks, n, pos, dm_logits_.data(), 1);
+      dq_.emplace_back();
+      sampler_.dist(dm_logits_.data(), V, hist, dq_.back());
+      d = sampler_.draw(dq_.back());
+    }
+    return d;
+  };
+  int d = next(in.data(), (int)in.size(), (int)dm_hist_.size());
+  dm_hist_.insert(dm_hist_.end(), in.begin(), in.end());
+  dm_todo_.clear();
+  if (!dm_->state_save()) { dm_ = nullptr; return; }  // cannot rewind: stop using the draft model
+  drafts_.push_back(d);
+  hist.push_back(d);
+  for (int i = 1; i < k; i++) {
+    d = next(&drafts_.back(), 1, (int)dm_hist_.size() + i - 1);
+    drafts_.push_back(d);
+    hist.push_back(d);
+  }
+  dm_drafted_ = true;
 }
 
 // Build the draft chain [d1 .. dk] (k <= draft_max).  Greedy: MTP argmax tokens (stop when the
@@ -370,6 +430,8 @@ void Generator::step(std::vector<int>& out) {
       }
       last_ng_ = !drafts_.empty();
     }
+    dm_drafted_ = false;
+    if (drafts_.empty() && dm_) dm_make_drafts(!g);
   }
   if (!mtp_ && drafts_.empty()) {
     int next;
@@ -380,6 +442,7 @@ void Generator::step(std::vector<int>& out) {
       else next = sampler_.sample(logits_.data(), V, history_);
     }
     committed().push_back(last_);
+    if (dm_) dm_todo_.push_back(last_);
     pos_ += 1;
     last_ = next;
     history_.push_back(next);
@@ -472,7 +535,20 @@ void Generator::step(std::vector<int>& out) {
   static const bool hp = getenv("QE_HPROF") != nullptr;
   static double hp_rb = 0, hp_d1 = 0, hp_ch = 0, hp_n = 0;
   if (nd > 0) m_.rollback(a + 1);  // commit the accepted prefix of the verify pass
-  if (!mtp_) {  // n-gram only: commit and stop (no MTP head to draft from)
+  if (!mtp_) {  // n-gram / draft model: commit and stop (no MTP head)
+    if (dm_) {
+      if (dm_drafted_ && a == nd) {
+        // the draft read last_ and d1..d_{k-1} while drafting: only d_k is still to read
+        dm_hist_.insert(dm_hist_.end(), drafts_.begin(), drafts_.end() - 1);
+        dm_todo_.assign(1, drafts_.back());
+      } else if (dm_drafted_) {
+        dm_->state_restore();  // back to "after last_", then read the accepted drafts
+        dm_todo_.assign(drafts_.begin(), drafts_.begin() + a);
+      } else {  // n-gram step: everything committed is still unread by the draft
+        dm_todo_.push_back(in[0]);
+        dm_todo_.insert(dm_todo_.end(), drafts_.begin(), drafts_.begin() + a);
+      }
+    }
     pos_ += a + 1;
     last_ = s;
     st_.generated += a + 1;

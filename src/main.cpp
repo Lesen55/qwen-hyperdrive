@@ -39,6 +39,7 @@ int main(int argc, char** argv) {
   float draft_pmin = 0.f;
   SamplingParams sp;
   sp.temperature = 0.f;
+  std::string draft_model;
   for (int i = 2; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { if (i + 1 >= argc) QE_FATAL("missing value for %s", a.c_str()); return argv[++i]; };
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
     else if (a == "--reserve") reserve = std::stoi(next());
     else if (a == "--draft") mtp_max = std::stoi(next());
     else if (a == "--no-ngram") ngram = false;
+    else if (a == "--draft-model") draft_model = next();
     else if (a == "--cache-keep") opt.cache_keep = std::stoi(next());
     else if (a == "--cache-blocks") opt.cache_blocks = std::stoi(next());
     else if (a == "--cache-host-mb") opt.cache_host_mb = std::stoi(next());
@@ -78,6 +80,8 @@ int main(int argc, char** argv) {
     else if (a == "-v") opt.verbose = true;
     else QE_FATAL("unknown argument %s", a.c_str());
   }
+  std::unique_ptr<IModel> dmp;
+  if (!draft_model.empty()) dmp = create_draft_model(draft_model, opt);  // first: it takes its share of VRAM
   std::unique_ptr<IModel> mp = create_model(opt);
   IModel& model = *mp;
   const int V = model.cfg().n_vocab;
@@ -112,6 +116,7 @@ int main(int argc, char** argv) {
     gen.set_spec_relax(spec_relax);
     gen.set_mtp_max(mtp_max);
     gen.set_ngram(ngram);
+    if (dmp) gen.set_draft_model(dmp.get());
     std::vector<int> out;
     // QE_REPEAT=n: run the same generation n times through the prompt cache (server-like reuse)
     for (int rep = getenv("QE_REPEAT") ? atoi(getenv("QE_REPEAT")) : 1; rep > 1; rep--) {

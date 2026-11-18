@@ -55,6 +55,8 @@ class Generator {
   void set_spec_relax(float l) { spec_relax_ = l < 1.f ? 1.f : l; }
   void set_mtp_max(int n) { mtp_max_ = n < 1 ? 1 : n; }
   void set_ngram(bool on, int n = 3) { ngram_on_ = on; ngram_n_ = n < 2 ? 2 : n; }
+  // separate draft model (same tokenizer, e.g. Qwen3.5-0.8B) for targets without an MTP head
+  void set_draft_model(IModel* d) { dm_ = d; }
   // Process the prompt; returns the first generated token.  If the model state currently holds a
   // strict prefix of `prompt` (previous conversation turn), only the new suffix is processed.
   int start(const std::vector<int>& prompt, bool allow_reuse = true, int reserve = 4096);
@@ -97,6 +99,15 @@ class Generator {
   double tstep_[9] = {};
   int nstep_[9] = {};
   int want_drafts_ = 3;
+  // draft model: it has processed dm_hist_ (a prefix of the committed tokens); dm_todo_ are committed
+  // tokens it still has to read before drafting from last_
+  IModel* dm_ = nullptr;
+  int dm_seq_ = -1;
+  std::vector<int> dm_hist_, dm_todo_;
+  std::vector<float> dm_logits_;
+  bool dm_drafted_ = false;
+  void dm_sync(const std::vector<int>& toks);
+  void dm_make_drafts(bool sampled);
   int mtp_max_ = 5;  // MTP chain length cap (the adaptive policy picks the length below it)
   int mtp_long_ = 7, long_ctx_ = 16384;  // longer chains at long context (passes are PCIe-bound, drafts cheap)
   int mtp_cap() const {

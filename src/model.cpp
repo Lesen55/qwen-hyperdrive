@@ -313,7 +313,7 @@ void Model::plan_and_load() {
   auto bn = [](int il, const char* n) { return "blk." + std::to_string(il) + "." + n; };
 
   tok_embd_ = make_mat("token_embd.weight");
-  output_ = make_mat("output.weight");
+  output_ = make_mat(gguf_->tensor("output.weight") ? "output.weight" : "token_embd.weight");  // tied head (small models)
   for (int il = 0; il < nL; il++) {
     Layer& L = layers_[il];
     L.attn = c.is_attn(il);
@@ -813,8 +813,8 @@ void Model::plan_and_load() {
     for (float** p : {&mhc_a_, &mhc_b_, &mhc_branch_}) *p = (float*)dalloc((size_t)Tmax_ * c.n_embd * 4);
     mhc_pk_ = (float*)dalloc((size_t)Tmax_ * 8 * 4);
   }
-  if ((c.rope_mscale != 1.f || c.arch != "qwen35") && !getenv("QE_ROPE_PLAIN"))  // QE_ROPE_PLAIN: experiments
-    qk::set_rope_table(c.rope_freq.data(), (int)c.rope_freq.size(), c.rope_mscale);
+  rope_table_ = (c.rope_mscale != 1.f || c.arch != "qwen35") && !getenv("QE_ROPE_PLAIN");  // QE_ROPE_PLAIN: tests
+  if (rope_table_) qk::set_rope_table(c.rope_freq.data(), (int)c.rope_freq.size(), c.rope_mscale);
   reset();
   size_t fr = 0;
   CUDA_CHECK(cudaMemGetInfo(&fr, &total_b));
@@ -1069,11 +1069,12 @@ void Model::layer_attn(int il, int T, int pos0) {
   linear(&L, L.wk, xn_, T, k, kvw, false, s);
   linear(&L, L.wv, xn_, T, v, kvw, false, s);
   if (!fuse_ || !qk::qk_norm_rope(qg, L.q_norm, 2 * c.hd, qw, c.n_head, k, L.k_norm, c.hd, kvw, c.n_kv, pos_dev_, c.hd, T,
-                                  c.rope_dims, c.rope_base, c.eps, s)) {
+                                  c.rope_dims, rope_table_ ? -1.f : c.rope_base, c.eps, s)) {
     qk::rmsnorm_heads(qg, L.q_norm, c.hd, c.n_head, 2 * c.hd, T, qw, c.eps, s);
     qk::rmsnorm_heads(k, L.k_norm, c.hd, c.n_kv, c.hd, T, kvw, c.eps, s);
-    qk::rope_neox(qg, pos_dev_, c.hd, c.n_head, 2 * c.hd, T, qw, c.rope_dims, c.rope_base, s);
-    qk::rope_neox(k, pos_dev_, c.hd, c.n_kv, c.hd, T, kvw, c.rope_dims, c.rope_base, s);
+    const float rb = rope_table_ ? -1.f : c.rope_base;  // < 0: this model's YaRN table
+    qk::rope_neox(qg, pos_dev_, c.hd, c.n_head, 2 * c.hd, T, qw, c.rope_dims, rb, s);
+    qk::rope_neox(k, pos_dev_, c.hd, c.n_kv, c.hd, T, kvw, c.rope_dims, rb, s);
   }
   qk::kv_store(opt_.kv_type, L.kcache, L.vcache, k, v, pos_dev_, c.n_kv, c.hd, T, kvw, kvw, kvmap(), s);
   float* o = t2_;
@@ -1846,6 +1847,32 @@ void Model::ws_reclaim() {
   ws_borrowed_.clear();
   ws_lent_ = false;
   if (any) refresh_streamed();
+}
+
+// recurrent state (DeltaNet + conv history of every GDN layer) <-> one device backup (draft models)
+bool Model::state_save() {
+  const size_t cb = 3 * (size_t)cfg_.conv_dim() * 4, per = state_bytes() + cb;
+  if (!state_bk_dev_) {
+    if (cudaMalloc((void**)&state_bk_dev_, per * std::max(1, n_gdn_)) != cudaSuccess) { cudaGetLastError(); return false; }
+    allocs_.push_back(state_bk_dev_);
+  }
+  for (auto& L : layers_) {
+    if (!L.ssm_state) continue;
+    uint8_t* d = state_bk_dev_ + (size_t)L.gdn_idx * per;
+    CUDA_CHECK(cudaMemcpyAsync(d, L.ssm_state, state_bytes(), cudaMemcpyDeviceToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d + state_bytes(), L.conv_state, cb, cudaMemcpyDeviceToDevice, stream_));
+  }
+  return true;
+}
+void Model::state_restore() {
+  const size_t cb = 3 * (size_t)cfg_.conv_dim() * 4, per = state_bytes() + cb;
+  QE_ASSERT(state_bk_dev_);
+  for (auto& L : layers_) {
+    if (!L.ssm_state) continue;
+    const uint8_t* d = state_bk_dev_ + (size_t)L.gdn_idx * per;
+    CUDA_CHECK(cudaMemcpyAsync(L.ssm_state, d, state_bytes(), cudaMemcpyDeviceToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(L.conv_state, d + state_bytes(), cb, cudaMemcpyDeviceToDevice, stream_));
+  }
 }
 
 void Model::set_carry_row(int row) {

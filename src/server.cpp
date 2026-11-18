@@ -112,6 +112,8 @@ std::string take_utf8(std::string& buf) {
 struct Server {
   EngineOptions opt;
   bool ngram = true;
+  std::string draft_model;
+  std::unique_ptr<IModel> draft;
   int mtp_max = 5;
   float spec_relax = 1.f;  // >1: lenient speculative acceptance (faster, slightly biased sampling)
   std::unique_ptr<IModel> model;
@@ -707,6 +709,7 @@ int main(int argc, char** argv) {
     else if (a == "-v" || a == "--verbose") srv.opt.verbose = true;
     else if (a == "--spec-relax") srv.spec_relax = std::stof(next());
     else if (a == "--no-ngram") srv.ngram = false;
+    else if (a == "--draft-model") srv.draft_model = next();
     else if (a == "--mtp-vocab") srv.opt.mtp_vocab = std::stoi(next());
     else if (a == "--draft") srv.mtp_max = std::stoi(next());
     else if (a == "--cache-keep") srv.opt.cache_keep = std::stoi(next());
@@ -725,6 +728,7 @@ int main(int argc, char** argv) {
     } else QE_FATAL("unknown argument %s (see --help)", a.c_str());
   }
   if (srv.opt.model_path.empty()) QE_FATAL("-m model.gguf is required");
+  if (!srv.draft_model.empty()) srv.draft = create_draft_model(srv.draft_model, srv.opt);  // before the target
   srv.model = create_model(srv.opt);
   srv.tok = std::make_unique<Tokenizer>(srv.model->gguf());
   srv.gen = std::make_unique<Generator>(*srv.model, SamplingParams{}, srv.opt.use_mtp);
@@ -734,6 +738,10 @@ int main(int argc, char** argv) {
   srv.gen->set_spec_relax(srv.spec_relax);
   srv.gen->set_mtp_max(srv.mtp_max);
   srv.gen->set_ngram(srv.ngram);
+  if (srv.draft) {
+    if (srv.draft->cfg().n_vocab != srv.model->cfg().n_vocab) QE_FATAL("draft model vocabulary differs from the model's");
+    srv.gen->set_draft_model(srv.draft.get());
+  }
   {
     std::string p = srv.opt.model_path;
     const size_t sl = p.find_last_of('/');

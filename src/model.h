@@ -98,6 +98,10 @@ class Model : public IModel {
   int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr) override;
   int draft_max() const override { return spec_ ? opt_.draft_max : 0; }
   bool spec_ = true;  // verify passes with rollback (MTP or n-gram drafts)
+  bool rope_table_ = false;  // RoPE from the (YaRN) frequency table
+  bool state_save() override;
+  void state_restore() override;
+  uint8_t* state_bk_dev_ = nullptr;
   void set_carry_row(int row) override;  // carried hidden := row of the last forward (for prefix continuation)
   // ---- paged KV sequences + recurrent-state checkpoints (prompt caching across conversations) ----
   int seq_create() override;
