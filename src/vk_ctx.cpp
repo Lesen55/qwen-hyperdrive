@@ -418,11 +418,11 @@ VkPipeline VkCtx::pipeline(const char* name, const PipeOpt& opt) {
   pci.stage.module = mod;
   pci.stage.pName = "main";
   pci.layout = layout_;
-  uint32_t sv[2];
-  VkSpecializationMapEntry me[2];
+  uint32_t sv[3];
+  VkSpecializationMapEntry me[3];
   VkSpecializationInfo si{};
-  for (int i = 0; i < 2; i++) {
-    const int v = i ? opt.spec1 : opt.spec0;
+  for (int i = 0; i < 3; i++) {
+    const int v = i == 0 ? opt.spec0 : i == 1 ? opt.spec1 : opt.spec2;
     if (v < 0) continue;
     me[si.mapEntryCount] = {(uint32_t)i, si.mapEntryCount * 4u, 4};
     sv[si.mapEntryCount++] = (uint32_t)v;
@@ -485,6 +485,13 @@ void VkCtx::copy(const VBuf& src, size_t so, const VBuf& dst, size_t dof, size_t
   if (!n) return;
   VkBufferCopy r{so, dof, n};
   vkCmdCopyBuffer(cb_, src.buf, dst.buf, 1, &r);
+  barrier();
+}
+
+void VkCtx::copy_regions(const VBuf& src, const VBuf& dst, const std::vector<VkBufferCopy>& r) {
+  QE_ASSERT(recording_);
+  if (r.empty()) return;
+  vkCmdCopyBuffer(cb_, src.buf, dst.buf, (uint32_t)r.size(), r.data());
   barrier();
 }
 

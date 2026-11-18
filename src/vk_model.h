@@ -2,6 +2,7 @@
 // formats and are dequantized inside the shaders; what does not fit in VRAM is read by the GPU from
 // system RAM.  No MTP drafting (plain decoding); single KV sequence with recurrent-state checkpoints.
 #pragma once
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <memory>
@@ -22,7 +23,14 @@ class VkModel : public IModel {
   const Config& cfg() const override { return cfg_; }
   const GGUFFile& gguf() const override { return *gguf_; }
   const EngineOptions& options() const override { return opt_; }
-  bool has_mtp() const override { return false; }
+  bool has_mtp() const override { return mtp_on_; }
+  int draft_max() const override { return mtp_on_ ? std::clamp(opt_.draft_max, 1, kMaxTok - 1) : 0; }
+  int mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf = nullptr, float* logits_host = nullptr,
+                bool head = true) override;
+  int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr) override;
+  void rollback(int n_keep) override;
+  void set_carry_row(int row) override;
+  void draft_vocab_add(const int* ids, int n) override;
   const char* backend() const override { return "vulkan"; }
   void forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax = nullptr,
                bool snapshot = false, bool mtp_prefill = false) override;
@@ -55,6 +63,9 @@ class VkModel : public IModel {
     VBuf attn_norm, post_norm, q_norm, k_norm, conv_w, dt_bias, ssm_a, ssm_norm;
     VBuf kc, vc;               // attention: KV cache
     size_t ssm_off = 0, conv_off = 0;  // GDN: offsets into the state buffers
+    VBuf sv;                   // GDN: inputs of a speculative verify pass [raw | qkv | g | beta] for rollback
+    VMat eh_proj;              // MTP block
+    VBuf enorm, hnorm, shnorm;
   };
   void QE_ASSERT_SEQ(int id) const;
   VMat load_mat(const std::string& name, bool prefer_device);
@@ -70,6 +81,7 @@ class VkModel : public IModel {
   static std::string arch_profile(const VkCtx& v);
   struct Tune {
     int mv_teams = 4, mv_r = 4;  // decode matvec: 32-lane teams per workgroup x rows per team
+    int mm_teams = 4, mm_r = 2;  // T = 2..8 (speculative verify) matvec
     uint32_t mv_sg = 0;          // required subgroup size (0: driver default)
     std::string gemm = "gemm16"; // prefill: fused | gemm16 | cm_gemm_MxNxK
   };
@@ -84,7 +96,23 @@ class VkModel : public IModel {
   void layer_gdn(VLayer& L, int T);
   void layer_ffn(VLayer& L, int T);
   void forward_chunk(const int* tokens, int T, int pos0);
-  void forward_impl(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax);
+  void forward_impl(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax, bool mtp_prefill);
+  void fill_inputs(const int* tokens, int T, int pos0, const VBuf& emb, const VBuf& rope);
+  void mtp_block(VkDeviceAddress hrows, const int* tokens, int T, int pos0);
+  int mtp_finish(int n, float* conf, float* logits_host);
+  void load_attn(VLayer& L, int il);
+  static constexpr int kDraftVocabCap = 98304;
+  VLayer mtp_;
+  bool mtp_on_ = false;
+  VBuf hid_, carry_, mtp_h_, hsafe_, hm_, emb2_h_, rope2_h_;
+  VMat dvhead_;  // output head restricted to the draft vocabulary (rows copied from output_)
+  std::vector<int> dv_host_;
+  std::vector<uint8_t> dv_has_, dv_cls_;
+  uint32_t dv_cls_on_ = 0;
+  size_t dv_uploaded_ = 0;
+  bool snapshot_ = false, snap_valid_ = false;
+  int snap_T_ = 0;
+  VkDeviceAddress rope_addr_ = 0;
 
   EngineOptions opt_;
   Config cfg_{};

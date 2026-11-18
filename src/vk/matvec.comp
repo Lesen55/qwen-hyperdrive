@@ -1,19 +1,25 @@
 // variants: mv_f32:QT=0 mv_f16:QT=1 mv_bf16:QT=30 mv_q8_0:QT=8 mv_q2_k:QT=10 mv_q3_k:QT=11 mv_q4_k:QT=12 mv_q5_k:QT=13 mv_q6_k:QT=14 mv_iq2_xxs:QT=16 mv_iq2_xs:QT=17 mv_iq2_s:QT=22 mv_iq3_xxs:QT=18 mv_iq3_s:QT=21 mv_iq1_s:QT=19 mv_iq1_m:QT=29 mv_iq4_xs:QT=23
 // y[t][row] (+)= W[row] . x[t]  for T <= 8 tokens (decode / speculative verify).
 // Workgroup = TEAMS teams of 32 lanes (local_size_x = 32 * TEAMS, specialization constant 1), a team
-// owns R rows (constant 0); rows per workgroup = TEAMS * R.  Both are picked per device by the
-// start-up autotuner.  A lane walks the 32-element groups with stride 32 (adjacent lanes read
-// adjacent groups); for T == 1 its activation chunk is loaded once and reused for the team's rows.
+// owns R rows (constant 0); rows per workgroup = TEAMS * R, picked per device by the start-up
+// autotuner.  A lane walks the 32-element groups with stride 32 (adjacent lanes read adjacent groups).
+//  T == 1: the lane's activation chunk is loaded once and reused for the team's R rows.
+//  T > 1 (MULTI pipeline, constant 2): per window of 32 groups the workgroup stages the activations of
+//  all T tokens once in shared memory (f16, lane-transposed: conflict-free), every lane dequantizes its
+//  group of each row once and applies it to all T tokens.
 #version 450
 #include "common.glsl"
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer F32x4 { vec4 d[]; };
 layout(local_size_x_id = 1, local_size_x = 128) in;
 layout(constant_id = 0) const uint R = 4u;
+layout(constant_id = 2) const bool MULTI = false;
 layout(push_constant) uniform PC { uvec2 w, x, y, tab; uint K, N, T, rb, ldx, ldy, acc, wide, kg; } pc;
 const uint WGS = gl_WorkGroupSize.x;
 const uint TEAMS = WGS / 32u;
-shared float red[8][TEAMS * R][33];
-shared float redw[8][WGS];
+// one shared block, aliased: activation staging [t][j][lane] (uvec2 = 4 halves) during the K loop,
+// reduction partials [t][row][lane] (floats as bits) after it
+const uint RED_WORDS = 8u * TEAMS * R * 33u, XS_WORDS = 8u * 8u * 32u * 2u;
+shared uint SH[4224];  // >= RED_WORDS (rows per workgroup <= 16), XS_WORDS (4096), 8 * WGS (WGS <= 256)
 float dot32(float v[32], vec4 xv[8]) {
   float a = 0.0;
   for (uint j = 0u; j < 8u; j++) a += dot(vec4(v[4u * j], v[4u * j + 1u], v[4u * j + 2u], v[4u * j + 3u]), xv[j]);
@@ -34,11 +40,11 @@ void main_wide() {
       s[t] += dot32(v, xv);
     }
   }
-  for (uint t = 0u; t < pc.T; t++) redw[t][tid] = s[t];
+  for (uint t = 0u; t < pc.T; t++) SH[t * WGS + tid] = floatBitsToUint(s[t]);
   barrier();
   if (tid < pc.T) {
     float a = 0.0;
-    for (uint i = 0u; i < WGS; i++) a += redw[tid][i];
+    for (uint i = 0u; i < WGS; i++) a += uintBitsToFloat(SH[tid * WGS + i]);
     const uint o = tid * pc.ldy + row;
     y.d[o] = pc.acc != 0u ? y.d[o] + a : a;
   }
@@ -52,7 +58,7 @@ void main() {
   const uint ng = pc.K / 32u;
   float s[R][8];
   for (uint r = 0u; r < R; r++) for (uint t = 0u; t < 8u; t++) s[r][t] = 0.0;
-  if (pc.T == 1u) {
+  if (!MULTI) {  // T == 1
     for (uint gi = lane; gi < ng; gi += 32u) {
       vec4 xv[8];
       for (uint j = 0u; j < 8u; j++) xv[j] = x.d[gi * 8u + j];
@@ -64,26 +70,42 @@ void main() {
       }
     }
   } else {
-    for (uint r = 0u; r < R; r++) {
-      if (row0 + r >= pc.N) break;
-      for (uint gi = lane; gi < ng; gi += 32u) {
-        float v[32];
-        deq32(w, tab, (row0 + r) * pc.rb + (gi / 8u) * BB, gi % 8u, v);
+    for (uint base = 0u; base < ng; base += 32u) {
+      barrier();  // previous window consumed
+      for (uint e = tid; e < pc.T * 256u; e += WGS) {  // T tokens x 32 groups x 8 vec4, coalesced
+        const uint t = e / 256u, g = (e / 8u) % 32u, j = e % 8u;
+        const vec4 v = base + g < ng ? x.d[(t * pc.ldx + (base + g) * 32u) / 4u + j] : vec4(0.0);
+        const uint o = ((t * 8u + j) * 32u + g) * 2u;
+        SH[o] = packHalf2x16(v.xy);
+        SH[o + 1u] = packHalf2x16(v.zw);
+      }
+      barrier();
+      const uint gi = base + lane;
+      if (gi < ng) {
+        float v[R][32];
+        for (uint r = 0u; r < R; r++) {
+          if (row0 + r < pc.N) deq32(w, tab, (row0 + r) * pc.rb + (gi / 8u) * BB, gi % 8u, v[r]);
+          else for (uint j = 0u; j < 32u; j++) v[r][j] = 0.0;
+        }
         for (uint t = 0u; t < pc.T; t++) {
           vec4 xv[8];
-          for (uint j = 0u; j < 8u; j++) xv[j] = x.d[(t * pc.ldx + gi * 32u) / 4u + j];
-          s[r][t] += dot32(v, xv);
+          for (uint j = 0u; j < 8u; j++) {
+            const uint o = ((t * 8u + j) * 32u + lane) * 2u;
+            xv[j] = vec4(unpackHalf2x16(SH[o]), unpackHalf2x16(SH[o + 1u]));
+          }
+          for (uint r = 0u; r < R; r++) s[r][t] += dot32(v[r], xv);
         }
       }
     }
+    barrier();  // staging area becomes the reduction area
   }
   for (uint r = 0u; r < R; r++)
-    for (uint t = 0u; t < pc.T; t++) red[t][team * R + r][lane] = s[r][t];
+    for (uint t = 0u; t < pc.T; t++) SH[(t * TEAMS * R + team * R + r) * 33u + lane] = floatBitsToUint(s[r][t]);
   barrier();
   for (uint e = tid; e < TEAMS * R * pc.T; e += WGS) {
     const uint rr = e % (TEAMS * R), t = e / (TEAMS * R), row = wg * TEAMS * R + rr;
     float a = 0.0;
-    for (uint i = 0u; i < 32u; i++) a += red[t][rr][i];
+    for (uint i = 0u; i < 32u; i++) a += uintBitsToFloat(SH[(t * TEAMS * R + rr) * 33u + i]);
     if (row < pc.N) {
       const uint o = t * pc.ldy + row;
       y.d[o] = pc.acc != 0u ? y.d[o] + a : a;

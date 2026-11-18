@@ -15,10 +15,13 @@ enum class Mem { Device, Host, Readback, DeviceMapped };
 // per-pipeline options: specialization constants 0 / 1 (-1 = shader default) and a required subgroup
 // size (0 = driver's choice; ignored without VK_EXT_subgroup_size_control)
 struct PipeOpt {
-  int spec0 = -1, spec1 = -1;
+  int spec0 = -1, spec1 = -1, spec2 = -1;
   uint32_t subgroup = 0;
   bool operator<(const PipeOpt& o) const {
-    return spec0 != o.spec0 ? spec0 < o.spec0 : spec1 != o.spec1 ? spec1 < o.spec1 : subgroup < o.subgroup;
+    if (spec0 != o.spec0) return spec0 < o.spec0;
+    if (spec1 != o.spec1) return spec1 < o.spec1;
+    if (spec2 != o.spec2) return spec2 < o.spec2;
+    return subgroup < o.subgroup;
   }
 };
 struct CmShape { uint32_t M, N, K; };
@@ -54,6 +57,7 @@ class VkCtx {
                 bool barrier = true, const PipeOpt& opt = PipeOpt{});
   void barrier();
   void copy(const VBuf& src, size_t src_off, const VBuf& dst, size_t dst_off, size_t n);
+  void copy_regions(const VBuf& src, const VBuf& dst, const std::vector<VkBufferCopy>& r);  // one command
   void fill(const VBuf& dst, size_t off, size_t n, uint32_t value = 0);
   void submit();  // end, submit, wait
   bool recording() const { return recording_; }

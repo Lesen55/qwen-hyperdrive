@@ -23,8 +23,8 @@ struct KvPC { uint64_t k, v, kc, vc; uint32_t nkv, hd, T, pos0, kts, q8; };
 struct AttnPC { uint64_t q, kc, vc, o, part; uint32_t T, pos0, nh, nkv, qts, nsplit, chunk; float scale; };
 struct CombPC { uint64_t part, o; uint32_t rows, nsplit; };
 struct ElemPC { uint64_t a, b, c, d, e, f; uint32_t n, p0, p1; };
-struct ConvPC { uint64_t x, st, w, y; uint32_t C, T, xts; };
-struct RecPC { uint64_t qkv, g, beta, st, o; uint32_t nk, nv, T, C; };
+struct ConvPC { uint64_t x, st, w, y; uint32_t C, T, xts, wr; };
+struct RecPC { uint64_t qkv, g, beta, st, o; uint32_t nk, nv, T, C, wr; };
 struct GNormPC { uint64_t o, z, w; uint32_t nv, dv, zts; float eps; };
 struct ArgPC { uint64_t x, out; uint32_t n; };
 
@@ -98,7 +98,7 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   size_t wbytes = 0, ffn_bytes = 0;
   for (const auto& t : gguf_->tensors()) {
     int il = -1;
-    if (sscanf(t.name.c_str(), "blk.%d.", &il) == 1 && il >= c.n_layer) continue;
+    if (sscanf(t.name.c_str(), "blk.%d.", &il) == 1 && il >= c.n_layer && !(opt.use_mtp && il == c.n_layer)) continue;
     if (t.name == "token_embd.weight" && gguf_->tensor("output.weight")) continue;
     const bool ffn = t.name.find(".ffn_") != std::string::npos;
     if (ffn && std::find(opt.skip_ffn.begin(), opt.skip_ffn.end(), il) != opt.skip_ffn.end()) continue;
@@ -109,7 +109,8 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   // (Arc 130V with 32 GB: >= 4 GiB); on a dGPU only a little headroom
   reserve_ = (size_t)opt.vram_reserve_mb * MiB +
              (vk_->integrated ? std::max<size_t>(4096 * MiB, vk_->vram_total() / 8) : 256 * MiB);
-  const int n_attn_l = [&] { int n = 0; for (int il = 0; il < c.n_layer; il++) n += c.is_attn(il); return n; }();
+  mtp_on_ = c.n_mtp > 0 && opt.use_mtp;
+  const int n_attn_l = [&] { int n = mtp_on_; for (int il = 0; il < c.n_layer; il++) n += c.is_attn(il); return n; }();
   // KV format: f16 / q8 as asked; q4 / q3 (CUDA formats) -> f16 when VRAM easily holds weights + f16
   // KV (e.g. 24 GB RX 7900 XTX: fewer dequant ops in attention, exact), else q8 (half the bytes; an
   // iGPU is bandwidth-bound, so q8 there)
@@ -159,6 +160,15 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
     }
   }
   emb_h_ = vk_->alloc(U * E * 4, Mem::Host);
+  if (mtp_on_) {  // MTP: trunk hidden rows of the last pass, carried row, chained MTP output, staging
+    hid_ = dev((size_t)kMaxTok * E);
+    carry_ = dev(E);
+    mtp_h_ = dev(E);
+    hsafe_ = dev((size_t)kMaxTok * E);
+    hm_ = dev(U * E);
+    emb2_h_ = vk_->alloc(U * E * 4, Mem::Host);
+    rope2_h_ = vk_->alloc(U * (c.rope_dims / 2) * 2 * 4, Mem::Host);
+  }
   rope_h_ = vk_->alloc(U * (c.rope_dims / 2) * 2 * 4, Mem::Host);
   logits_h_ = vk_->alloc((size_t)kLogitRows * c.n_vocab * 4, Mem::Readback);
   argmax_h_ = vk_->alloc(kLogitRows * 4, Mem::Readback);
@@ -202,12 +212,7 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
     L.attn_norm = load_f32(bn(il, "attn_norm.weight"));
     L.post_norm = load_f32(bn(il, "post_attention_norm.weight"));
     if (L.attn) {
-      L.wq = load_mat(bn(il, "attn_q.weight"), true);
-      L.wk = load_mat(bn(il, "attn_k.weight"), true);
-      L.wv = load_mat(bn(il, "attn_v.weight"), true);
-      L.wo = load_mat(bn(il, "attn_output.weight"), true);
-      L.q_norm = load_f32(bn(il, "attn_q_norm.weight"));
-      L.k_norm = load_f32(bn(il, "attn_k_norm.weight"));
+      load_attn(L, il);
     } else {
       L.wqkv = load_mat(bn(il, "attn_qkv.weight"), true);
       L.wgate = load_mat(bn(il, "attn_gate.weight"), true);
@@ -221,11 +226,23 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
       L.ssm_off = gdn_i * c.nv * c.dk * c.dv * 4;
       L.conv_off = gdn_i * 3 * C * 4;
       gdn_i++;
+      if (mtp_on_) L.sv = dev((size_t)kMaxTok * (2 * C + 2 * c.nv));
     }
+  }
+  if (mtp_on_) {  // MTP (nextn) block: one full-attention layer + FFN, eh_proj, its norms
+    const int il = c.n_layer;
+    mtp_.attn = true;
+    mtp_.attn_norm = load_f32(bn(il, "attn_norm.weight"));
+    mtp_.post_norm = load_f32(bn(il, "post_attention_norm.weight"));
+    load_attn(mtp_, il);
+    mtp_.eh_proj = load_mat(bn(il, "nextn.eh_proj.weight"), true);
+    mtp_.enorm = load_f32(bn(il, "nextn.enorm.weight"));
+    mtp_.hnorm = load_f32(bn(il, "nextn.hnorm.weight"));
+    if (gguf_->tensor(bn(il, "nextn.shared_head_norm.weight"))) mtp_.shnorm = load_f32(bn(il, "nextn.shared_head_norm.weight"));
   }
   // KV cache: the full context if it fits next to ~1 GiB of other data, else shrink the context
   {
-    const int n_attn = (int)std::count_if(layers_.begin(), layers_.end(), [](const VLayer& L) { return L.attn; });
+    const int n_attn = (int)std::count_if(layers_.begin(), layers_.end(), [](const VLayer& L) { return L.attn; }) + mtp_on_;
     const size_t per_pos = (size_t)n_attn * 2 * c.n_kv * kv_row_bytes_;
     // iGPU: the FFN weights still to come have no system-RAM fallback (it is the same memory)
     const size_t keep = reserve_ + (vk_->integrated ? ffn_bytes : 0);
@@ -242,6 +259,10 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
         L.kc = vk_->alloc((size_t)ctx_len_ * c.n_kv * kv_row_bytes_, Mem::Device);
         L.vc = vk_->alloc((size_t)ctx_len_ * c.n_kv * kv_row_bytes_, Mem::Device);
       }
+    if (mtp_on_) {
+      mtp_.kc = vk_->alloc((size_t)ctx_len_ * c.n_kv * kv_row_bytes_, Mem::Device);
+      mtp_.vc = vk_->alloc((size_t)ctx_len_ * c.n_kv * kv_row_bytes_, Mem::Device);
+    }
     QE_LOG("[plan] KV cache %s, %d positions: %.0f MiB\n", kv_q8_ ? "q8" : "f16", ctx_len_, ctx_len_ * per_pos / (double)MiB);
   }
   size_t host_ffn = 0, dev_ffn = 0;
@@ -259,6 +280,11 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
       on_dev &= m->buf.device_local;
     }
     res_ffn += on_dev;
+  }
+  if (mtp_on_) {
+    mtp_.ffn_gate = load_mat(bn(c.n_layer, "ffn_gate.weight"), true);
+    mtp_.ffn_up = load_mat(bn(c.n_layer, "ffn_up.weight"), true);
+    mtp_.ffn_down = load_mat(bn(c.n_layer, "ffn_down.weight"), true);
   }
   plan_.res_mb = vk_->vram_used() / (double)MiB;
   plan_.stream_mb = host_ffn / (double)MiB;
@@ -414,7 +440,7 @@ void VkModel::autotune() {
     if (L.ffn_gate.valid() && L.ffn_gate.buf.device_local && L.ffn_down.buf.device_local) { L0 = &L; break; }
   const VMat* mats[2] = {L0 ? &L0->ffn_gate : &output_, L0 ? &L0->ffn_down : &output_};
   char key[256];
-  snprintf(key, sizeof key, "vk-tune-v1-%x-%x-%x-%s%dx%d-%s%dx%d-ub%d", vk_->vendor_id, vk_->device_id,
+  snprintf(key, sizeof key, "vk-tune-v2-%x-%x-%x-%s%dx%d-%s%dx%d-ub%d", vk_->vendor_id, vk_->device_id,
            vk_->driver_version, type_tag(mats[0]->type), mats[0]->N, mats[0]->K, type_tag(mats[1]->type), mats[1]->N,
            mats[1]->K, ub_);
   const char* home = getenv("HOME");
@@ -431,9 +457,9 @@ void VkModel::autotune() {
         if (vk_->has_pipeline(nm)) cms.push_back(nm);
       }
   }
-  if (const char* f = getenv("QE_VK_TUNE")) {  // "teams,rows,subgroup,gemm"
+  if (const char* f = getenv("QE_VK_TUNE")) {  // "teams,rows,subgroup,multi_teams,multi_rows,gemm"
     char g[64] = "";
-    sscanf(f, "%d,%d,%u,%63s", &tune_.mv_teams, &tune_.mv_r, &tune_.mv_sg, g);
+    sscanf(f, "%d,%d,%u,%d,%d,%63s", &tune_.mv_teams, &tune_.mv_r, &tune_.mv_sg, &tune_.mm_teams, &tune_.mm_r, g);
     if (*g) tune_.gemm = g;
     QE_LOG("[tune] forced: matvec %d teams x %d rows, subgroup %u; prefill GEMM %s\n", tune_.mv_teams, tune_.mv_r,
            tune_.mv_sg, tune_.gemm.c_str());
@@ -443,14 +469,15 @@ void VkModel::autotune() {
     if (FILE* f = fopen(path.c_str(), "r")) {
       char g[64] = "";
       Tune t;
-      const int n = fscanf(f, "%d %d %u %63s", &t.mv_teams, &t.mv_r, &t.mv_sg, g);
+      const int n = fscanf(f, "%d %d %u %d %d %63s", &t.mv_teams, &t.mv_r, &t.mv_sg, &t.mm_teams, &t.mm_r, g);
       fclose(f);
       t.gemm = g;
       const bool cm_ok = t.gemm.rfind("cm_", 0) != 0 || std::find(cms.begin(), cms.end(), t.gemm) != cms.end();
-      if (n == 4 && t.mv_teams > 0 && t.mv_r > 0 && cm_ok) {
+      if (n == 6 && t.mv_teams > 0 && t.mv_r > 0 && t.mm_teams > 0 && t.mm_r > 0 && cm_ok) {
         tune_ = t;
-        QE_LOG("[tune] cached: matvec %d teams x %d rows, subgroup %s; prefill GEMM %s\n", tune_.mv_teams, tune_.mv_r,
-               tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default", tune_.gemm.c_str());
+        QE_LOG("[tune] cached: matvec %d teams x %d rows, subgroup %s, T=4 %d x %d; prefill GEMM %s\n", tune_.mv_teams,
+               tune_.mv_r, tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default", tune_.mm_teams, tune_.mm_r,
+               tune_.gemm.c_str());
         return;
       }
     }
@@ -484,6 +511,24 @@ void VkModel::autotune() {
     }
   tune_ = bt;
   const double mv_us = best / 16 * 1e6;
+  // ---- T = 4 matvec (speculative verify): its own workgroup shape (holds R dequantized rows)
+  best = 1e30;
+  for (auto& sh : shapes) {
+    tune_.mm_teams = sh[0];
+    tune_.mm_r = sh[1];
+    const double t = bench([&] {
+      for (int i = 0; i < 4; i++)
+        for (const VMat* m : mats) {
+          MvPC pc{m->buf.addr, m == mats[0] ? xn_.addr : t1_.addr, t0_.addr, tab_.addr, (uint32_t)m->K, (uint32_t)m->N,
+                  4, (uint32_t)m->rb, (uint32_t)m->K, (uint32_t)m->N, 0, 0, (uint32_t)(m->K / 32)};
+          matvec(*m, pc, true);
+        }
+    }, 3);
+    QE_DBG("[tune] T=4 matvec %d teams x %d rows: %.1f us\n", sh[0], sh[1], t / 8 * 1e6);
+    if (t < best * 0.98) { best = t; bt.mm_teams = sh[0]; bt.mm_r = sh[1]; }
+  }
+  tune_ = bt;
+  const double mm_us = best / 8 * 1e6;
   // ---- prefill GEMM
   std::vector<std::string> methods = {"fused", "gemm16"};
   for (auto& nm : cms) {
@@ -505,15 +550,183 @@ void VkModel::autotune() {
     if (t < best * 0.98) { best = t; bg = meth; }
   }
   tune_.gemm = bg;
-  QE_LOG("[tune] measured in %.1f s: matvec %d teams x %d rows, subgroup %s (%.0f us/matrix); prefill GEMM %s (%.1f ms per %d-token pair)\n",
+  QE_LOG("[tune] measured in %.1f s: matvec %d teams x %d rows, subgroup %s (%.0f us/matrix), T=4 %d x %d (%.0f us); "
+         "prefill GEMM %s (%.1f ms per %d-token pair)\n",
          qe_now() - t_start, tune_.mv_teams, tune_.mv_r, tune_.mv_sg ? std::to_string(tune_.mv_sg).c_str() : "default",
-         mv_us, tune_.gemm.c_str(), best * 1e3, ub_);
+         mv_us, tune_.mm_teams, tune_.mm_r, mm_us, tune_.gemm.c_str(), best * 1e3, ub_);
   if (!path.empty()) {
     (void)!system(("mkdir -p '" + path.substr(0, path.rfind('/')) + "'").c_str());
     if (FILE* f = fopen(path.c_str(), "w")) {
-      fprintf(f, "%d %d %u %s\n", tune_.mv_teams, tune_.mv_r, tune_.mv_sg, tune_.gemm.c_str());
+      fprintf(f, "%d %d %u %d %d %s\n", tune_.mv_teams, tune_.mv_r, tune_.mv_sg, tune_.mm_teams, tune_.mm_r, tune_.gemm.c_str());
       fclose(f);
     }
+  }
+}
+
+void VkModel::load_attn(VLayer& L, int il) {
+  L.wq = load_mat(bn(il, "attn_q.weight"), true);
+  L.wk = load_mat(bn(il, "attn_k.weight"), true);
+  L.wv = load_mat(bn(il, "attn_v.weight"), true);
+  L.wo = load_mat(bn(il, "attn_output.weight"), true);
+  L.q_norm = load_f32(bn(il, "attn_q_norm.weight"));
+  L.k_norm = load_f32(bn(il, "attn_k_norm.weight"));
+}
+
+// MTP (nextn) block: x = eh_proj([enorm(emb(x_p)), hnorm(h_{p-1})]); one full-attention decoder layer
+// with its own KV cache; final norm.  Records into the current command buffer; result rows in xn_.
+void VkModel::mtp_block(VkDeviceAddress hrows, const int* tokens, int T, int pos0) {
+  const Config& c = cfg_;
+  const int E = c.n_embd;
+  fill_inputs(tokens, T, pos0, emb2_h_, rope2_h_);
+  rope_addr_ = rope2_h_.addr;
+  vk_->begin();
+  vk_->copy(emb2_h_, 0, t1_, 0, (size_t)T * E * 4);
+  NormPC ne{t1_.addr, 0, mtp_.enorm.addr, t1_.addr, (uint32_t)E, c.eps};
+  vk_->dispatch("rmsnorm", &ne, sizeof ne, T, 1, 1, false);
+  NormPC nh{hrows, 0, mtp_.hnorm.addr, t2_.addr, (uint32_t)E, c.eps};
+  vk_->dispatch("rmsnorm", &nh, sizeof nh, T);
+  std::vector<VkBufferCopy> r1, r2;  // cat [T][2E] = [enorm(e) | hnorm(h)]
+  for (int t = 0; t < T; t++) {
+    r1.push_back({(VkDeviceSize)t * E * 4, (VkDeviceSize)t * 2 * E * 4, (VkDeviceSize)E * 4});
+    r2.push_back({(VkDeviceSize)t * E * 4, (VkDeviceSize)(t * 2 + 1) * E * 4, (VkDeviceSize)E * 4});
+  }
+  vk_->copy_regions(t1_, t0_, r1);
+  vk_->copy_regions(t2_, t0_, r2);
+  linear(mtp_.eh_proj, t0_.addr, T, x_.addr);
+  pend_ = false;
+  const bool snap = snapshot_;
+  snapshot_ = false;
+  layer_attn(mtp_, T, pos0);
+  layer_ffn(mtp_, T);
+  snapshot_ = snap;
+  norm_in(mtp_.shnorm.buf ? mtp_.shnorm : output_norm_, T);
+}
+
+// MTP head over the draft vocabulary: greedy draft (and its logits for sampled drafts)
+int VkModel::mtp_finish(int n, float* conf, float* logits_host) {
+  const Config& c = cfg_;
+  const size_t rb = (size_t)c.n_embd * 4;
+  vk_->copy(xn_, (n - 1) * rb, mtp_h_, 0, rb);  // chained drafts continue from this row
+  const VMat* head = &output_;
+  if (!dv_host_.empty()) {
+    if (!dvhead_.buf.buf) {
+      dvhead_ = output_;
+      dvhead_.buf = vk_->alloc((size_t)kDraftVocabCap * output_.rb, output_.buf.device_local ? Mem::Device : Mem::Host);
+      dv_uploaded_ = 0;
+    }
+    if (dv_uploaded_ < dv_host_.size()) {  // gather the new rows of the output head
+      std::vector<VkBufferCopy> r;
+      for (size_t i = dv_uploaded_; i < dv_host_.size(); i++)
+        r.push_back({(VkDeviceSize)dv_host_[i] * output_.rb, (VkDeviceSize)i * output_.rb, (VkDeviceSize)output_.rb});
+      vk_->copy_regions(output_.buf, dvhead_.buf, r);
+      dv_uploaded_ = dv_host_.size();
+    }
+    dvhead_.N = (int)dv_host_.size();
+    head = &dvhead_;
+  }
+  const int nl = head->N;
+  linear(*head, xn_.addr + (n - 1) * rb, 1, logits_.addr);
+  ArgPC ap{logits_.addr, argmax_.addr, (uint32_t)nl};
+  vk_->dispatch("argmax", &ap, sizeof ap, 1);
+  vk_->copy(argmax_, 0, argmax_h_, 0, 4);
+  if (logits_host || conf) vk_->copy(logits_, 0, logits_h_, 0, (size_t)nl * 4);
+  vk_->submit();
+  int d = ((const int*)argmax_h_.map)[0];
+  const float* lg = (const float*)logits_h_.map;
+  if (conf) {
+    double s = 0;
+    for (int i = 0; i < nl; i++) s += std::exp((double)lg[i] - lg[d]);
+    *conf = (float)(1.0 / s);
+  }
+  if (head == &dvhead_) {
+    if (logits_host) {
+      std::fill(logits_host, logits_host + c.n_vocab, -INFINITY);
+      for (int i = 0; i < nl; i++) logits_host[dv_host_[i]] = lg[i];
+    }
+    d = dv_host_[d];
+  } else if (logits_host) {
+    memcpy(logits_host, lg, (size_t)nl * 4);
+  }
+  return d;
+}
+
+int VkModel::mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf, float* logits_host, bool head) {
+  const Config& c = cfg_;
+  QE_ASSERT(mtp_on_ && n >= 1 && n <= kMaxTok);
+  if (pos0 + n > ctx_len_) QE_FATAL("context overflow: %d positions > KV cache %d", pos0 + n, ctx_len_);
+  vk_->begin();
+  // mtp_block clobbers the activations: stage the h rows
+  vk_->copy(hrow0 < 0 ? carry_ : hid_, hrow0 < 0 ? 0 : (size_t)hrow0 * c.n_embd * 4, hsafe_, 0, (size_t)n * c.n_embd * 4);
+  mtp_block(hsafe_.addr, tokens, n, pos0);
+  if (!head) { vk_->submit(); return -1; }
+  return mtp_finish(n, conf, logits_host);
+}
+
+int VkModel::mtp_chain(int token, int pos, float* conf, float* logits_host) {
+  if (pos + 1 > ctx_len_) QE_FATAL("context overflow: %d positions > KV cache %d", pos + 1, ctx_len_);
+  vk_->begin();
+  vk_->copy(mtp_h_, 0, hsafe_, 0, (size_t)cfg_.n_embd * 4);
+  mtp_block(hsafe_.addr, &token, 1, pos);
+  return mtp_finish(1, conf, logits_host);
+}
+
+void VkModel::set_carry_row(int row) {
+  vk_->begin();  // recorded; runs with the next submission (mtp_draft / forward)
+  vk_->copy(hid_, (size_t)row * cfg_.n_embd * 4, carry_, 0, (size_t)cfg_.n_embd * 4);
+}
+
+// commit the first n_keep tokens of the last verify pass: advance the untouched pre-pass conv and
+// recurrent states by the saved inputs (every GDN layer in one go, no barriers between layers)
+void VkModel::rollback(int n_keep) {
+  const Config& c = cfg_;
+  QE_ASSERT(snap_valid_ && n_keep >= 1 && n_keep <= snap_T_);
+  const int C = c.conv_dim();
+  vk_->begin();
+  for (auto& L : layers_) {
+    if (!L.sv.buf) continue;
+    const VkDeviceAddress raw = L.sv.addr, qkv = L.sv.addr + (size_t)kMaxTok * C * 4;
+    const VkDeviceAddress gb = L.sv.addr + (size_t)kMaxTok * 2 * C * 4, bb = gb + (size_t)kMaxTok * c.nv * 4;
+    RecPC rp{qkv, gb, bb, ssm_.addr + L.ssm_off, 0, (uint32_t)c.nk, (uint32_t)c.nv, (uint32_t)n_keep, (uint32_t)C, 1};
+    vk_->dispatch("gdn_rec", &rp, sizeof rp, c.nv, c.dv / 16, 1, false);
+    ConvPC cp{raw, conv_.addr + L.conv_off, L.conv_w.addr, 0, (uint32_t)C, (uint32_t)n_keep, (uint32_t)C, 1};
+    vk_->dispatch("conv", &cp, sizeof cp, (C + 255) / 256, 1, 1, false);
+  }
+  vk_->barrier();
+  snap_valid_ = false;  // not submitted: runs ahead of the next MTP step / pass in the same submission
+}
+
+// draft vocabulary: the first mtp_vocab ids, the special-token tail, every token seen, and every token
+// of a script (kana / CJK / hangul / ...) once that script appears (same policy as the CUDA backend)
+void VkModel::draft_vocab_add(const int* ids, int n) {
+  const Config& c = cfg_;
+  if (!mtp_on_ || opt_.mtp_vocab <= 0) return;
+  if (dv_has_.empty()) {
+    dv_has_.assign(c.n_vocab, 0);
+    const int head = std::min(opt_.mtp_vocab, c.n_vocab);
+    for (int i = 0; i < head; i++) { dv_has_[i] = 1; dv_host_.push_back(i); }
+    for (int i = std::max(head, c.n_vocab - 320); i < c.n_vocab; i++) { dv_has_[i] = 1; dv_host_.push_back(i); }
+    dv_cls_.assign(c.n_vocab, 0);
+    if (const GGUFValue* tk = gguf_->get("tokenizer.ggml.tokens"))
+      for (int i = 0; i < c.n_vocab && i < (int)tk->arr.size(); i++) dv_cls_[i] = (uint8_t)token_script(tk->arr[i].as_str());
+  }
+  auto add = [&](int t) {
+    if (dv_has_[t] || (int)dv_host_.size() >= kDraftVocabCap) return;
+    dv_has_[t] = 1;
+    dv_host_.push_back(t);
+  };
+  for (int i = 0; i < n; i++) {
+    const int t = ids[i];
+    if (t < 0 || t >= c.n_vocab) continue;
+    const int cl = dv_cls_[t];
+    if (cl && !(dv_cls_on_ & (1u << cl))) {
+      dv_cls_on_ |= 1u << cl;
+      if (cl == 2) dv_cls_on_ |= 1u << 1;  // CJK text: kana too (Japanese)
+      if (cl == 1) dv_cls_on_ |= 1u << 2;
+      for (int j = 0; j < c.n_vocab; j++)
+        if (dv_cls_[j] && (dv_cls_on_ & (1u << dv_cls_[j]))) add(j);
+      QE_DBG("[mtp] draft vocabulary: script %d enabled, %zu tokens\n", cl, dv_host_.size());
+    }
+    add(t);
   }
 }
 
@@ -531,10 +744,12 @@ void VkModel::prepare_context(int npos, bool) {
 void VkModel::ck_save_live(int slot) {
   if (slot < 0 || slot >= kCkSlots) return;
   if ((int)ck_.size() < kCkSlots) ck_.resize(kCkSlots);
-  if (!ck_[slot].buf) ck_[slot] = vk_->alloc(ssm_bytes_ + conv_bytes_, Mem::Host);
+  const size_t cb = mtp_on_ ? (size_t)cfg_.n_embd * 4 : 0;  // + MTP carry row
+  if (!ck_[slot].buf) ck_[slot] = vk_->alloc(ssm_bytes_ + conv_bytes_ + cb, Mem::Host);
   vk_->begin();
   vk_->copy(ssm_, 0, ck_[slot], 0, ssm_bytes_);
   vk_->copy(conv_, 0, ck_[slot], ssm_bytes_, conv_bytes_);
+  if (cb) vk_->copy(carry_, 0, ck_[slot], ssm_bytes_ + conv_bytes_, cb);
   vk_->submit();
 }
 
@@ -543,6 +758,7 @@ void VkModel::ck_restore(int slot) {
   vk_->begin();
   vk_->copy(ck_[slot], 0, ssm_, 0, ssm_bytes_);
   vk_->copy(ck_[slot], ssm_bytes_, conv_, 0, conv_bytes_);
+  if (mtp_on_) vk_->copy(ck_[slot], ssm_bytes_ + conv_bytes_, carry_, 0, (size_t)cfg_.n_embd * 4);
   vk_->submit();
 }
 
@@ -558,13 +774,16 @@ KvInfo VkModel::kv_info() const {
 void VkModel::matvec(const VMat& m, const MvPC& pc0, bool bar) {
   MvPC pc = pc0;
   pc.wide = m.N < 2048;  // few rows: one row per workgroup so the GPU is filled
-  const uint32_t rows = (uint32_t)(tune_.mv_teams * tune_.mv_r);
+  const bool multi = pc.T > 1;
+  const int teams = multi ? tune_.mm_teams : tune_.mv_teams, rr = multi ? tune_.mm_r : tune_.mv_r;
+  const uint32_t rows = (uint32_t)(teams * rr);
   uint32_t gx, gy;
   grid_wg(pc.wide ? m.N : (m.N + rows - 1) / rows, gx, gy);
   PipeOpt po;
-  po.spec0 = tune_.mv_r;
-  po.spec1 = 32 * tune_.mv_teams;
+  po.spec0 = rr;
+  po.spec1 = 32 * teams;
   po.subgroup = tune_.mv_sg;
+  po.spec2 = multi ? 1 : 0;
   vk_->dispatch((std::string("mv_") + type_tag(m.type)).c_str(), &pc, sizeof pc, gx, gy, 1, bar, po);
 }
 
@@ -667,10 +886,10 @@ void VkModel::layer_attn(VLayer& L, int T, int pos0) {
   }
   {
     const uint32_t half = c.rope_dims / 2;
-    RopePC rq{qg, rope_h_.addr, (uint32_t)c.n_head, (uint32_t)(2 * c.hd), (uint32_t)qw, (uint32_t)T, half};
+    RopePC rq{qg, rope_addr_, (uint32_t)c.n_head, (uint32_t)(2 * c.hd), (uint32_t)qw, (uint32_t)T, half};
     grid1d((uint64_t)T * c.n_head * half, gx, gy);
     vk_->dispatch("rope", &rq, sizeof rq, gx, gy, 1, false);
-    RopePC rk{k, rope_h_.addr, (uint32_t)c.n_kv, (uint32_t)c.hd, (uint32_t)kvw, (uint32_t)T, half};
+    RopePC rk{k, rope_addr_, (uint32_t)c.n_kv, (uint32_t)c.hd, (uint32_t)kvw, (uint32_t)T, half};
     grid1d((uint64_t)T * c.n_kv * half, gx, gy);
     vk_->dispatch("rope", &rk, sizeof rk, gx, gy);
   }
@@ -712,27 +931,34 @@ void VkModel::layer_gdn(VLayer& L, int T) {
   const int C = c.conv_dim();
   norm_in(L.attn_norm, T);
   const VkDeviceAddress ab = t4_.addr;  // alpha [T][nv], beta [T][nv]; t4 is free until ssm_out
-  linear(L.wqkv, xn_.addr, T, t0_.addr, false, false);
+  // speculative verify: keep this pass' recurrence inputs (rollback commits the accepted prefix) and
+  // leave the conv / recurrent state untouched
+  const bool snap = snapshot_ && L.sv.buf;
+  const VkDeviceAddress raw = snap ? L.sv.addr : t0_.addr;
+  const VkDeviceAddress qkv = snap ? L.sv.addr + (size_t)kMaxTok * C * 4 : t3_.addr;
+  const VkDeviceAddress gb = snap ? L.sv.addr + (size_t)kMaxTok * 2 * C * 4 : g_.addr;
+  const VkDeviceAddress bb = snap ? gb + (size_t)kMaxTok * c.nv * 4 : beta_.addr;
+  linear(L.wqkv, xn_.addr, T, raw, false, false);
   linear(L.wgate, xn_.addr, T, t1_.addr, false, false);
   linear(L.walpha, xn_.addr, T, ab, false, false);
   linear(L.wbeta, xn_.addr, T, ab + (size_t)T * c.nv * 4);
   uint32_t gx, gy;
   {
-    ConvPC cp{t0_.addr, conv_.addr + L.conv_off, L.conv_w.addr, t3_.addr, (uint32_t)C, (uint32_t)T, (uint32_t)C};
+    ConvPC cp{raw, conv_.addr + L.conv_off, L.conv_w.addr, qkv, (uint32_t)C, (uint32_t)T, (uint32_t)C, snap ? 0u : 1u};
     vk_->dispatch("conv", &cp, sizeof cp, (C + 255) / 256);
   }
   {
-    HeadNormPC hp{t3_.addr, 0, (uint32_t)c.dk, (uint32_t)(2 * c.nk), (uint32_t)c.dk, (uint32_t)C, 1, c.eps};
+    HeadNormPC hp{qkv, 0, (uint32_t)c.dk, (uint32_t)(2 * c.nk), (uint32_t)c.dk, (uint32_t)C, 1, c.eps};
     grid_wg((uint64_t)T * 2 * c.nk, gx, gy);
     vk_->dispatch("headnorm", &hp, sizeof hp, gx, gy, 1, false);
-    ElemPC ep{ab, ab + (size_t)T * c.nv * 4, L.dt_bias.addr, L.ssm_a.addr, g_.addr, beta_.addr, (uint32_t)(T * c.nv),
+    ElemPC ep{ab, ab + (size_t)T * c.nv * 4, L.dt_bias.addr, L.ssm_a.addr, gb, bb, (uint32_t)(T * c.nv),
               (uint32_t)c.nv, 0};
     grid1d(ep.n, gx, gy);
     vk_->dispatch("gdn_gb", &ep, sizeof ep, gx, gy);
   }
   {
-    RecPC rp{t3_.addr, g_.addr, beta_.addr, ssm_.addr + L.ssm_off, t2_.addr, (uint32_t)c.nk, (uint32_t)c.nv, (uint32_t)T,
-             (uint32_t)C};
+    RecPC rp{qkv, gb, bb, ssm_.addr + L.ssm_off, t2_.addr, (uint32_t)c.nk, (uint32_t)c.nv, (uint32_t)T, (uint32_t)C,
+             snap ? 0u : 1u};
     vk_->dispatch("gdn_rec", &rp, sizeof rp, c.nv, c.dv / 16);
   }
   {
@@ -758,26 +984,31 @@ void VkModel::layer_ffn(VLayer& L, int T) {
   pend_ = true;
 }
 
+// host-side inputs of a pass: embedding rows (CPU dequant of token_embd) and RoPE angles (fp64)
+void VkModel::fill_inputs(const int* tokens, int T, int pos0, const VBuf& embb, const VBuf& rope) {
+  const Config& c = cfg_;
+  float* emb = (float*)embb.map;
+  const GGUFTensor& te = gguf_->need("token_embd.weight");
+  for (int t = 0; t < T; t++) {
+    if (tokens[t] < 0 || tokens[t] >= tok_embd_.N) QE_FATAL("token id %d out of range", tokens[t]);
+    dequant_row_ref(te.type, te.data + (size_t)tokens[t] * tok_embd_.rb, c.n_embd, emb + (size_t)t * c.n_embd);
+  }
+  const int half = c.rope_dims / 2;
+  float* cs = (float*)rope.map;
+  for (int t = 0; t < T; t++)
+    for (int i = 0; i < half; i++) {
+      const double freq = std::pow((double)c.rope_base, -2.0 * i / c.rope_dims);
+      const double a = (double)(pos0 + t) * freq;
+      cs[2 * (t * half + i)] = (float)std::cos(a);
+      cs[2 * (t * half + i) + 1] = (float)std::sin(a);
+    }
+}
+
 // record one chunk of <= ub_ tokens (embedding, all layers, final norm); not submitted
 void VkModel::forward_chunk(const int* tokens, int T, int pos0) {
   const Config& c = cfg_;
-  float* emb = (float*)emb_h_.map;
-  for (int t = 0; t < T; t++) {
-    if (tokens[t] < 0 || tokens[t] >= tok_embd_.N) QE_FATAL("token id %d out of range", tokens[t]);
-    const GGUFTensor& te = gguf_->need("token_embd.weight");
-    dequant_row_ref(te.type, te.data + (size_t)tokens[t] * tok_embd_.rb, c.n_embd, emb + (size_t)t * c.n_embd);
-  }
-  {  // RoPE angles in double precision (positions up to 1e5+ rad)
-    const int half = c.rope_dims / 2;
-    float* cs = (float*)rope_h_.map;
-    for (int t = 0; t < T; t++)
-      for (int i = 0; i < half; i++) {
-        const double freq = std::pow((double)c.rope_base, -2.0 * i / c.rope_dims);
-        const double a = (double)(pos0 + t) * freq;
-        cs[2 * (t * half + i)] = (float)std::cos(a);
-        cs[2 * (t * half + i) + 1] = (float)std::sin(a);
-      }
-  }
+  fill_inputs(tokens, T, pos0, emb_h_, rope_h_);
+  rope_addr_ = rope_h_.addr;
   vk_->begin();
   vk_->copy(emb_h_, 0, x_, 0, (size_t)T * c.n_embd * 4);
   pend_ = false;
@@ -787,25 +1018,32 @@ void VkModel::forward_chunk(const int* tokens, int T, int pos0) {
     layer_ffn(L, T);
   }
   norm_in(output_norm_, T);
+  if (mtp_on_ && T <= kMaxTok) vk_->copy(xn_, 0, hid_, 0, (size_t)T * c.n_embd * 4);  // rows for mtp_draft
 }
 
-void VkModel::forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax, bool, bool) {
+void VkModel::forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax, bool snapshot,
+                      bool mtp_prefill) {
+  snapshot_ = snapshot && mtp_on_ && n > 1 && n <= kMaxTok;
+  snap_valid_ = snapshot_;
+  snap_T_ = n;
   // checkpoint capture inside this pass: split it at the capture position
   if (cap_slot_ >= 0 && cap_pos_ == pos0) {
     ck_save_live(cap_slot_);
     cap_slot_ = -1;
-  } else if (cap_slot_ >= 0 && cap_pos_ > pos0 && cap_pos_ < pos0 + n && n - (cap_pos_ - pos0) >= n_logits) {
+  } else if (cap_slot_ >= 0 && !snapshot_ && cap_pos_ > pos0 && cap_pos_ < pos0 + n && n - (cap_pos_ - pos0) >= n_logits) {
     const int k = cap_pos_ - pos0;
-    forward_impl(tokens, k, pos0, nullptr, 0, nullptr);
+    forward_impl(tokens, k, pos0, nullptr, 0, nullptr, mtp_prefill);
     ck_save_live(cap_slot_);
     cap_slot_ = -1;
-    forward_impl(tokens + k, n - k, cap_pos_, logits, n_logits, argmax);
+    forward_impl(tokens + k, n - k, cap_pos_, logits, n_logits, argmax, mtp_prefill);
     return;
   }
-  forward_impl(tokens, n, pos0, logits, n_logits, argmax);
+  forward_impl(tokens, n, pos0, logits, n_logits, argmax, mtp_prefill);
+  snapshot_ = false;
 }
 
-void VkModel::forward_impl(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax) {
+void VkModel::forward_impl(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax,
+                           bool mtp_prefill) {
   const Config& c = cfg_;
   QE_ASSERT(n_logits <= n);
   if (pos0 + n > ctx_len_) QE_FATAL("context overflow: %d positions > KV cache %d", pos0 + n, ctx_len_);
@@ -831,6 +1069,18 @@ void VkModel::forward_impl(const int* tokens, int n, int pos0, float* logits, in
       }
     }
     vk_->submit();
+    if (mtp_prefill && mtp_on_) {
+      // MTP KV for this chunk: pairs (h_{p-1}, x_p) = rows [carry, xn_0 .. xn_{T-2}]; carry := xn_{T-1}.
+      // Position 0 has no h_{-1}: a zero row (its MTP KV slot must still be written)
+      const size_t rb = (size_t)c.n_embd * 4;
+      vk_->begin();
+      if (pos0 + b0 == 0) vk_->fill(hm_, 0, rb);
+      else vk_->copy(carry_, 0, hm_, 0, rb);
+      if (T > 1) vk_->copy(xn_, 0, hm_, rb, (T - 1) * rb);
+      vk_->copy(xn_, (T - 1) * rb, carry_, 0, rb);
+      mtp_block(hm_.addr, tokens + b0, T, pos0 + b0);
+      vk_->submit();
+    }
   }
   max_pos_ = std::max(max_pos_, pos0 + n);
 }

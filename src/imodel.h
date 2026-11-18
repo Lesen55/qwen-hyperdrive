@@ -53,6 +53,9 @@ struct PlanStats {
 };
 
 Config load_qwen35_config(const GGUFFile& g);  // fatal on unsupported architecture / dims
+// script class of a GPT-2 byte-level token string (1 kana, 2 CJK, 3 hangul, 4 cyrillic, 5 arabic,
+// 6 thai, 0 other): seeds the MTP draft vocabulary per script in use
+int token_script(const std::string& tok);
 
 class IModel {
  public:

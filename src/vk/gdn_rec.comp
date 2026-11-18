@@ -1,11 +1,12 @@
 // Gated DeltaNet recurrence (dk = dv = 128), state [head][col j][row r] fp32, updated in place.
 // Workgroup = (v head, 16 columns); 8 consecutive invocations own one column (16 rows each) and
 // reduce with clustered subgroup adds (subgroup size >= 8 is checked by the host).
+// wr = 0 (speculative verify): state only read; rollback re-runs the accepted tokens with wr = 1, o = 0.
 #version 450
 #include "common.glsl"
 #extension GL_KHR_shader_subgroup_clustered : require
 layout(local_size_x = 128) in;
-layout(push_constant) uniform PC { uvec2 qkv, g, beta, st, o; uint nk, nv, T, C; } pc;
+layout(push_constant) uniform PC { uvec2 qkv, g, beta, st, o; uint nk, nv, T, C, wr; } pc;
 void main() {
   const uint h = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
   const uint j = gl_WorkGroupID.y * 16u + tid / 8u, r0 = (tid % 8u) * 16u;
@@ -34,7 +35,8 @@ void main() {
       oo += S[i] * qkv.d[base + hk * 128u + r0 + i];
     }
     oo = subgroupClusteredAdd(oo, 8u);
-    if (tid % 8u == 0u) o.d[t * pc.nv * 128u + h * 128u + j] = oo * qs;
+    if (tid % 8u == 0u && !is_null(pc.o)) o.d[t * pc.nv * 128u + h * 128u + j] = oo * qs;
   }
-  for (uint i = 0u; i < 16u; i++) st.d[sb + i] = S[i];
+  if (pc.wr != 0u)
+    for (uint i = 0u; i < 16u; i++) st.d[sb + i] = S[i];
 }
