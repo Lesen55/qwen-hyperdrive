@@ -1956,7 +1956,9 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
         if (on != L.hyb_on) { L.hyb_on = on; hyb_dirty_ = true; }
         idx++;
       }
-      QE_DBG("[auto] decode CPU level %d/%d: %d of %d streamed layers hybrid\n", dm, kDmLevels - 1, want, nh);
+      QE_DBG("[auto] decode CPU level %d/%d: %d of %d streamed layers hybrid (ema ms: %.1f %.1f %.1f %.1f %.1f, n %d %d %d %d %d)\n",
+             dm, kDmLevels - 1, want, nh, dm_ema_[0] * 1e3, dm_ema_[1] * 1e3, dm_ema_[2] * 1e3, dm_ema_[3] * 1e3,
+             dm_ema_[4] * 1e3, dm_cnt_[0], dm_cnt_[1], dm_cnt_[2], dm_cnt_[3], dm_cnt_[4]);
     }
     use_cpu = dm > 0;
   }

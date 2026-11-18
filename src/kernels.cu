@@ -2900,8 +2900,8 @@ __global__ void k_fa_prep_q(const float* __restrict__ q, int qhs, int qts, int n
   *(uint4*)(q16 + (size_t)wid * FA_D + 8 * lane) = *(uint4*)hh;
 }
 
-template <int KT>
-__global__ void __launch_bounds__(128, 2)  // Q in registers: 2 CTAs / SM overlap one's dequant with the other's MMA
+template <int KT, int NW>  // NW warps x 16 query rows; Q in registers, so 2 CTAs / SM fit (dequant overlaps MMA)
+__global__ void __launch_bounds__(NW * 32, 8 / NW)
     k_fa(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
          const __half* __restrict__ q16, float* __restrict__ out, int nh, int nkv, int pos0, int T,
          int recb, KVMap bs) {
@@ -2909,7 +2909,8 @@ __global__ void __launch_bounds__(128, 2)  // Q in registers: 2 CTAs / SM overla
   __half* Ks = (__half*)fa_smem;             // [32][FA_QLD]
   __half* Vs = Ks + FA_BN * FA_QLD;          // [32][FA_QLD] (row-major, read with ldmatrix.trans)
   const int h = blockIdx.y, kvh = h / (nh / nkv);
-  const int row0 = blockIdx.x * FA_BM;
+  constexpr int BM = NW * 16, NTH = NW * 32;
+  const int row0 = blockIdx.x * BM;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, tq = lane & 3;
 
@@ -2935,7 +2936,7 @@ __global__ void __launch_bounds__(128, 2)  // Q in registers: 2 CTAs / SM overla
   float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
   const int r_lo = warp * 16 + g, r_hi = r_lo + 8;   // rows of this thread inside the tile
   const int lim_lo = pos0 + row0 + r_lo, lim_hi = pos0 + row0 + r_hi;  // max key pos (causal)
-  const int pend = pos0 + min(row0 + FA_BM, T) - 1;
+  const int pend = pos0 + min(row0 + BM, T) - 1;
 
   // Q4 cache: raw records of the next tile are prefetched with cp.async (double-buffered) so the
   // global-memory latency overlaps the tensor-core work of the current tile.
@@ -2947,7 +2948,7 @@ __global__ void __launch_bounds__(128, 2)  // Q in registers: 2 CTAs / SM overla
     const uint8_t* kb = kc + kv_off(kvh, kt, bs, recb);  // a tile never crosses a KV block
     const uint8_t* vb = vc + kv_off(kvh, kt, bs, recb);
     const int nch = min(FA_BN, pend - kt + 1) * (RECB / 16);
-    for (int i = tid; i < nch; i += 128) {
+    for (int i = tid; i < nch; i += NTH) {
       cp_async16(raw + (st * 2 + 0) * RAWB + i * 16, kb + i * 16);
       cp_async16(raw + (st * 2 + 1) * RAWB + i * 16, vb + i * 16);
     }
@@ -2962,7 +2963,7 @@ __global__ void __launch_bounds__(128, 2)  // Q in registers: 2 CTAs / SM overla
       cp_async_wait<1>();
     }
     __syncthreads();
-    for (int i = tid; i < FA_BN * (FA_D / 8); i += 128) {
+    for (int i = tid; i < FA_BN * (FA_D / 8); i += NTH) {
       const int pi = i % FA_BN, c = i / FA_BN;  // lanes = positions: conflict-free stores
       const int p = kt + pi;
       uint4 pkk = make_uint4(0, 0, 0, 0), pkv = make_uint4(0, 0, 0, 0);
@@ -3259,7 +3260,8 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   const size_t sh = ((size_t)(2 * FA_BN) * FA_QLD) * sizeof(__half) +
                     (kvtype == KV_Q4 ? (size_t)2 * 2 * FA_BN * 144 : kvtype == KV_Q3 ? (size_t)2 * 2 * FA_BN * 112 : 0);
   const float sl2 = scale * 1.4426950408889634f;
-  const dim3 grid(cdiv(T, FA_BM), nh);
+  static const int fa_nw = getenv("QE_FA_NW") ? atoi(getenv("QE_FA_NW")) : 4;  // warps per CTA (4; 8 measured no faster)
+  const dim3 grid(cdiv(T, fa_nw * 16), nh);
   static const bool use_fa2 = getenv("QE_FA2") && atoi(getenv("QE_FA2")) == 1 && nh / nkv == 6;  // off: slower on sm_86
   const size_t sh2 = (size_t)2 * F2_BN * FA_QLD * sizeof(__half) + (kvtype == KV_Q4 ? (size_t)2 * 2 * F2_BN * 144 : kvtype == KV_Q3 ? (size_t)2 * 2 * F2_BN * 112 : 0);
   const uint8_t* kc = (const uint8_t*)kcache;
@@ -3269,7 +3271,8 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   case KT: {                                                                                             \
     static bool init = false;                                                                            \
     if (!init) {                                                                                         \
-      CUDA_CHECK(cudaFuncSetAttribute(k_fa<KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh)); \
+      CUDA_CHECK(cudaFuncSetAttribute(k_fa<KT, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh)); \
+      CUDA_CHECK(cudaFuncSetAttribute(k_fa<KT, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh)); \
       init = true;                                                                                       \
     }                                                                                                    \
     k_fa_prep_q<KT><<<cdiv(T * nh, 8), 256, 0, s>>>(q, qhs, qts, nh, T, sl2, q16);                       \
@@ -3281,7 +3284,8 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
       }                                                                                                  \
       k_fa2<KT, 6><<<dim3(cdiv(T, F2_TOK), nkv), 6 * 32, sh2, s>>>(kc, vc, q16, out, nh, nkv, pos0, T, recb, bs); \
     } else                                                                                               \
-      k_fa<KT><<<grid, 128, sh, s>>>(kc, vc, q16, out, nh, nkv, pos0, T, recb, bs);                         \
+    if (fa_nw == 4) k_fa<KT, 4><<<grid, 128, sh, s>>>(kc, vc, q16, out, nh, nkv, pos0, T, recb, bs);      \
+    else k_fa<KT, 8><<<grid, 256, sh, s>>>(kc, vc, q16, out, nh, nkv, pos0, T, recb, bs);                  \
     if (KT != KV_F16) k_wht_rows<<<cdiv(T * nh, 8), 256, 0, s>>>(out, T * nh);                         \
     break;                                                                                               \
   }
