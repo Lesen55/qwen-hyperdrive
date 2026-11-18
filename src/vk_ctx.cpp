@@ -163,6 +163,22 @@ VkCtx::VkCtx() {
     }
   }
   if (coopmat) en.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+  if (has_ext(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    q.pNext = &hp;
+    vkGetPhysicalDeviceProperties2(pdev_, &q);
+    import_align = hp.minImportedHostPointerAlignment ? hp.minImportedHostPointerAlignment : 4096;
+    host_import = true;
+    en.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+  }
+  {
+    VkPhysicalDeviceMaintenance4Properties m4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
+    VkPhysicalDeviceProperties2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    if (has_ext(VK_KHR_MAINTENANCE_4_EXTENSION_NAME) || p2.properties.apiVersion >= VK_API_VERSION_1_3) q.pNext = &m4;
+    vkGetPhysicalDeviceProperties2(pdev_, &q);
+    max_buffer = m4.maxBufferSize ? (size_t)m4.maxBufferSize : (size_t)1 << 31;
+  }
   VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR};
   if (has_ext(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) && !getenv("QE_VK_NO_INTDOT")) {
     VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -227,6 +243,10 @@ VkCtx::VkCtx() {
       vram_heap_ = (int)i;
     }
 
+  for (uint32_t i = 0; i < mprops_.memoryHeapCount; i++)
+    QE_DBG("[vk] memory heap %u: %.1f GiB flags 0x%x\n", i, mprops_.memoryHeaps[i].size / 1073741824.0, mprops_.memoryHeaps[i].flags);
+  for (uint32_t i = 0; i < mprops_.memoryTypeCount; i++)
+    QE_DBG("[vk] memory type %u: heap %u flags 0x%x\n", i, mprops_.memoryTypes[i].heapIndex, mprops_.memoryTypes[i].propertyFlags);
   for (uint32_t i = 0; i < mprops_.memoryTypeCount; i++) {
     const auto f = mprops_.memoryTypes[i].propertyFlags;
     if ((int)mprops_.memoryTypes[i].heapIndex == vram_heap_ && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
@@ -283,6 +303,7 @@ VkCtx::VkCtx() {
 VkCtx::~VkCtx() {
   if (!dev_) return;
   vkDeviceWaitIdle(dev_);
+  for (VkEvent e : events_) vkDestroyEvent(dev_, e, nullptr);
   if (qpool_) { prof_report(); vkDestroyQueryPool(dev_, qpool_, nullptr); }
   for (auto& [k, p] : pipes_) vkDestroyPipeline(dev_, p, nullptr);
   vkDestroyPipelineCache(dev_, cache_, nullptr);
@@ -410,6 +431,61 @@ bool VkCtx::has_pipeline(const char* name) const {
   return false;
 }
 
+VBuf VkCtx::import_host(const void* p, size_t n) {
+  VBuf b;
+  if (!host_import || ((uintptr_t)p % import_align) || (n % import_align)) return b;
+  static auto getprops = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev_, "vkGetMemoryHostPointerPropertiesEXT");
+  VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+  const VkResult pr = getprops ? getprops(dev_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p, &hp)
+                                : VK_ERROR_EXTENSION_NOT_PRESENT;
+  if (pr != VK_SUCCESS || !hp.memoryTypeBits) {
+    QE_DBG("[vk] host import: pointer properties failed (%d, types 0x%x)\n", (int)pr, hp.memoryTypeBits);
+    return b;
+  }
+  VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+  eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.pNext = &eb;
+  bci.size = n;
+  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  if (vkCreateBuffer(dev_, &bci, nullptr, &b.buf) != VK_SUCCESS) return VBuf{};
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(dev_, b.buf, &req);
+  int t = -1;
+  for (uint32_t i = 0; i < mprops_.memoryTypeCount && t < 0; i++)
+    if ((hp.memoryTypeBits & req.memoryTypeBits) & (1u << i)) t = (int)i;
+  VkImportMemoryHostPointerInfoEXT im{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+  im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  im.pHostPointer = const_cast<void*>(p);
+  VkMemoryAllocateFlagsInfo fi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  fi.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  fi.pNext = &im;
+  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  ai.pNext = &fi;
+  ai.allocationSize = n;
+  ai.memoryTypeIndex = (uint32_t)std::max(t, 0);
+  VkResult ar = VK_ERROR_UNKNOWN, br = VK_ERROR_UNKNOWN;
+  if (t >= 0) ar = vkAllocateMemory(dev_, &ai, nullptr, &b.mem);
+  if (ar == VK_SUCCESS) br = vkBindBufferMemory(dev_, b.buf, b.mem, 0);
+  if (t < 0 || ar != VK_SUCCESS || br != VK_SUCCESS) {
+    QE_DBG("[vk] host import of %.0f MiB failed: type %d (ptr types 0x%x, buffer types 0x%x), allocate %d, bind %d\n",
+           n / 1048576.0, t, hp.memoryTypeBits, req.memoryTypeBits, (int)ar, (int)br);
+    if (b.mem) vkFreeMemory(dev_, b.mem, nullptr);
+    b.mem = VK_NULL_HANDLE;
+    vkDestroyBuffer(dev_, b.buf, nullptr);
+    return VBuf{};
+  }
+  VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  dai.buffer = b.buf;
+  b.addr = vkGetBufferDeviceAddress(dev_, &dai);
+  b.size = n;
+  b.map = const_cast<void*>(p);
+  b.device_local = integrated;  // the same memory on a UMA device
+  QE_DBG("[vk] imported %.0f MiB of host memory (memory type %d, flags 0x%x)\n", n / 1048576.0, t,
+         mprops_.memoryTypes[t].propertyFlags);
+  return b;
+}
+
 bool VkCtx::has_cm(uint32_t M, uint32_t N, uint32_t K) const {
   for (auto& c : cm_shapes)
     if (c.M == M && c.N == N && c.K == K) return true;
@@ -522,15 +598,56 @@ void VkCtx::fill(const VBuf& dst, size_t off, size_t n, uint32_t v) {
 
 void VkCtx::submit() {
   if (!recording_) return;
+  submit_nowait();
+  finish();
+}
+
+void VkCtx::submit_nowait() {
+  if (!recording_) return;
   VK_CHECK(vkEndCommandBuffer(cb_));
   recording_ = false;
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &cb_;
   VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence_));
+  pending_ = true;
+}
+
+void VkCtx::finish() {
+  if (!pending_) return;
   VK_CHECK(vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX));
   VK_CHECK(vkResetFences(dev_, 1, &fence_));
+  pending_ = false;
   if (qpool_) prof_collect();
+}
+
+VkEvent VkCtx::make_event() {
+  VkEventCreateInfo ei{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+  VkEvent e;
+  VK_CHECK(vkCreateEvent(dev_, &ei, nullptr, &e));
+  events_.push_back(e);
+  return e;
+}
+void VkCtx::wait_event(VkEvent e) {
+  QE_ASSERT(recording_);
+  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdWaitEvents(cb_, 1, &e, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  1, &mb, 0, nullptr, 0, nullptr);
+  ops_++;
+}
+void VkCtx::set_event(VkEvent e) { VK_CHECK(vkSetEvent(dev_, e)); }
+void VkCtx::reset_event(VkEvent e) { VK_CHECK(vkResetEvent(dev_, e)); }
+void VkCtx::signal_host(const VBuf& flags, size_t off, uint32_t value) {
+  QE_ASSERT(recording_);
+  barrier();  // everything before (e.g. the activations the CPU will read) is visible to the host
+  vkCmdFillBuffer(cb_, flags.buf, off, 4, value);
+  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+  ops_++;
 }
 
 void VkCtx::prof_collect() {

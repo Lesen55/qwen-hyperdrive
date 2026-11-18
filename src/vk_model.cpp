@@ -1,6 +1,7 @@
 #include "vk_model.h"
 
 #include <fcntl.h>
+#include <immintrin.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -124,17 +125,26 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   }
   kv_q8_ = kvt != 0;
   kv_row_bytes_ = kv_q8_ ? (size_t)c.hd + c.hd / 8 : (size_t)c.hd * 2;
-  drop_pages_ = vk_->integrated || getenv("QE_VK_DROP_PAGES");
+  // unified memory: use the weights in place from the mapped model file (QE_VK_ZEROCOPY=1, experimental)
+  // opt-in only: Mesa ANV cannot pin read-only file pages and loses the device when the import fails
+  zero_copy_ = vk_->host_import && getenv("QE_VK_ZEROCOPY") && atoi(getenv("QE_VK_ZEROCOPY")) != 0;
+  if (zero_copy_) zc_plan();
+  drop_pages_ = !zero_copy_ && (vk_->integrated || getenv("QE_VK_DROP_PAGES"));
   if (drop_pages_) model_fd_ = open(opt.model_path.c_str(), O_RDONLY);
 
   // ---- activations, state, small tensors (always device-local)
   const int E = c.n_embd, C = c.conv_dim(), qw = 2 * c.n_head * c.hd, kvw = c.n_kv * c.hd;
   auto dev = [&](size_t floats) { return vk_->alloc(floats * 4, Mem::Device, true); };
   const size_t U = (size_t)ub_;
+  // CPU / GPU co-execution: possible on unified memory (QE_VK_HYBRID=0/1 overrides; the CPU kernels
+  // must handle the FFN gate / up formats, checked when the weights are known)
+  hyb_ = getenv("QE_VK_HYBRID") ? atoi(getenv("QE_VK_HYBRID")) != 0 : vk_->integrated;
+  if (const char* e = getenv("QE_VK_HYBRID_LEVEL")) hyb_force_ = std::clamp(atoi(e), 0, kHybLevels - 1);
+  auto devm = [&](size_t floats) { return vk_->alloc(floats * 4, hyb_ ? Mem::DeviceMapped : Mem::Device, true); };
   x_ = dev(U * E);
-  xn_ = dev(U * E);
-  t0_ = dev(U * std::max({qw, C, c.n_ff}));
-  t1_ = dev(U * std::max(c.d_inner, c.n_ff));
+  xn_ = devm(U * E);
+  t0_ = devm(U * std::max({qw, C, c.n_ff}));
+  t1_ = devm(U * std::max(c.d_inner, c.n_ff));
   t2_ = dev(U * std::max(c.n_head * c.hd, c.d_inner));
   t3_ = dev(U * std::max(2 * kvw, C));
   t4_ = dev(U * std::max(E, 2 * c.nv));
@@ -296,10 +306,33 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   plan_.res_ffn = res_ffn;
   QE_LOG("[plan] VRAM used %.0f MiB (%d/%d FFN layers resident)%s\n", vk_->vram_used() / (double)MiB, res_ffn,
          c.n_layer, host_ffn ? "" : ", all weights in VRAM");
+  if (zero_copy_ && zc_bytes_)
+    QE_LOG("[plan] unified memory: %.0f MiB of weights used in place from the mapped model file (no copy)\n",
+           zc_bytes_ / (double)MiB);
   if (host_ffn)
     QE_LOG("[plan] %.0f MiB of FFN weights read from system RAM over PCIe each token (decode will be slower)\n",
            host_ffn / (double)MiB);
   if (model_fd_ >= 0) { close(model_fd_); model_fd_ = -1; }
+  if (hyb_) {
+    for (auto& L : layers_)
+      if (L.ffn_gate.valid() && (!cpu::type_supported(L.ffn_gate.type) || !cpu::type_supported(L.ffn_up.type) || c.n_embd % 256))
+        hyb_ = false;
+    if (!hyb_) QE_LOG("[plan] CPU / GPU co-execution off: FFN formats without CPU kernels\n");
+  }
+  if (hyb_ && (!xn_.map || !t0_.map || !t1_.map)) {
+    hyb_ = false;
+    QE_LOG("[plan] CPU / GPU co-execution off: activations are not CPU-mappable on this device\n");
+  }
+  if (hyb_) {
+    const int nt = opt.cpu_threads > 0 ? opt.cpu_threads : cpu::fast_cores();
+    pool_ = std::make_unique<cpu::ThreadPool>(nt);
+    for (size_t i = 0; i < layers_.size(); i++) hyb_ev_.push_back(vk_->make_event());
+    hyb_flags_ = vk_->alloc(layers_.size() * 4, Mem::Readback);  // GPU writes, CPU polls
+    memset(hyb_flags_.map, 0, layers_.size() * 4);
+    hyb_q_.resize(c.n_embd, kMaxTok);
+    QE_LOG("[plan] CPU / GPU co-execution of the FFN gate/up rows on unified memory: %d %s threads (%s), share chosen online\n",
+           nt, cpu::fast_cores() < (int)cpu::core_order().size() ? "big-core" : "", cpu::isa_name(cpu::isa()));
+  }
   vk_->warm_pipelines();
   autotune();
   if (const char* g = getenv("QE_VK_GEMM")) tune_.gemm = g;  // fused | gemm16 | cm_gemm_MxNxK
@@ -313,6 +346,46 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
 
 VkModel::~VkModel() {
   vk_.reset();  // device teardown frees every allocation
+}
+
+void VkModel::zc_plan() {
+  std::vector<const GGUFTensor*> ts;
+  for (const auto& t : gguf_->tensors()) ts.push_back(&t);
+  std::sort(ts.begin(), ts.end(), [](const GGUFTensor* a, const GGUFTensor* b) { return a->data < b->data; });
+  const size_t al = vk_->import_align, base = (size_t)gguf_->base();
+  const size_t limit = std::min<size_t>(vk_->max_buffer, (size_t)3 << 30) / al * al;
+  for (const GGUFTensor* t : ts) {
+    const size_t s = ((size_t)t->data - base) / al * al, e = ((size_t)t->data - base + t->nbytes + al - 1) / al * al;
+    if (zc_chunks_.empty() || e - zc_chunks_.back().begin > limit) zc_chunks_.push_back({s, e});
+    else zc_chunks_.back().end = std::max(zc_chunks_.back().end, e);
+    zc_index_.push_back({t->data, (int)zc_chunks_.size() - 1});
+  }
+  std::sort(zc_index_.begin(), zc_index_.end());
+}
+
+bool VkModel::zc_view(const uint8_t* data, size_t bytes, VBuf& out) {
+  auto it = std::lower_bound(zc_index_.begin(), zc_index_.end(), std::make_pair(data, -1));
+  if (it == zc_index_.end() || it->first != data) return false;
+  ZcChunk& c = zc_chunks_[it->second];
+  const size_t file_end = gguf_->size();
+  if (!c.tried) {
+    c.tried = true;
+    // the mapping covers whole pages, so the last chunk may round past the file end: clamp to the map
+    const size_t end = std::min(c.end, (file_end + vk_->import_align - 1) / vk_->import_align * vk_->import_align);
+    c.buf = vk_->import_host(gguf_->base() + c.begin, end - c.begin);
+    if (!c.buf.buf) {
+      QE_LOG("[plan] host-memory import failed: copying the weights instead\n");
+      zero_copy_ = false;
+      return false;
+    }
+    zc_bytes_ += c.buf.size;
+  }
+  if (!c.buf.buf) return false;
+  out = c.buf;
+  out.addr = c.buf.addr + (size_t)(data - gguf_->base() - c.begin);
+  out.size = bytes;
+  out.map = const_cast<uint8_t*>(data);
+  return true;
 }
 
 // iGPU: once a tensor is in GPU memory (= system RAM), drop the model file's page-cache copy of it so
@@ -363,6 +436,7 @@ VkModel::VMat VkModel::load_mat(const std::string& name, bool prefer_device) {
   if (m.K % 256) QE_FATAL("vulkan backend: %s row length %d is not a multiple of 256", name.c_str(), m.K);
   if (m.rb % 4) QE_FATAL("vulkan backend: %s rows are not 4-byte aligned", name.c_str());
   const size_t bytes = m.rb * m.N;
+  if (zero_copy_ && prefer_device && zc_view(t.data, bytes, m.buf)) return m;
   const bool fits = vk_->vram_free() > bytes + reserve_;
   if (!fits && vk_->integrated)
     QE_FATAL("not enough memory for %s (%.0f MiB free after the %.0f MiB reserve): use a smaller model or context",
@@ -370,7 +444,10 @@ VkModel::VMat VkModel::load_mat(const std::string& name, bool prefer_device) {
   // mapped device memory (ReBAR dGPU, any iGPU): the upload is a memcpy, no staging copy
   m.buf = vk_->alloc(bytes, prefer_device && fits ? Mem::DeviceMapped : Mem::Host);
   upload(m.buf, t.data, bytes);
-  release_pages(t.data, bytes);
+  // co-execution reads the first rows of gate / up from the mapped file: keep those pages
+  const bool cpu_rows = hyb_ && (name.find("ffn_gate") != std::string::npos || name.find("ffn_up") != std::string::npos);
+  const size_t keep = cpu_rows ? (size_t)(m.N / 2) * m.rb : 0;
+  release_pages(t.data + keep, bytes - keep);
   return m;
 }
 
@@ -815,6 +892,46 @@ void VkModel::draft_vocab_add(const int* ids, int n) {
   }
 }
 
+// submit the recorded pass; with co-execution, run the CPU's share of every FFN layer meanwhile
+void VkModel::submit_pass() {
+  if (!pass_hyb_) { vk_->submit(); return; }
+  const double t0 = qe_now();
+  vk_->submit_nowait();
+  hyb_host_loop();
+  vk_->finish();
+  pass_hyb_ = false;
+  const double dt = qe_now() - t0;
+  double& e = hyb_ema_[hyb_level_];
+  e = hyb_cnt_[hyb_level_]++ ? 0.8 * e + 0.2 * dt : dt;
+}
+
+void VkModel::hyb_host_loop() {
+  const Config& c = cfg_;
+  const int T = hyb_T_, r = hyb_rows_, n = pool_->size();
+  volatile const uint32_t* flags = (volatile const uint32_t*)hyb_flags_.map;
+  const float* xn = (const float*)xn_.map;
+  float* g = (float*)t0_.map;
+  float* u = (float*)t1_.map;
+  for (int il = 0; il < (int)layers_.size(); il++) {
+    VLayer& L = layers_[il];
+    if (!L.ffn_gate.valid()) continue;
+    const double tw = qe_now();
+    while (flags[il] != hyb_serial_) {
+      _mm_pause();
+      if (qe_now() - tw > 30.0) QE_FATAL("co-execution: GPU did not reach layer %d", il);
+    }
+    for (int t = 0; t < T; t++) cpu::quantize(xn, c.n_embd, t, hyb_q_, 0, c.n_embd / 256);
+    const GGUFTensor& tg = gguf_->need(bn(il, "ffn_gate.weight"));
+    const GGUFTensor& tu = gguf_->need(bn(il, "ffn_up.weight"));
+    pool_->run([&](int i) {  // 2r rows (gate then up) split evenly
+      const int a = 2 * r * i / n, b = 2 * r * (i + 1) / n;
+      if (a < r) cpu::matvec(L.ffn_gate.type, tg.data, L.ffn_gate.rb, c.n_embd, a, std::min(b, r), hyb_q_, T, g, c.n_ff);
+      if (b > r) cpu::matvec(L.ffn_up.type, tu.data, L.ffn_up.rb, c.n_embd, std::max(a, r) - r, b - r, hyb_q_, T, u, c.n_ff);
+    });
+    vk_->set_event(hyb_ev_[il]);
+  }
+}
+
 void VkModel::reset() {
   vk_->begin();
   vk_->fill(ssm_, 0, ssm_bytes_);
@@ -1103,8 +1220,27 @@ void VkModel::layer_ffn(VLayer& L, int T) {
   const Config& c = cfg_;
   if (!L.ffn_gate.valid()) return;  // --skip-ffn
   norm_in(L.post_norm, T);
-  linear(L.ffn_gate, xn_.addr, T, t0_.addr, false, false);
-  linear(L.ffn_up, xn_.addr, T, t1_.addr);
+  const int il = (int)(&L - layers_.data());
+  if (pass_hyb_ && il >= 0 && il < (int)layers_.size() && hyb_rows_ > 0) {
+    // the CPU computes rows [0, r) of gate / up into t0_ / t1_ (it waits for this flag), the GPU
+    // the rest; SwiGLU + down wait for the CPU's event
+    const int r = hyb_rows_;
+    vk_->signal_host(hyb_flags_, (size_t)il * 4, hyb_serial_);
+    VMat g = L.ffn_gate, u = L.ffn_up;
+    g.buf.addr += (size_t)r * g.rb; g.N -= r;
+    u.buf.addr += (size_t)r * u.rb; u.N -= r;
+    MvPC pg{g.buf.addr, xn_.addr, t0_.addr + (size_t)r * 4, tab_.addr, (uint32_t)g.K, (uint32_t)g.N, (uint32_t)T,
+            (uint32_t)g.rb, (uint32_t)g.K, (uint32_t)c.n_ff, 0, 0, (uint32_t)(g.K / 32)};
+    matvec(g, pg, false);
+    MvPC pu = pg;
+    pu.w = u.buf.addr;
+    pu.y = t1_.addr + (size_t)r * 4;
+    matvec(u, pu, true);
+    vk_->wait_event(hyb_ev_[il]);
+  } else {
+    linear(L.ffn_gate, xn_.addr, T, t0_.addr, false, false);
+    linear(L.ffn_up, xn_.addr, T, t1_.addr);
+  }
   uint32_t gx, gy;
   ElemPC ep{t0_.addr, t1_.addr, 0, 0, 0, 0, (uint32_t)(T * c.n_ff), 0, 0};
   grid1d(ep.n, gx, gy);
@@ -1136,6 +1272,34 @@ void VkModel::fill_inputs(const int* tokens, int T, int pos0, const VBuf& embb, 
 // record one chunk of <= ub_ tokens (embedding, all layers, final norm); not submitted
 void VkModel::forward_chunk(const int* tokens, int T, int pos0) {
   const Config& c = cfg_;
+  pass_hyb_ = false;
+  if (hyb_ && T <= kMaxTok) {
+    // share for this pass: measured levels first, then the fastest, neighbours re-measured now and then
+    int lv;
+    if (hyb_force_ >= 0) lv = hyb_force_;
+    else {
+      lv = -1;
+      for (int k = 0; k < kHybLevels && lv < 0; k++)
+        if (hyb_cnt_[k] < 3) lv = k;
+      if (lv < 0) {
+        int best = 0;
+        for (int k = 1; k < kHybLevels; k++)
+          if (hyb_ema_[k] < hyb_ema_[best]) best = k;
+        if (++hyb_pass_ % 96 == 0) hyb_explore_ = 3, hyb_dir_ = -hyb_dir_;
+        lv = hyb_explore_ > 0 ? std::clamp(best + hyb_dir_, 0, kHybLevels - 1) : best;
+        if (hyb_explore_ > 0) hyb_explore_--;
+      }
+    }
+    if (lv != hyb_level_) QE_DBG("[auto] CPU share of the FFN gate/up rows: %d/8\n", lv);
+    hyb_level_ = lv;
+    hyb_rows_ = std::min(c.n_ff / 2, (int)std::lround(lv / 8.0 * c.n_ff / 256.0) * 256);
+    pass_hyb_ = hyb_rows_ > 0;
+    if (pass_hyb_) {
+      hyb_serial_++;
+      hyb_T_ = T;
+      for (VkEvent e : hyb_ev_) vk_->reset_event(e);
+    }
+  }
   fill_inputs(tokens, T, pos0, emb_h_, rope_h_);
   rope_addr_ = rope_h_.addr;
   vk_->begin();
@@ -1200,12 +1364,12 @@ void VkModel::forward_impl(const int* tokens, int n, int pos0, float* logits, in
           vk_->dispatch("argmax", &ap, sizeof ap, nb);
           vk_->copy(argmax_, 0, argmax_h_, 0, nb * 4);
         }
-        vk_->submit();
+        submit_pass();
         if (logits) memcpy(logits + (size_t)(r - first) * c.n_vocab, logits_h_.map, (size_t)nb * c.n_vocab * 4);
         if (argmax) memcpy(argmax + (r - first), argmax_h_.map, nb * 4);
       }
     }
-    vk_->submit();
+    submit_pass();
     if (mtp_prefill && mtp_on_) {
       // MTP KV for this chunk: pairs (h_{p-1}, x_p) = rows [carry, xn_0 .. xn_{T-2}]; carry := xn_{T-1}.
       // Position 0 has no h_{-1}: a zero row (its MTP KV slot must still be written)

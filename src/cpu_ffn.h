@@ -20,6 +20,7 @@ Isa isa();
 const char* isa_name(Isa i);
 std::string cpu_features();              // inference-relevant x86 extensions the CPU reports
 const std::vector<int>& core_order();    // one logical CPU per physical core, fastest cores first
+int fast_cores();                        // cores of the fastest class (P-cores of a hybrid CPU), >= 1
 
 // int8 activations, one scale per 256-block (q8_K style) + int16 sums per 16 (for min formats).
 // Weight sub-block scales are applied in the integer domain; one float multiply per 256 block.

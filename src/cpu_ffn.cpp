@@ -317,6 +317,33 @@ const std::vector<int>& core_order() {
   return order;
 }
 
+// Memory-bound int8 matvecs on a hybrid CPU are best left to the big cores: the slow (low-power)
+// cores finish their row share last and the whole job waits for them (Core Ultra 5 228V: 4 P-cores
+// 57.6 GB/s, all 8 cores 19.3 GB/s).
+int fast_cores() {
+  static const int n = [] {
+    const std::vector<int> pcores = read_cpu_list("/sys/devices/cpu_core/cpus");
+    const std::vector<int>& order = core_order();
+    if (!pcores.empty()) {
+      int k = 0;
+      for (int c : order) k += std::find(pcores.begin(), pcores.end(), c) != pcores.end();
+      if (k > 0) return k;
+    }
+    int best = -1, k = 0;
+    for (int c : order) {
+      int cap = 1024;
+      if (FILE* f = fopen(("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cpu_capacity").c_str(), "r")) {
+        if (fscanf(f, "%d", &cap) != 1) cap = 1024;
+        fclose(f);
+      }
+      if (cap > best) { best = cap; k = 1; }
+      else if (cap == best) k++;
+    }
+    return std::max(1, k ? k : (int)order.size());
+  }();
+  return n;
+}
+
 ThreadPool::ThreadPool(int n) : n_(n) {
   for (int i = 0; i < n; i++) threads_.emplace_back([this, i] { worker(i); });
 }

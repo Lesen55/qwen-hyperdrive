@@ -61,6 +61,16 @@ class VkCtx {
   void copy_regions(const VBuf& src, const VBuf& dst, const std::vector<VkBufferCopy>& r);  // one command
   void fill(const VBuf& dst, size_t off, size_t n, uint32_t value = 0);
   void submit();  // end, submit, wait
+  // CPU / GPU co-execution inside one submission (unified memory): the GPU writes `value` to a
+  // host-visible word when it reaches signal_host(); the CPU sets an event the GPU waits for
+  void submit_nowait();           // end + submit; finish() waits
+  void finish();
+  VkEvent make_event();
+  void wait_event(VkEvent e);     // recorded: the GPU waits until the host sets e
+  void set_event(VkEvent e);      // host
+  void reset_event(VkEvent e);    // host (event must not be waited on by pending work)
+  void signal_host(const VBuf& flags, size_t off, uint32_t value);  // recorded: flags[off] = value
+  bool pending() const { return pending_; }
   bool recording() const { return recording_; }
   bool has_pipeline(const char* name) const;
   void warm_pipelines();  // compile every embedded shader now (first request would pay for it)
@@ -77,6 +87,11 @@ class VkCtx {
   uint32_t compute_units = 0;     // CUs (AMD) / SMs (NVIDIA) when the driver tells, else 0
   uint32_t max_shared = 0, max_wg_invocations = 0;
   bool int_dot = false;           // VK_KHR_shader_integer_dot_product (packed 4 x 8-bit dot, DP4A)
+  bool host_import = false;       // VK_EXT_external_memory_host: GPU buffers over existing host memory
+  size_t import_align = 4096;
+  size_t max_buffer = 0;          // largest single buffer (VkPhysicalDeviceMaintenance4: maxBufferSize)
+  // wrap [p, p + n) (p and n multiples of import_align) as a GPU buffer; empty VBuf on failure
+  VBuf import_host(const void* p, size_t n);
   uint64_t ops() const { return ops_; }  // dispatches / copies recorded so far
   bool rebar = false;             // a CPU-mappable device-local type spans the VRAM heap
   bool has_cm(uint32_t M, uint32_t N, uint32_t K) const;
@@ -102,7 +117,9 @@ class VkCtx {
   int vram_heap_ = -1;
   size_t vram_total_ = 0, vram_used_ = 0;
   bool recording_ = false;
+  bool pending_ = false;
   uint64_t ops_ = 0;
+  std::vector<VkEvent> events_;
   // QE_VK_PROF: GPU time per pipeline (timestamps around every dispatch)
   VkQueryPool qpool_ = VK_NULL_HANDLE;
   float ts_period_ = 1.f;

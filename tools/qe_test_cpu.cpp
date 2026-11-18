@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
       for (int r = 0; r < NR; r++)
         for (int b = 0; b < B; b++) worst = std::max(worst, std::fabs(y[(size_t)b * N + r] - ref[(size_t)b * NR + r]) / rms);
       // throughput, full matrix, nth threads
-      const int reps = 5;
+      const int reps = getenv("QE_CPU_BENCH_REPS") ? atoi(getenv("QE_CPU_BENCH_REPS")) : 5;
       double t0 = qe_now();
       for (int rep = 0; rep < reps; rep++)
         pool.run([&](int i) {

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "cpu_ffn.h"
 #include "imodel.h"
 #include "vk_ctx.h"
 
@@ -94,6 +95,32 @@ class VkModel : public IModel {
   size_t reserve_ = 0;
   bool drop_pages_ = false;
   int model_fd_ = -1;
+  // unified memory (iGPU): weight matrices are GPU views of the mmapped model file itself (no copy,
+  // no second copy in RAM); the file is split into page-aligned chunks that each hold whole tensors
+  // CPU / GPU co-execution of the FFN gate / up projections on unified memory (decode and verify
+  // passes): the CPU's big cores compute rows [0, r) straight from the mapped model file while the GPU
+  // computes rows [r, n_ff); synchronized inside the submission (host flag, Vulkan event).  The share
+  // r is chosen online from measured pass times.
+  static constexpr int kHybLevels = 5;   // r = level/8 of n_ff
+  bool hyb_ = false, pass_hyb_ = false;
+  int hyb_level_ = 0, hyb_rows_ = 0, hyb_force_ = -1;
+  std::unique_ptr<cpu::ThreadPool> pool_;
+  std::vector<VkEvent> hyb_ev_;
+  VBuf hyb_flags_;
+  uint32_t hyb_serial_ = 0;
+  cpu::Q8Act hyb_q_;
+  int hyb_T_ = 0;
+  double hyb_ema_[kHybLevels] = {};
+  int hyb_cnt_[kHybLevels] = {}, hyb_pass_ = 0, hyb_explore_ = 0, hyb_dir_ = 1;
+  void hyb_host_loop();
+  void submit_pass();
+  bool zero_copy_ = false;
+  struct ZcChunk { size_t begin = 0, end = 0; VBuf buf; bool tried = false; };
+  std::vector<ZcChunk> zc_chunks_;
+  std::vector<std::pair<const uint8_t*, int>> zc_index_;  // tensor data -> chunk
+  size_t zc_bytes_ = 0;
+  void zc_plan();
+  bool zc_view(const uint8_t* data, size_t bytes, VBuf& out);
   void norm_in(const VBuf& w, int T);
   void layer_attn(VLayer& L, int T, int pos0);
   void layer_gdn(VLayer& L, int T);

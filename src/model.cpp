@@ -112,7 +112,8 @@ void Model::calibrate_host() {
   if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c") ||
       !__builtin_cpu_supports("bmi2"))
     QE_FATAL("CPU without AVX2/FMA/F16C/BMI2 (x86-64-v3) is not supported");
-  if (opt_.cpu_threads <= 0) opt_.cpu_threads = std::clamp(physical_cores(), 1, 32);
+  // big cores only on hybrid CPUs (P-cores; the E-cores would hold every parallel matvec back)
+  if (opt_.cpu_threads <= 0) opt_.cpu_threads = std::clamp(std::min(physical_cores(), cpu::fast_cores()), 1, 32);
   if (opt_.pcie_gbps <= 0) {
     const size_t n = 256ull << 20;
     void* h = nullptr;
