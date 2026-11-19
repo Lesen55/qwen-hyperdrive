@@ -54,14 +54,17 @@ jobs:
           $clang = $clangxx.Replace('clang++.exe', 'clang.exe')
           Write-Host "CXX=$clangxx C=$clang"
           & $clangxx --version
+          # CMake writes ROCM_ROOT into a generated .cmake file where backslashes
+          # in "Program Files" become invalid escapes; use forward slashes there.
+          $hipFwd = $hip -replace '\\', '/'
           cmake -S . -B build-hip -G Ninja `
             -DQE_CUDA=OFF -DQE_VULKAN=OFF -DQE_HIP=ON `
             -DCMAKE_C_COMPILER="$clang" `
             -DCMAKE_CXX_COMPILER="$clangxx" `
             -DCMAKE_HIP_COMPILER="$clangxx" `
-            -DCMAKE_HIP_COMPILER_ROCM_ROOT="$hip" `
+            -DCMAKE_HIP_COMPILER_ROCM_ROOT="$hipFwd" `
             -DCMAKE_HIP_ARCHITECTURES=gfx1100 `
-            -DCMAKE_PREFIX_PATH="$hip" `
+            -DCMAKE_PREFIX_PATH="$hipFwd" `
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
