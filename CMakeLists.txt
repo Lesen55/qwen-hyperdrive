@@ -118,7 +118,9 @@ if(QE_VULKAN)
       set(hdr ${CMAKE_BINARY_DIR}/spv/${vname}.h)
       add_custom_command(OUTPUT ${hdr}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/spv
-        COMMAND ${GLSLC} --target-env=vulkan1.2 -O -I${CMAKE_SOURCE_DIR}/src/vk ${defs} -o ${spv} ${sh}
+        # vulkan1.3 target env: the Windows SDK glslc rejects GL_EXT_integer_dot_product
+        # (mvc.comp I8 variants) under vulkan1.2, where it is core in 1.3 / SPIR-V 1.6.
+        COMMAND ${GLSLC} --target-env=vulkan1.3 -O -I${CMAKE_SOURCE_DIR}/src/vk ${defs} -o ${spv} ${sh}
         COMMAND ${CMAKE_COMMAND} -DIN=${spv} -DOUT=${hdr} -DNAME=spv_${vname} -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS ${sh} ${QE_VK_INCLUDES} ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         COMMENT "glslc ${vname}")
