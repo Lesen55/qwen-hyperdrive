@@ -1,8 +1,12 @@
 // qwen35 hybrid (Gated DeltaNet + gated full attention) model runtime.
 #pragma once
+#ifdef QE_HIP
+#include "hip_compat.h"
+#else
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#endif
 
 #include <map>
 #include <memory>
@@ -16,7 +20,9 @@
 #include "kernels.h"
 #include "cpu_ffn.h"
 #include "imodel.h"
+#ifndef QE_HIP
 #include <cuda.h>
+#endif
 
 // A weight matrix [N rows][K] in GGUF quantized form.
 struct Mat {
