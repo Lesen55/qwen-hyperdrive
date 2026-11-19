@@ -179,6 +179,9 @@ if(QE_HIP)
   target_include_directories(qehip PUBLIC src)
   target_compile_definitions(qehip PUBLIC QE_HIP=1)
   target_compile_options(qehip PRIVATE ${QE_CPU_FLAGS} -Wall -Wno-unused-function)
+  # Phase 2: the kernels are written for 32-lane warps (CUDA). gfx1100 supports
+  # wave32 natively; match the code's warp size instead of the wave64 default.
+  target_compile_options(qehip PRIVATE -mwavefrontsize32)
   set_target_properties(qehip PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(qehip PUBLIC qecommon hip::host roc::hipblas)
   qe_frontends("-hip" qehip)
