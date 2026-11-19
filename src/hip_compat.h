@@ -90,6 +90,21 @@ static inline hipError_t qeStreamWaitValue32(hipStream_t s, unsigned long long a
   return hipStreamWaitValue32(s, (hipDeviceptr_t)(uintptr_t)addr, v, flags);
 }
 
+// ---- warp shuffle mask width
+// CUDA code passes 32-bit masks (0xffffffff); HIP's __shfl*_sync templates
+// static-assert a 64-bit mask. Widen at the call sites via macros (the real
+// builtins are used inside the wrappers, which are declared before the macros).
+template <typename T>
+static __device__ __forceinline__ T qe_shfl_xor_sync(unsigned int mask, T var, int lane) {
+  return __shfl_xor_sync((unsigned long long)mask, var, lane);
+}
+template <typename T>
+static __device__ __forceinline__ T qe_shfl_sync(unsigned int mask, T var, int lane) {
+  return __shfl_sync((unsigned long long)mask, var, lane);
+}
+#define __shfl_xor_sync(mask, var, lane) qe_shfl_xor_sync(mask, var, lane)
+#define __shfl_sync(mask, var, lane) qe_shfl_sync(mask, var, lane)
+
 // ---- device intrinsics HIP does not ship
 // __dp4a: 4-way signed/unsigned byte dot product plus accumulator.
 static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
