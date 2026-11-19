@@ -19,6 +19,8 @@
 #include <deque>
 #include <cmath>
 #include <ctime>
+#include <condition_variable>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -433,6 +435,27 @@ struct Server {
       return send_all(fd, "data: " + c.dump() + "\n\n");
     };
 
+    // Prompt processing can run for minutes (long contexts) without a byte on the wire, and proxies
+    // (the Cloudflare tunnel: ~100 s) drop idle streams, which the browser reports as "network error".
+    // While a prefill runs, a helper thread sends SSE comment lines every 10 s; it is joined before the
+    // request thread writes again, so the two never write at the same time.
+    auto keepalive = [&](auto&& fn) {
+      if (!stream) return fn();
+      std::mutex km;
+      std::condition_variable kcv;
+      bool kdone = false;
+      std::thread th([&] {
+        std::unique_lock<std::mutex> lk(km);
+        while (!kcv.wait_for(lk, std::chrono::seconds(10), [&] { return kdone; }))
+          if (!send_all(fd, ": keep-alive\n\n")) break;
+      });
+      struct Join {
+        std::mutex& m; std::condition_variable& cv; bool& done; std::thread& t;
+        ~Join() { { std::lock_guard<std::mutex> g(m); done = true; } cv.notify_all(); t.join(); }
+      } join{km, kcv, kdone, th};
+      return fn();
+    };
+
     gen->set_sampling(sp);
     std::vector<int> out;
     std::string bytes_pending, reasoning, content, text_all;
@@ -454,7 +477,7 @@ struct Server {
       live.cur = rsn;
     }
     live_update("prefill", nullptr, false);
-    out.push_back(gen->start(ids));
+    out.push_back(keepalive([&] { return gen->start(ids); }));
     {
       const auto& st0 = gen->stats();
       reused0 = gen->reused();
@@ -530,7 +553,7 @@ struct Server {
         cont.insert(cont.end(), fx.begin(), fx.end());
         out.insert(out.end(), fx.begin(), fx.end());
         if (!looping) QE_LOG("[server] %s: thinking budget %d reached, closing the reasoning\n", id.c_str(), think_budget);
-        out.push_back(gen->start(cont));
+        out.push_back(keepalive([&] { return gen->start(cont); }));
         pre.t_decode += gen->stats().t_prefill;  // the forced tokens count as decode time
         continue;
       }
