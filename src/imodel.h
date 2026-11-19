@@ -2,6 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,8 @@ class IModel {
   virtual void forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax = nullptr,
                        bool snapshot = false, bool mtp_prefill = false) = 0;
   virtual void reset() = 0;
+  // cancellation flag polled between prompt chunks (a prefill stops early; the caller resets the state)
+  virtual void set_cancel(const std::atomic<bool>* c) { (void)c; }
   virtual void prepare_context(int npos, bool small_prefill = false) = 0;
   // speculative decoding (MTP); defaults for backends without it
   virtual int draft_max() const { return 0; }

@@ -26,6 +26,7 @@ inline void qe_close_sock(QeSock s) { closesocket(s); }
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -34,6 +35,7 @@ inline void qe_close_sock(QeSock s) { close(s); }
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <map>
 #include <atomic>
@@ -54,6 +56,35 @@ inline void qe_close_sock(QeSock s) { close(s); }
 #include "gguf.h"
 #include "json.h"
 #include "tokenizer.h"
+
+// true when the peer has closed the connection (EOF or reset) - checked without blocking
+static bool client_gone(QeSock fd) {
+#ifdef _WIN32
+  WSAPOLLFD p{};
+  p.fd = fd;
+  p.events = (short)POLLRDNORM;
+  if (WSAPoll(&p, 1, 0) <= 0) return false;
+  if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+  if (p.revents & POLLRDNORM) {
+    char c;
+    // the socket is blocking, but WSAPoll said readable, so the peek returns at once
+    const int r = recv(fd, &c, 1, MSG_PEEK);
+    return r == 0 || (r < 0 && WSAGetLastError() != WSAEWOULDBLOCK);
+  }
+  return false;
+#else
+  pollfd p{fd, (short)(POLLIN | POLLRDHUP), 0};
+  if (poll(&p, 1, 0) <= 0) return false;
+  if (p.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL)) return true;
+  if (p.revents & POLLIN) {
+    char c;
+    const ssize_t r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
+  }
+  return false;
+#endif
+}
+
 
 namespace {
 
@@ -565,21 +596,28 @@ struct Server {
     // (the Cloudflare tunnel: ~100 s) drop idle streams, which the browser reports as "network error".
     // While a prefill runs, a helper thread sends SSE comment lines every 10 s; it is joined before the
     // request thread writes again, so the two never write at the same time.
+    // The same thread watches the connection every second (streaming or not) and raises `cancel`
+    // when the client has gone, which stops the prefill between chunks.
+    std::atomic<bool> cancel{false};
     auto keepalive = [&](auto&& fn) {
-      if (!stream) return fn();
       std::mutex km;
       std::condition_variable kcv;
       bool kdone = false;
+      model->set_cancel(&cancel);
       std::thread th([&] {
         std::unique_lock<std::mutex> lk(km);
-        while (!kcv.wait_for(lk, std::chrono::seconds(10), [&] { return kdone; }))
-          if (!send_all(fd, ": keep-alive\n\n")) break;
+        for (int tick = 1; !kcv.wait_for(lk, std::chrono::seconds(1), [&] { return kdone; }); tick++) {
+          if (client_gone(fd)) { cancel = true; break; }
+          if (stream && tick % 10 == 0 && !send_all(fd, ": keep-alive\n\n")) { cancel = true; break; }
+        }
       });
       struct Join {
         std::mutex& m; std::condition_variable& cv; bool& done; std::thread& t;
         ~Join() { { std::lock_guard<std::mutex> g(m); done = true; } cv.notify_all(); t.join(); }
       } join{km, kcv, kdone, th};
-      return fn();
+      const int r = fn();
+      model->set_cancel(nullptr);
+      return r;
     };
 
     gen->set_sampling(sp);
@@ -604,6 +642,12 @@ struct Server {
     }
     live_update("prefill", nullptr, false);
     out.push_back(keepalive([&] { return gen->start(ids); }));
+    if (cancel) {  // the client left during the prompt: drop the partial state, send nothing
+      gen->abandon();
+      QE_LOG("[server] %s: client disconnected during prompt processing, cancelled\n", id.c_str());
+      live_update("idle", nullptr, true);
+      return;
+    }
     {
       const auto& st0 = gen->stats();
       reused0 = gen->reused();
@@ -652,6 +696,10 @@ struct Server {
           }
         }
       }
+      if (alive && client_gone(fd)) {  // no reader any more (non-streaming requests never write before the end)
+        alive = false;
+        QE_LOG("[server] %s: client disconnected, generation stopped after %zu tokens\n", id.c_str(), out.size());
+      }
       if (stop || (int)out.size() >= max_tokens || !alive) break;
       // a reasoning loop (the same passage repeated >= 4 times at the end) is closed like the budget
       bool looping = false;
@@ -680,6 +728,7 @@ struct Server {
         out.insert(out.end(), fx.begin(), fx.end());
         if (!looping) QE_LOG("[server] %s: thinking budget %d reached, closing the reasoning\n", id.c_str(), think_budget);
         out.push_back(keepalive([&] { return gen->start(cont); }));
+        if (cancel) { gen->abandon(); alive = false; break; }
         pre.t_decode += gen->stats().t_prefill;  // the forced tokens count as decode time
         continue;
       }

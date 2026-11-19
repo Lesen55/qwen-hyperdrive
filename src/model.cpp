@@ -2014,6 +2014,7 @@ void Model::forward(const int* tokens, int n, int pos0, float* logits, int n_log
     pool_->start([this, &jobs, n](int tid) { cpu_ffn_job(jobs, n, tid); });
   }
   for (int b0 = 0, T = 0; b0 < n; b0 += T) {
+    if (b0 > 0 && cancel_ && cancel_->load(std::memory_order_relaxed)) break;  // cancelled prefill
     T = std::min(Tmax_, n - b0);
     const int p0 = pos0 + b0;
     // prompt-cache checkpoint inside this chunk: end the chunk there and save the live state after it
