@@ -45,13 +45,21 @@ jobs:
           $hip = (Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
           Write-Host "HIP_PATH=$hip"
           $env:HIP_PATH = $hip
-          $clangxx = "$hip\lib\llvm\bin\clang++.exe"
+          Get-ChildItem $hip | Select-Object Name | Format-Table -HideTableHeaders
+          # ROCm 7.x flattens the layout (bin\amdclang++.exe); 6.x used lib\llvm\bin.
+          # Discover the compiler instead of assuming one layout.
+          $candidates = @("$hip\bin\amdclang++.exe", "$hip\lib\llvm\bin\clang++.exe", "$hip\llvm\bin\clang++.exe", "$hip\bin\clang++.exe")
+          $clangxx = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $clangxx) { throw "no clang++ found under $hip" }
+          $clang = $clangxx.Replace('clang++.exe', 'clang.exe')
+          Write-Host "CXX=$clangxx C=$clang"
           & $clangxx --version
           cmake -S . -B build-hip -G Ninja `
             -DQE_CUDA=OFF -DQE_VULKAN=OFF -DQE_HIP=ON `
-            -DCMAKE_C_COMPILER="$hip\lib\llvm\bin\clang.exe" `
+            -DCMAKE_C_COMPILER="$clang" `
             -DCMAKE_CXX_COMPILER="$clangxx" `
             -DCMAKE_HIP_COMPILER="$clangxx" `
+            -DCMAKE_HIP_COMPILER_ROCM_ROOT="$hip" `
             -DCMAKE_HIP_ARCHITECTURES=gfx1100 `
             -DCMAKE_PREFIX_PATH="$hip" `
             -DCMAKE_BUILD_TYPE=Release
