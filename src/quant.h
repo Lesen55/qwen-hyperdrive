@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cstring>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define QE_HD __host__ __device__ __forceinline__
 #else
 #define QE_HD inline
@@ -18,13 +18,13 @@ namespace qtab {
 #undef QT_DECL
 }  // namespace qtab
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 namespace qtab_dev {
 #define QT_DECL(type, name, size) static __device__ const type name[size]
 #include "quant_tables.inc"
 #undef QT_DECL
 }  // namespace qtab_dev
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
 #define QTAB(name) (qtab_dev::name)
 #else
 #define QTAB(name) (qtab::name)
