@@ -10,7 +10,9 @@
 #include <cmath>
 
 #include "quant.h"
+#ifndef QE_HIP
 #include <cuda.h>
+#endif
 
 #define CUBLAS_CHECK(x)                                                \
   do {                                                                 \
@@ -82,7 +84,9 @@ Model::Model(const EngineOptions& opt) : opt_(opt) {
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   CUBLAS_CHECK(cublasCreate(&cublas_));
   CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
+#ifndef QE_HIP
   CUBLAS_CHECK(cublasSetMathMode(cublas_, CUBLAS_DEFAULT_MATH));
+#endif
   plan_and_load();
 }
 
