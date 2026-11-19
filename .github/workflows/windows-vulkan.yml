@@ -11,6 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The windows-latest image ships Clang 20, but its Visual Studio 18 STL
+      # hard-rejects anything below Clang 22 (error STL1000). Install a current
+      # LLVM so the compiler and the MSVC STL agree.
+      - name: Install LLVM 22
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "22.1"
+
       - name: Check clang (LLVM, GNU-style driver targeting the MSVC ABI)
         shell: pwsh
         run: |
