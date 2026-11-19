@@ -101,22 +101,40 @@ namespace isa_avx2 {
 #include "cpu_kernels.inc"
 }
 #undef QE_ISA_AVX2
+#ifdef __clang__
+// clang (notably with the MSVC ABI) ignores #pragma GCC target; use the
+// equivalent clang attribute pragma to stamp the target features on every
+// function defined in the region instead.
+#pragma clang attribute push(__attribute__((target("avxvnni"))), apply_to = function)
+#else
 #pragma GCC push_options
 #pragma GCC target("avxvnni")
+#endif
 #define QE_ISA_VNNI
 namespace isa_vnni {
 #include "cpu_kernels.inc"
 }
 #undef QE_ISA_VNNI
+#ifdef __clang__
+#pragma clang attribute pop
+#else
 #pragma GCC pop_options
 #pragma GCC push_options
 #pragma GCC target("avx512f,avx512bw,avx512vl,avx512vnni")
+#endif
+#ifdef __clang__
+#pragma clang attribute push(__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni"))), apply_to = function)
+#endif
 #define QE_ISA_AVX512
 namespace isa_avx512 {
 #include "cpu_kernels.inc"
 }
 #undef QE_ISA_AVX512
+#ifdef __clang__
+#pragma clang attribute pop
+#else
 #pragma GCC pop_options
+#endif
 using namespace isa_avx2;  // R4 conversion (load time only)
 
 struct R4Tables {
