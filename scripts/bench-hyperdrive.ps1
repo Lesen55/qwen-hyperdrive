@@ -1,4 +1,4 @@
-# bench-hyperdrive.ps1
+﻿# bench-hyperdrive.ps1
 # qwen35-server-vk を直接起動して統制ベンチを取る（手順の考え方は llama-rx7900xtx の BENCH と同じ）
 #   - 捨て生成で温めてから本番生成2本を行い、レスポンスの timings を集計する
 #   - 2本目を採用値とする。-Draft で MTP ドラフト長を変えて比較できる
