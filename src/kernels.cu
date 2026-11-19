@@ -27,6 +27,14 @@ static __device__ __forceinline__ float warp_max(float v) {
 }
 static inline int cdiv(int64_t a, int64_t b) { return (int)((a + b - 1) / b); }
 
+#ifdef __HIP_PLATFORM_AMD__
+// No cp.async on AMD: synchronous copies (same data movement, no async overlap).
+static __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) { *(uint4*)smem = *(const uint4*)gmem; }
+static __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) { *(uint2*)smem = *(const uint2*)gmem; }
+static __device__ __forceinline__ void cp_async_commit() {}
+template <int N>
+static __device__ __forceinline__ void cp_async_wait() { __syncthreads(); }
+#else
 static __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a), "l"(gmem));
@@ -38,6 +46,7 @@ static __device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
 static __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
 static __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+#endif
 
 // =============================================================================================
 // Activation quantization
@@ -453,10 +462,15 @@ static __device__ __forceinline__ float dot_w32(const W32& w, const int4 a, cons
 //   the int8 weights (8w +- 1, scale / 8).
 // =============================================================================================
 static __device__ __forceinline__ void mma_tc_k32(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP v1: tensor-core paths are gated off (launch_mmv_tc returns false); never called.
+  (void)c; (void)a; (void)b0; (void)b1;
+#else
   asm volatile(
       "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 // IQ1 grid bytes {-1, 0, 1} -> 8g + s (s = +-1) via a byte-permute table
 static __device__ __forceinline__ uint32_t iq1_fold(uint32_t g, int s) {
@@ -733,6 +747,9 @@ __global__ void __launch_bounds__(TC_WARPS * 32)
 template <int T>
 static bool launch_mmv_tc(const uint8_t* w, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B,
                           float* y, int ldy, bool acc, cudaStream_t s) {
+#ifdef __HIP_PLATFORM_AMD__
+  return false;  // HIP v1: no tensor-core matvec (mma helpers are stubs)
+#endif
   static const int mode = getenv("QE_MMV_TC") ? atoi(getenv("QE_MMV_TC")) : 0;
   constexpr bool tc2_ok = T != QT_Q2_K && T != QT_Q4_K && T != QT_Q5_K;  // min terms not foldable
   if constexpr (tc2_ok) {
@@ -1162,10 +1179,17 @@ static bool mmv_variant(int v, const uint8_t* w, size_t rb, int K, int N, const 
     case 1: case 2: {
       const size_t sh = (size_t)B * K + (size_t)B * (K / 32) * 4;
       if (!smem_ok || sh > 99 * 1024 || (v == 2 && B < 3)) return false;
+#ifdef __HIP_PLATFORM_AMD__
+      if (sh > 64 * 1024) return false;  // RDNA3 LDS cap: fall back to mmv_default
+#endif
       if (sh > 48 * 1024) {
         static bool init = false;
         if (!init) {
+#ifdef __HIP_PLATFORM_AMD__
+#define ATTR(n, r) cudaFuncSetAttribute(k_mmv_x<T, n, r>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+#else
 #define ATTR(n, r) cudaFuncSetAttribute(k_mmv_x<T, n, r>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024);
+#endif
           ATTR(2, 2) ATTR(3, 2) ATTR(4, 2) ATTR(5, 2) ATTR(6, 2) ATTR(7, 2) ATTR(8, 2)
           ATTR(3, 4) ATTR(4, 4) ATTR(5, 4) ATTR(6, 4) ATTR(7, 4) ATTR(8, 4)
 #undef ATTR
@@ -1311,15 +1335,24 @@ constexpr int MQ_BM = 64, MQ_BN = 64, MQ_LD = 256 + 16;
 constexpr int MQ_NT = MQ_BN / 32;  // n8 tiles per warp (warps are 2 x 4)
 
 static __device__ __forceinline__ void mma_s8_k32(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP v1: MMQ is gated off (mmq_supported returns false); never called.
+  (void)c; (void)a; (void)b0; (void)b1;
+#else
   asm volatile(
       "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 static __device__ __forceinline__ void mma_s8_k16(int* c, uint32_t a0, uint32_t a1, uint32_t b0) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)c; (void)a0; (void)a1; (void)b0;
+#else
   asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                : "r"(a0), "r"(a1), "r"(b0));
+#endif
 }
 
 // Integer-scale decode of one 32-weight sub-block: int8 weights (8 ints), integer scale per scale
@@ -1799,13 +1832,22 @@ __global__ void k_gq_xsum(const int8_t* __restrict__ xq, int K, int T, int16_t* 
 }
 
 static __device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
+#ifdef __HIP_PLATFORM_AMD__
+  *(uint32_t*)smem = *(const uint32_t*)gmem;
+#else
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(a), "l"(gmem));
+#endif
 }
 static __device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP v1: GQ GEMM is gated off (gq_supported returns false); never called.
+  (void)r; (void)p;
+#else
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+#endif
 }
 
 constexpr int GQ_BN = 128, GQ_BK = 64, GQ_ST = 3, GQ_LDS = GQ_BK + 16;
@@ -2033,8 +2075,13 @@ void gq_xsum(const int8_t* xq, int K, int T, int16_t* xs, cudaStream_t s) {
 
 bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K || type == QT_Q5_K; }  // IQ1_S: min folded
 bool gq_supported(uint32_t type) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)type;
+  return false;  // follows from mmq_supported() == false on HIP
+#else
   static const bool all = getenv("QE_GQ_MIN") && atoi(getenv("QE_GQ_MIN")) != 0;  // MIN types: +0.4% PPL so far
   return mmq_supported(type) && (all || !gq_needs_xsum(type));
+#endif
 }
 
 void gq_gemm(uint32_t type, const void* buf, int K, int N, const int8_t* xq, const float* xd256,
@@ -2386,8 +2433,13 @@ __global__ void __launch_bounds__(TQ_WARPS * 32, MB)
 }
 
 bool matvec_tq_supported(uint32_t type) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)type;
+  return false;  // HIP v1: tensor-core matvec disabled; qk::matvec takes over
+#else
   return type == QT_IQ2_XXS || type == QT_IQ2_XS || type == QT_IQ2_S || type == QT_IQ3_XXS || type == QT_IQ3_S ||
          type == QT_IQ4_XS;
+#endif
 }
 template <int T>
 static void launch_tq(const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B, float* y,
@@ -2448,6 +2500,10 @@ void matvec_tq(uint32_t type, const void* W, size_t rb, int K, int N, const int8
 }
 
 bool mmq_supported(uint32_t type) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)type;
+  return false;  // HIP v1: prefill goes through dequant_f16 + hipBLAS instead
+#else
   switch (type) {
     case QT_Q2_K: case QT_Q3_K: case QT_Q4_K: case QT_Q5_K: case QT_Q6_K: case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S:
     case QT_IQ3_XXS: case QT_IQ3_S: case QT_IQ1_S: case QT_IQ4_XS:
@@ -2455,6 +2511,7 @@ bool mmq_supported(uint32_t type) {
     default:
       return false;
   }
+#endif
 }
 
 void mmq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd, int Tt, float* y,
@@ -3262,6 +3319,26 @@ static void attn_decode_simt(int kvtype, const void* kcache, const void* vcache,
 void attn_decode(int kvtype, const void* kcache, const void* vcache, const float* q, int qhs,
                  int qts, float* out, int nh, int nkv, int hd, int pos0, int T, float scale,
                  float* work, size_t work_bytes, KVMap bs, cudaStream_t s) {
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP v1: SIMT path only (the MMA kernel needs tensor cores), chunked to its
+  // T <= 4 limit, with a private scratch buffer sized by the SIMT formula (the
+  // caller's buffer follows the MMA sizing).
+  (void)work; (void)work_bytes;
+  static float* hwork = nullptr;
+  static size_t hwork_bytes = 0;
+  const size_t need = attn_decode_work_bytes(pos0 + T, nh, hd, 4);
+  if (need > hwork_bytes) {
+    if (hwork) (void)cudaFree(hwork);
+    CUDA_CHECK(cudaMalloc(&hwork, need));
+    hwork_bytes = need;
+  }
+  for (int t0 = 0; t0 < T; t0 += 4) {
+    const int nt = T - t0 < 4 ? T - t0 : 4;
+    attn_decode_simt(kvtype, kcache, vcache, q + (size_t)t0 * qts, qhs, qts, out + (size_t)t0 * nh * hd,
+                     nh, nkv, hd, pos0 + t0, nt, scale, hwork, hwork_bytes, bs, s);
+  }
+  return;
+#endif
   static const int mode = getenv("QE_ATT") ? atoi(getenv("QE_ATT")) : -1;  // 0 simt, 1 mma, -1 auto
   const bool mma = mode != 0;  // the MMA kernel is as fast or faster at T = 1 too
   if (mma) attn_decode_mma(kvtype, kcache, vcache, q, qhs, qts, out, nh, nkv, hd, pos0, T, scale, work, work_bytes, bs, s);
@@ -3309,25 +3386,39 @@ constexpr int FA_BM = 64, FA_BN = 32, FA_D = 256;
 constexpr int FA_QLD = FA_D + 8;
 
 static __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP v1: tensor-core attention paths are not launched (SIMT decode + chunked
+  // prefill take over); never called.
+  (void)c; (void)a; (void)b0; (void)b1;
+#else
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
       "{%0,%1,%2,%3};\n"
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 
 static __device__ __forceinline__ void mma16816_h(uint32_t* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)c; (void)a; (void)b0; (void)b1;
+#else
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                : "+r"(c[0]), "+r"(c[1])
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 
 // 4 transposed 8x8 b16 matrices from shared memory (B fragments of m16n8k16 from row-major [k][n])
 static __device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const void* p) {
+#ifdef __HIP_PLATFORM_AMD__
+  (void)r; (void)p;
+#else
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                : "r"(a));
+#endif
 }
 static __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
   __half2 h = __floats2half2_rn(a, b);
@@ -3706,6 +3797,17 @@ size_t attn_prefill_work_bytes(int T, int nh, int hd) { return (size_t)T * nh * 
 void attn_prefill(int kvtype, const void* kcache, const void* vcache, const float* q, int qhs,
                   int qts, float* out, int nh, int nkv, int hd, int pos0, int T, float scale,
                   void* work, KVMap bs, cudaStream_t s) {
+#ifdef __HIP_PLATFORM_AMD__
+  // HIP v1: no tensor-core flash attention; run the decode path in chunks of 4
+  // (exactly the engine's own QE_SLOW_ATTN reference route).
+  (void)work;
+  for (int t0 = 0; t0 < T; t0 += 4) {
+    const int nt = T - t0 < 4 ? T - t0 : 4;
+    attn_decode(kvtype, kcache, vcache, q + (size_t)t0 * qts, qhs, qts, out + (size_t)t0 * nh * hd,
+                nh, nkv, hd, pos0 + t0, nt, scale, nullptr, 0, bs, s);
+  }
+  return;
+#endif
   QE_ASSERT(hd == FA_D);
   __half* q16 = (__half*)work;
   const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
