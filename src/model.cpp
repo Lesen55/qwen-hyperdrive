@@ -13,6 +13,10 @@
 #ifndef QE_HIP
 #include <cuda.h>
 #endif
+#ifdef QE_HIP
+#include <direct.h>  // _mkdir (Windows): POSIX mkdir(path, mode) shim for the cache writer below
+#define mkdir(path, mode) _mkdir(path)
+#endif
 
 #define CUBLAS_CHECK(x)                                                \
   do {                                                                 \
