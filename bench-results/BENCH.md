@@ -4,10 +4,10 @@
 
 | config | max | mean | min |
 |---|---|---|---|
-| 速度優先 (`--kv q3 --spec-relax 2 --skip-ffn 29,10`) | 107.2 | 76.0 | 57.0 |
-| 厳密 (q4 KV, exact sampling) | 105.2 | 70.0 | 51.9 |
+| 速度優先 (`--kv q3 --spec-relax 2 --skip-ffn 29,10`) | 117.1 | 80.6 | 61.0 |
+| 厳密 (q4 KV, exact sampling) | 117.8 | 77.3 | 56.2 |
 
-Raw (ja x4, story x4, code x4; greedy, temp 0.7 seeds 1-3): speed 57.03 60.43 62.02 66.17 / 58.54 60.15 63.48 69.03 / 103.17 105.21 99.14 107.16; exact 59.34 57.46 55.01 52.18 / 55.55 58.50 51.93 53.70 / 99.24 97.21 105.20 95.22.
+Raw (ja x4, story x4, code x4; greedy, temp 0.7 seeds 1-3): speed 65.48 64.78 67.18 64.22 / 60.98 69.37 67.43 64.34 / 108.03 108.63 109.34 117.10; exact 64.49 57.46 58.58 60.43 / 57.49 58.49 56.21 59.31 / 117.82 109.25 115.88 112.68.
 
 ## Prefill and long-context decode (速度優先 config, temp 0.7, 200 generated tokens)
 
