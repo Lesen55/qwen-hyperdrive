@@ -7,3 +7,4 @@ result-*
 /bench-results/*.log
 /bench-results/*.txt
 /bench-results/*.json
+/media/

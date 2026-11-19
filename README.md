@@ -8,6 +8,11 @@
 （Intel Arc 130V の実機で調整済み、[対応範囲](#対応範囲)）。
 既存エンジンのラッパーではありません（llama.cpp は精度・速度比較用のリファレンスとしてのみ flake に入っています）。
 
+🎬 **紹介動画**: [パステル版（49 秒）](https://github.com/frost-1256/qwen-hyperdrive/releases/download/media-2026-11-19/qwen-hyperdrive-cute.mp4) ・
+[ネオン版（33 秒）](https://github.com/frost-1256/qwen-hyperdrive/releases/download/media-2026-11-19/qwen-hyperdrive-hype.mp4) ・
+[解説版（63 秒）](https://github.com/frost-1256/qwen-hyperdrive/releases/download/media-2026-11-19/qwen-hyperdrive-intro.mp4)
+（[リリースページ](https://github.com/frost-1256/qwen-hyperdrive/releases/tag/media-2026-11-19)。デモは本番サーバーの実際の生成を実時間で再生）
+
 ## 結果（128K コンテキスト設定、同一マシン、hazkey-server 停止時）
 
 `scripts/bench.sh` と同じ手順で計測（短い文脈は 2026-11-19、長文脈は 2026-11-18、生データは `bench-results/BENCH.md`）。
