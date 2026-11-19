@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h>
 
 #include <thread>
 #else
@@ -206,11 +207,66 @@ void r4_convert(uint32_t type, const uint8_t* src, size_t src_rb, int K, int N, 
 }
 // ---- instruction-set selection (once, at first use): AVX-512 VNNI > AVX-VNNI > AVX2; QE_CPU_ISA
 // = avx2 | vnni | avx512 overrides (only to something the CPU has)
+#ifdef _WIN32
+// __builtin_cpu_supports() lowers to libgcc's __cpu_model / __cpu_indicator_init,
+// which do not exist in the MSVC CRT, so the link fails. Do the CPUID leaf 7
+// checks directly (with the OS XCR0 state checks the builtin also performs).
+static bool qe_cpu_has(const char* name) {
+  struct Feats {
+    bool avx2, fma, f16c, avxvnni, avx512f, avx512bw, avx512vl, avx512vnni, avx512bf16, avxvnniint8, amx_int8;
+  };
+  static const Feats ft = [] {
+    Feats f{};
+    int regs[4] = {};
+    __cpuidex(regs, 0, 0);
+    const int max_leaf = regs[0];
+    int l1[4] = {}, l7[4] = {}, l7s1[4] = {};
+    if (max_leaf >= 1) __cpuidex(l1, 1, 0);
+    if (max_leaf >= 7) {
+      __cpuidex(l7, 7, 0);
+      __cpuidex(l7s1, 7, 1);
+    }
+    const bool osxsave = (l1[2] >> 27) & 1;
+    const unsigned long long xcr0 = osxsave ? (unsigned long long)_xgetbv(0) : 0;
+    const bool os_avx = ((xcr0 & 0x6) == 0x6) && ((l1[2] >> 28) & 1);
+    const bool os_512 = os_avx && ((xcr0 & 0xE6) == 0xE6);
+    f.fma = ((l1[2] >> 12) & 1) && os_avx;
+    f.f16c = ((l1[2] >> 29) & 1) && os_avx;
+    f.avx2 = ((l7[1] >> 5) & 1) && os_avx;
+    f.avxvnni = ((l7s1[0] >> 4) & 1) && os_avx;
+    f.avx512f = ((l7[1] >> 16) & 1) && os_512;
+    f.avx512bw = ((l7[1] >> 30) & 1) && os_512;
+    f.avx512vl = ((l7[1] >> 31) & 1) && os_512;
+    f.avx512vnni = ((l7[2] >> 11) & 1) && os_512;
+    f.avx512bf16 = ((l7s1[0] >> 5) & 1) && os_512;
+    f.avxvnniint8 = ((l7s1[3] >> 4) & 1) && os_avx;
+    f.amx_int8 = (l7[3] >> 25) & 1;
+    return f;
+  }();
+  if (!strcmp(name, "avx2")) return ft.avx2;
+  if (!strcmp(name, "fma")) return ft.fma;
+  if (!strcmp(name, "f16c")) return ft.f16c;
+  if (!strcmp(name, "avxvnni")) return ft.avxvnni;
+  if (!strcmp(name, "avx512f")) return ft.avx512f;
+  if (!strcmp(name, "avx512bw")) return ft.avx512bw;
+  if (!strcmp(name, "avx512vl")) return ft.avx512vl;
+  if (!strcmp(name, "avx512vnni")) return ft.avx512vnni;
+  if (!strcmp(name, "avx512bf16")) return ft.avx512bf16;
+  if (!strcmp(name, "avxvnniint8")) return ft.avxvnniint8;
+  if (!strcmp(name, "amx-int8")) return ft.amx_int8;
+  return false;
+}
+#define QE_CPU_INIT() ((void)0)
+#define QE_CPU_HAS(name) qe_cpu_has(name)
+#else
+#define QE_CPU_INIT() __builtin_cpu_init()
+#define QE_CPU_HAS(name) __builtin_cpu_supports(name)
+#endif
 static Isa detect_isa() {
-  __builtin_cpu_init();
-  const bool a512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-                    __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni");
-  const bool vnni = __builtin_cpu_supports("avxvnni");
+  QE_CPU_INIT();
+  const bool a512 = QE_CPU_HAS("avx512f") && QE_CPU_HAS("avx512bw") &&
+                    QE_CPU_HAS("avx512vl") && QE_CPU_HAS("avx512vnni");
+  const bool vnni = QE_CPU_HAS("avxvnni");
   Isa best = a512 ? Isa::AVX512 : vnni ? Isa::VNNI : Isa::AVX2;
   if (const char* e = getenv("QE_CPU_ISA")) {
     const std::string v = e;
@@ -232,12 +288,12 @@ const char* isa_name(Isa i) {
   }
 }
 std::string cpu_features() {
-  __builtin_cpu_init();
+  QE_CPU_INIT();
   std::string s;
   for (const char* f : {"avx2", "fma", "f16c", "avxvnni", "avx512f", "avx512bw", "avx512vl", "avx512vnni", "avx512bf16",
                         "avxvnniint8", "amx-int8"}) {
     bool has = false;
-#define F(name) if (!strcmp(f, name)) has = __builtin_cpu_supports(name);
+#define F(name) if (!strcmp(f, name)) has = QE_CPU_HAS(name);
     F("avx2") F("fma") F("f16c") F("avxvnni") F("avx512f") F("avx512bw") F("avx512vl") F("avx512vnni") F("avx512bf16")
     F("avxvnniint8") F("amx-int8")
 #undef F
