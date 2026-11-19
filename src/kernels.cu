@@ -1,6 +1,8 @@
 #include <type_traits>
 // CUDA kernels for qwen35-engine.
+#ifndef QE_HIP
 #include <cuda_fp16.h>
+#endif
 
 #include <cfloat>
 
