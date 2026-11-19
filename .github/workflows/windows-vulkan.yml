@@ -31,10 +31,13 @@ jobs:
           ninja --version
           cmake --version
 
+      # SDK 1.3.296's bundled shaderc/glslang cannot compile
+      # GL_EXT_integer_dot_product (mvc.comp I8 variants); 1.4.x ships a
+      # glslang that supports it, matching the upstream Nix toolchain.
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
-          vulkan_version: 1.3.296.0
+          vulkan_version: 1.4.321.0
           install_runtime: true
           cache: true
           stripdown: true
