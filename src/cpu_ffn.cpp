@@ -1,8 +1,20 @@
 #include "cpu_ffn.h"
 
 #include <immintrin.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <thread>
+#else
 #include <pthread.h>
 #include <sched.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -286,6 +298,13 @@ static std::vector<int> read_cpu_list(const char* path) {
 }
 const std::vector<int>& core_order() {
   static const std::vector<int> order = [] {
+#ifdef _WIN32
+    // no /sys topology on Windows: all logical CPUs, in order (no SMT / hybrid ranking in v1)
+    const unsigned n = std::thread::hardware_concurrency();
+    std::vector<int> o;
+    for (unsigned i = 0; i < (n ? n : 1); i++) o.push_back((int)i);
+    return o;
+#else
     std::vector<int> online = read_cpu_list("/sys/devices/system/cpu/online");
     const std::vector<int> pcores = read_cpu_list("/sys/devices/cpu_core/cpus");
     std::vector<std::pair<std::pair<int, int>, int>> cand;  // ((-rank, cpu), cpu)
@@ -313,6 +332,7 @@ const std::vector<int>& core_order() {
     std::vector<int> o;
     for (auto& c : cand) o.push_back(c.second);
     return o;
+#endif
   }();
   return order;
 }
@@ -375,10 +395,15 @@ void ThreadPool::worker(int idx) {
   {
     const std::vector<int>& order = core_order();
     if (!order.empty()) {
+      const int cpu = order[idx % order.size()];
+#ifdef _WIN32
+      if (cpu < 64) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpu);
+#else
       cpu_set_t cs;
       CPU_ZERO(&cs);
-      CPU_SET(order[idx % order.size()], &cs);
+      CPU_SET(cpu, &cs);
       pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+#endif
     }
   }
   uint64_t seen = 0;

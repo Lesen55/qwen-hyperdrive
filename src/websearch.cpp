@@ -2,9 +2,11 @@
 
 #include "common.h"
 
+#ifndef _WIN32
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +17,11 @@ namespace {
 
 const char* kUA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
+#ifdef _WIN32
+// Windows port: no fork/exec curl subprocess yet, so fetches fail and web search
+// returns no results (the rest of the server is unaffected).
+std::string curl_get(const std::string&, size_t, int) { return ""; }
+#else
 // run curl (no shell), capture at most max_bytes of stdout
 std::string curl_get(const std::string& url, size_t max_bytes, int timeout_s) {
   // everything the child needs is built before fork (no allocation between fork and exec)
@@ -47,6 +54,7 @@ std::string curl_get(const std::string& url, size_t max_bytes, int timeout_s) {
   if (out.size() > max_bytes) out.resize(max_bytes);
   return out;
 }
+#endif  // _WIN32
 
 std::string url_encode(const std::string& s) {
   static const char* hex = "0123456789ABCDEF";

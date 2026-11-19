@@ -1,9 +1,15 @@
 #include "vk_model.h"
 
+#ifndef _WIN32
 #include <fcntl.h>
-#include <immintrin.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+#include <immintrin.h>
+#ifdef _WIN32
+#include <filesystem>
+#include <system_error>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -129,10 +135,17 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   kv_row_bytes_ = kv_q8_ ? (size_t)c.hd + c.hd / 8 : (size_t)c.hd * 2;
   // unified memory: use the weights in place from the mapped model file (QE_VK_ZEROCOPY=1, experimental)
   // opt-in only: Mesa ANV cannot pin read-only file pages and loses the device when the import fails
+#ifdef _WIN32
+  // no zero-copy import of the mapped file and no page-cache dropping on Windows (v1):
+  // weights always go through the copy path into GPU buffers
+  zero_copy_ = false;
+  drop_pages_ = false;
+#else
   zero_copy_ = vk_->host_import && getenv("QE_VK_ZEROCOPY") && atoi(getenv("QE_VK_ZEROCOPY")) != 0;
   if (zero_copy_) zc_plan();
   drop_pages_ = !zero_copy_ && (vk_->integrated || getenv("QE_VK_DROP_PAGES"));
   if (drop_pages_) model_fd_ = open(opt.model_path.c_str(), O_RDONLY);
+#endif
 
   // ---- activations, state, small tensors (always device-local)
   const int E = c.n_embd, C = c.conv_dim(), qw = 2 * c.n_head * c.hd, kvw = c.n_kv * c.hd;
@@ -314,7 +327,9 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   if (host_ffn)
     QE_LOG("[plan] %.0f MiB of FFN weights read from system RAM over PCIe each token (decode will be slower)\n",
            host_ffn / (double)MiB);
+#ifndef _WIN32
   if (model_fd_ >= 0) { close(model_fd_); model_fd_ = -1; }
+#endif
   if (hyb_) {
     for (auto& L : layers_)
       if (L.ffn_gate.valid() && (!cpu::type_supported(L.ffn_gate.type) || !cpu::type_supported(L.ffn_up.type) || c.n_embd % 256))
@@ -393,10 +408,15 @@ bool VkModel::zc_view(const uint8_t* data, size_t bytes, VBuf& out) {
 // iGPU: once a tensor is in GPU memory (= system RAM), drop the model file's page-cache copy of it so
 // the weights are not held twice (32 GB Arc 130V laptops); token_embd stays mapped for embedding
 void VkModel::release_pages(const void* p, size_t n) {
+#ifdef _WIN32
+  (void)p;
+  (void)n;  // no page-cache management in the Windows port
+#else
   if (model_fd_ < 0 || !n) return;
   const uintptr_t pg = 4096, a = ((uintptr_t)p + pg - 1) & ~(pg - 1), e = ((uintptr_t)p + n) & ~(pg - 1);
   if (e > a) madvise((void*)a, e - a, MADV_DONTNEED);
   posix_fadvise(model_fd_, (off_t)((const uint8_t*)p - gguf_->base()), (off_t)n, POSIX_FADV_DONTNEED);
+#endif
 }
 
 // architecture profile (logged; the per-device numbers come from the autotuner)
@@ -532,6 +552,9 @@ void VkModel::autotune() {
            vk_->driver_version, type_tag(mats[0]->type), mats[0]->N, mats[0]->K, type_tag(mats[1]->type), mats[1]->N,
            mats[1]->K, ub_);
   const char* home = getenv("HOME");
+#ifdef _WIN32
+  if (!home) home = getenv("USERPROFILE");
+#endif
   const std::string path = home ? std::string(home) + "/.cache/qwen-hyperdrive/" + key + ".txt" : "";
   // cooperative-matrix shapes this device offers (preferred order per vendor: Intel XMX is 8 x 16 x 16)
   std::vector<std::string> cms;
@@ -718,7 +741,12 @@ void VkModel::autotune() {
                    std::to_string(tune_.cm_r) + ": " + std::to_string((int)c4) + " us)").c_str(),
          tune_.gemm.c_str(), best * 1e3, ub_);
   if (!path.empty()) {
+#ifdef _WIN32
+    std::error_code ec;
+    std::filesystem::create_directories(path.substr(0, path.rfind('/')), ec);
+#else
     (void)!system(("mkdir -p '" + path.substr(0, path.rfind('/')) + "'").c_str());
+#endif
     if (FILE* f = fopen(path.c_str(), "w")) {
       fprintf(f, "%d %d %u %d %d %d %d %d %d %d %d %s\n", tune_.mv_teams, tune_.mv_r, tune_.mv_sg, tune_.mm_teams, tune_.mm_r,
               tune_.coop ? 1 : 0, tune_.c_teams, tune_.c_r, tune_.cm_teams, tune_.cm_r, tune_.i8 ? 1 : 0, tune_.gemm.c_str());

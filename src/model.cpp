@@ -89,6 +89,9 @@ Model::Model(const EngineOptions& opt) : opt_(opt) {
 // Host-side machine parameters the planner uses: physical cores, PCIe host->device bandwidth and DRAM
 // read bandwidth, measured at start-up unless given explicitly (they decide the CPU/GPU split).
 static int physical_cores() {
+#ifdef _WIN32
+  return (int)std::thread::hardware_concurrency();  // no /sys topology on Windows
+#else
   std::set<std::pair<int, int>> cores;
   for (int cpu = 0; cpu < 1024; cpu++) {
     const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
@@ -104,6 +107,7 @@ static int physical_cores() {
     cores.insert({pkg, core});
   }
   return cores.empty() ? (int)std::thread::hardware_concurrency() : (int)cores.size();
+#endif
 }
 
 void Model::calibrate_host() {

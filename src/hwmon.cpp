@@ -1,5 +1,12 @@
 #include "hwmon.h"
 
+#ifdef _WIN32
+// Windows port: no telemetry yet (NVML .so / /proc / /sys do not exist); the web UI
+// shows the "unknown" defaults from hwmon.h.
+GpuStats read_gpu_stats() { return GpuStats{}; }
+CpuStats read_cpu_stats() { return CpuStats{}; }
+#else
+
 #include <dirent.h>
 #include <dlfcn.h>
 
@@ -170,3 +177,5 @@ CpuStats read_cpu_stats() {
   }
   return c;
 }
+
+#endif  // _WIN32
