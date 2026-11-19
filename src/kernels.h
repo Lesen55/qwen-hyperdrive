@@ -32,8 +32,9 @@ void quantize_q8_256(const float* x, int8_t* xq, float* xd, int K, int T, cudaSt
 // K % 256 == 0); activations from quantize_q8_256.
 bool matvec_tq_supported(uint32_t type);
 int matvec_tq_min_batch(uint32_t type, int K);  // smallest B where matvec_tq beats qk::matvec
-void matvec_tq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq256, const float* xd256, int B,
-               float* y, int ldy, bool acc, cudaStream_t s);
+// gs = activation scale group: 256 (quantize_q8_256) or 32 (quantize_q8, the dp4a kernels' format)
+void matvec_tq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B,
+               float* y, int ldy, bool acc, cudaStream_t s, int gs = 256);
 bool mmq_supported(uint32_t type);
 void set_num_sms(int n);  // device SM count (launch heuristics)
 void matvec_rows(uint32_t type, const void* W, size_t rb, int K, const int* rows, int N, const int8_t* xq,

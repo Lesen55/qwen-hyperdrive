@@ -987,11 +987,17 @@ void Model::linear(Layer* L, Mat& m, const float* x, int T, float* y, int ldy, b
   const bool is_float = m.type == QT_F32 || m.type == QT_F16 || m.type == QT_BF16;
   if (T <= qk::kMaxB) {
     if (!is_float && use_tq(m, T)) {
+      static const int gs = getenv("QE_TQ_GS") && atoi(getenv("QE_TQ_GS")) == 256 ? 256 : 32;
+      if (gs == 32) {  // the dp4a kernels' activations: same numbers as the T = 1 path
+        prepare_input(x, m.K, T, s);
+        qk::matvec_tq(m.type, W, m.row_bytes, m.K, m.N, xq_, xd_, T, y, ldy, acc, s, 32);
+        return;
+      }
       if (prep256_ != x || prep256_K_ != m.K || prep256_T_ != T) {
         qk::quantize_q8_256(x, xq256_, xd256_, m.K, T, s);
         prep256_ = x; prep256_K_ = m.K; prep256_T_ = T;
       }
-      qk::matvec_tq(m.type, W, m.row_bytes, m.K, m.N, xq256_, xd256_, T, y, ldy, acc, s);
+      qk::matvec_tq(m.type, W, m.row_bytes, m.K, m.N, xq256_, xd256_, T, y, ldy, acc, s, 256);
       return;
     }
     if (!is_float) prepare_input(x, m.K, T, s);

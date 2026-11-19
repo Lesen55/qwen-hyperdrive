@@ -77,6 +77,21 @@ int main(int argc, char** argv) {
         double md = 0, mx = 0;
         for (size_t i = 0; i < ha.size(); i++) { md = std::max(md, (double)fabsf(ha[i] - hb[i])); mx = std::max(mx, (double)fabsf(ha[i])); }
         printf("/tq %4.0f (d %.0e)", t->nbytes / (ms2 / reps * 1e-3) / 1e9, md / std::max(mx, 1e-30));
+        {  // per-32 activations (the dp4a kernels' xq / xd)
+          for (int i = 0; i < 10; i++) qk::matvec_tq(t->type, W, rb, K, N, xq, xd, B, y2, N, false, 0, 32);
+          float ms3 = 1e30f;
+          for (int trial = 0; trial < 7; trial++) {
+            cudaEventRecord(e0);
+            for (int i = 0; i < reps; i++) qk::matvec_tq(t->type, W, rb, K, N, xq, xd, B, y2, N, false, 0, 32);
+            cudaEventRecord(e1); cudaEventSynchronize(e1);
+            float m; cudaEventElapsedTime(&m, e0, e1);
+            ms3 = std::min(ms3, m);
+          }
+          CUDA_CHECK(cudaMemcpy(hb.data(), y2, hb.size() * 4, cudaMemcpyDeviceToHost));
+          double md3 = 0;
+          for (size_t i = 0; i < ha.size(); i++) md3 = std::max(md3, (double)fabsf(ha[i] - hb[i]));
+          printf("/x32 %4.0f (d %.0e)", t->nbytes / (ms3 / reps * 1e-3) / 1e9, md3 / std::max(mx, 1e-30));
+        }
       }
       if (check) {
         std::vector<float> hy((size_t)B * N);

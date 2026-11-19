@@ -2234,7 +2234,9 @@ constexpr int TQ_WARPS = 4;  // the warps of a CTA split the K range of one 16-r
 // current one is decoded from shared memory; half the shared memory of the cp.async double buffer,
 // so about twice the warps per SM)
 // MB: min CTAs per SM for the register allocation (a cap that raises occupancy where it pays)
-template <int T, int B, bool RP, int MB>
+// X32: activations with one scale per 32 (quantize_q8, as the dp4a kernels): the scale is applied per
+// sub-block in float; else per 256 (quantize_q8_256), one float multiply per super-block
+template <int T, int B, bool RP, int MB, bool X32 = false>
 __global__ void __launch_bounds__(TQ_WARPS * 32, MB)
     k_mmv_tq(const uint8_t* __restrict__ W, size_t rb, int K, int N, const int8_t* __restrict__ xq,
              const float* __restrict__ xd, float* __restrict__ y, int ldy, int acc) {
@@ -2243,7 +2245,11 @@ __global__ void __launch_bounds__(TQ_WARPS * 32, MB)
   constexpr int BB = QDec<T>::BB;
   constexpr int BW = (BB + 3 + 3) / 4 + 1;  // 4-byte words per staged row (aligned-down start)
   constexpr int NS = RP ? 1 : 2, PW = (16 * BW + 31) / 32;
-  __shared__ __align__(16) uint32_t stage[TQ_WARPS][NS][16][BW];
+  // double-buffer rows are copied in 16-byte chunks from the 16-byte boundary below the super-block
+  // (cp.async.cg, L2 only): BC chunks per row; the register-prefetch stage keeps 4-byte words
+  // row stride in words: an odd number of 16-byte chunks, so the 16 rows fall on different banks
+  constexpr int BC = (BB + 15 + 15) / 16, RW = RP ? BW : 4 * (BC | 1);
+  __shared__ __align__(16) uint32_t stage[TQ_WARPS][NS][16][RW];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
   const int row0 = blockIdx.x * 16;
   const int nb = K / 256;
@@ -2253,11 +2259,11 @@ __global__ void __launch_bounds__(TQ_WARPS * 32, MB)
   const int t0 = 2 * tq, t1 = 2 * tq + 1;  // the C columns (tokens) of this lane
   // the staged copy of row r starts at the 4-byte boundary below its super-block: offset (r*rb + j*BB) & 3
   auto issue = [&](int j, int st) {
-    for (int i = lane; i < 16 * BW; i += 32) {
-      const int r = i / BW, wd = i % BW;
+    for (int i = lane; i < 16 * BC; i += 32) {
+      const int r = i / BC, ch = i % BC;
       const uint8_t* src = W + (size_t)min(row0 + r, N - 1) * rb + (size_t)j * BB;
-      const uint8_t* al = (const uint8_t*)((uintptr_t)src & ~(uintptr_t)3);
-      cp_async4(&stage[warp][st][r][wd], al + 4 * wd);
+      const uint8_t* al = (const uint8_t*)((uintptr_t)src & ~(uintptr_t)15);
+      cp_async16(&stage[warp][st][r][4 * ch], al + 16 * ch);
     }
     cp_async_commit();
   };
@@ -2297,13 +2303,16 @@ __global__ void __launch_bounds__(TQ_WARPS * 32, MB)
       cp_async_wait<1>();
       __syncwarp();
     }
-    const size_t oa = ((size_t)min(row0 + g, N - 1) * rb + (size_t)j * BB) & 3;
-    const size_t ob = ((size_t)min(row0 + g + 8, N - 1) * rb + (size_t)j * BB) & 3;
+    constexpr uintptr_t OM = RP ? 3 : 15;
+    const uintptr_t oa = (uintptr_t)(W + (size_t)min(row0 + g, N - 1) * rb + (size_t)j * BB) & OM;
+    const uintptr_t ob = (uintptr_t)(W + (size_t)min(row0 + g + 8, N - 1) * rb + (size_t)j * BB) & OM;
     const uint8_t* ba = (const uint8_t*)stage[warp][st][g] + oa;
     const uint8_t* bbk = (const uint8_t*)stage[warp][st][g + 8] + ob;
     int ci[4] = {0, 0, 0, 0};
+    float cf[4] = {0.f, 0.f, 0.f, 0.f};  // X32: per-sub-block scaled partials
 #pragma unroll
     for (int ib = 0; ib < 8; ib++) {
+      if constexpr (X32) ci[0] = ci[1] = ci[2] = ci[3] = 0;
       uint32_t a[4];
       int sa0, sa1, sb0, sb1;
       P::dec(ba, ib, tq, a[0], a[2], sa0, sa1);
@@ -2328,14 +2337,25 @@ __global__ void __launch_bounds__(TQ_WARPS * 32, MB)
           ci[0] += c[0] * s_a; ci[1] += c[1] * s_a; ci[2] += c[2] * s_b; ci[3] += c[3] * s_b;
         }
       }
+      if constexpr (X32) {
+        const int nsb = K / 32;
+        const float xs0 = t0 < B ? __ldg(xd + (size_t)t0 * nsb + j * 8 + ib) : 0.f;
+        const float xs1 = t1 < B ? __ldg(xd + (size_t)t1 * nsb + j * 8 + ib) : 0.f;
+        cf[0] += (float)ci[0] * xs0; cf[1] += (float)ci[1] * xs1;
+        cf[2] += (float)ci[2] * xs0; cf[3] += (float)ci[3] * xs1;
+      }
     }
     const float fa = Q::fac(ba), fb = Q::fac(bbk);
+    if constexpr (X32) {
+      acc4[0] += cf[0] * fa; acc4[1] += cf[1] * fa; acc4[2] += cf[2] * fb; acc4[3] += cf[3] * fb;
+    } else {
     const float x0 = t0 < B ? __ldg(xd + (size_t)t0 * nb + j) : 0.f;
     const float x1 = t1 < B ? __ldg(xd + (size_t)t1 * nb + j) : 0.f;
     acc4[0] += (float)ci[0] * fa * x0;
     acc4[1] += (float)ci[1] * fa * x1;
     acc4[2] += (float)ci[2] * fb * x0;
     acc4[3] += (float)ci[3] * fb * x1;
+    }
     __syncwarp();  // the stage is refilled by the next iteration's issue
     if constexpr (RP) {
       if (j + 1 < j1) sstore();
@@ -2369,46 +2389,58 @@ bool matvec_tq_supported(uint32_t type) {
 }
 template <int T>
 static void launch_tq(const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B, float* y,
-                      int ldy, bool acc, cudaStream_t s) {
+                      int ldy, bool acc, cudaStream_t s, bool x32) {
   const uint8_t* w = (const uint8_t*)W;
   const int grid = cdiv(N, 16);
-  // per type (qe_bench_mv ... types, RTX 3080): IQ3_S prefers the register-prefetched single stage,
-  // IQ3_XXS / IQ2_XXS the cp.async double buffer with registers capped for 8 CTAs / SM, the others
-  // the plain double buffer.  QE_TQ_MODE=0|1|2 forces double buffer / register prefetch / capped.
+  // per type and shape (qe_bench_mv ... types, RTX 3080): the uncapped 16-byte double buffer, except
+  // the long rows (K >= 8192, down projections) of IQ2_XS / IQ2_S / IQ4_XS, which prefer registers
+  // capped for 8 CTAs / SM.  QE_TQ_MODE=0|1|2 forces double buffer / register prefetch / capped.
   static const int force = getenv("QE_TQ_MODE") ? atoi(getenv("QE_TQ_MODE")) : -1;
-  const int mode = force >= 0 ? force : T == QT_IQ3_S ? 1 : (T == QT_IQ3_XXS || T == QT_IQ2_XXS) ? 2 : 0;
-#define LAUNCH(RP, MB)                                                                                         \
+  const bool capped = K >= 8192 && (T == QT_IQ2_XS || T == QT_IQ2_S || T == QT_IQ4_XS);
+  const int mode = force >= 0 ? force : capped ? 2 : 0;
+#define LAUNCH1(RP, MB, X)                                                                                     \
   switch (B) {                                                                                                 \
-    case 1: k_mmv_tq<T, 1, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
-    case 2: k_mmv_tq<T, 2, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
-    case 3: k_mmv_tq<T, 3, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
-    case 4: k_mmv_tq<T, 4, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
-    case 5: k_mmv_tq<T, 5, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
-    case 6: k_mmv_tq<T, 6, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
-    case 7: k_mmv_tq<T, 7, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
-    case 8: k_mmv_tq<T, 8, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 1: k_mmv_tq<T, 1, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
+    case 2: k_mmv_tq<T, 2, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
+    case 3: k_mmv_tq<T, 3, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
+    case 4: k_mmv_tq<T, 4, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
+    case 5: k_mmv_tq<T, 5, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
+    case 6: k_mmv_tq<T, 6, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
+    case 7: k_mmv_tq<T, 7, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
+    case 8: k_mmv_tq<T, 8, RP, MB, X><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break; \
     default: QE_FATAL("matvec_tq: batch %d", B);                                                               \
   }
+#define LAUNCH(RP, MB) if (x32) { LAUNCH1(RP, MB, true) } else { LAUNCH1(RP, MB, false) }
   if (mode == 1) { LAUNCH(true, 1) }
   else if (mode == 2) { LAUNCH(false, 8) }
   else { LAUNCH(false, 1) }
 #undef LAUNCH
+#undef LAUNCH1
 }
 int matvec_tq_min_batch(uint32_t type, int K) {
   // smallest batch where the tensor-core kernel beats the dp4a kernels (same benchmark)
-  if (type == QT_IQ3_S) return K >= 6144 ? 4 : 5;
-  return K >= 6144 ? 4 : 7;
+  const bool down = K >= 8192, wide = K >= 6144;
+  switch (type) {
+    case QT_IQ3_S: return 2;
+    case QT_IQ3_XXS: return 4;
+    case QT_IQ2_XS: return down ? 2 : 4;
+    case QT_IQ2_XXS: return 4;
+    case QT_IQ2_S: return wide ? 4 : 6;
+    case QT_IQ4_XS: return wide ? 4 : 7;
+  }
+  return 99;
 }
 void matvec_tq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq256, const float* xd256, int B,
-               float* y, int ldy, bool acc, cudaStream_t s) {
+               float* y, int ldy, bool acc, cudaStream_t s, int gs) {
+  const bool x32 = gs == 32;
   QE_ASSERT(K % 256 == 0);
   switch (type) {
-    case QT_IQ2_XXS: launch_tq<QT_IQ2_XXS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s); break;
-    case QT_IQ2_XS: launch_tq<QT_IQ2_XS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s); break;
-    case QT_IQ2_S: launch_tq<QT_IQ2_S>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s); break;
-    case QT_IQ3_XXS: launch_tq<QT_IQ3_XXS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s); break;
-    case QT_IQ3_S: launch_tq<QT_IQ3_S>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s); break;
-    case QT_IQ4_XS: launch_tq<QT_IQ4_XS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s); break;
+    case QT_IQ2_XXS: launch_tq<QT_IQ2_XXS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s, x32); break;
+    case QT_IQ2_XS: launch_tq<QT_IQ2_XS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s, x32); break;
+    case QT_IQ2_S: launch_tq<QT_IQ2_S>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s, x32); break;
+    case QT_IQ3_XXS: launch_tq<QT_IQ3_XXS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s, x32); break;
+    case QT_IQ3_S: launch_tq<QT_IQ3_S>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s, x32); break;
+    case QT_IQ4_XS: launch_tq<QT_IQ4_XS>(W, rb, K, N, xq256, xd256, B, y, ldy, acc, s, x32); break;
     default: QE_FATAL("matvec_tq: unsupported type %u", type);
   }
 }
