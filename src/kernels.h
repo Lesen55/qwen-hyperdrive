@@ -1,7 +1,11 @@
 // CUDA kernels of qwen35-engine (host-side API).
 #pragma once
+#ifdef QE_HIP
+#include "hip_compat.h"
+#else
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#endif
 
 #include <cstdint>
 
