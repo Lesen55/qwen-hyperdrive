@@ -125,6 +125,40 @@ struct Server {
   std::string model_name;
   std::atomic<int> id_counter{0};
   int stop_ids[2] = {-1, -1};
+  // compaction summaries: hash of the dropped message prefix -> summary of it
+  std::map<size_t, std::string> summaries;
+  // Summarize `part` (with an earlier summary `prev` of what came before it) using the model itself:
+  // greedy, no thinking, at most 512 tokens; the transcript is cut to its most recent ~24K tokens so
+  // the call stays well inside proxy timeouts.  Call with `mu` held.
+  std::string summarize(const std::vector<ChatMessage>& part, const std::string& prev) {
+    std::string tr;
+    for (const auto& m : part) {
+      if (m.content.empty() && !m.tool_calls.is_array()) continue;
+      tr += (m.role == "user" ? "ユーザー" : m.role == "assistant" ? "アシスタント" : m.role) + std::string(": ") + m.content;
+      if (m.tool_calls.is_array()) tr += " [ツール呼び出し " + m.tool_calls.dump() + "]";
+      tr += "\n\n";
+    }
+    std::vector<int> t = tok->encode(tr, false);
+    const int cap = std::min(24576, opt.ctx / 2);
+    if ((int)t.size() > cap) tr = "（…前略…）\n" + tok->decode(std::vector<int>(t.end() - cap, t.end()));
+    std::vector<ChatMessage> req;
+    req.push_back({"system", "あなたは会話の要約係です。後で会話を続けるために必要な事実・決定事項・ユーザーの要望・未解決の質問・固有名詞や数値を落とさず、日本語の箇条書きで簡潔にまとめてください。", "", Json()});
+    std::string u;
+    if (!prev.empty()) u += "これまでの要約:\n" + prev + "\n\n";
+    u += "続きの会話:\n" + tr + "\n上の内容（これまでの要約があればそれも含めて）を 1 つの要約にまとめてください。";
+    req.push_back({"user", u, "", Json()});
+    std::vector<int> ids = tok->encode(chat_render(req, true, false), true);
+    SamplingParams g;
+    g.temperature = 0.f;
+    gen->set_sampling(g);
+    std::vector<int> out;
+    out.push_back(gen->start(ids));
+    while ((int)out.size() < 512 && out.back() != stop_ids[0] && out.back() != stop_ids[1]) gen->step(out);
+    while (!out.empty() && (out.back() == stop_ids[0] || out.back() == stop_ids[1])) out.pop_back();
+    for (size_t i = 0; i < out.size(); i++)
+      if (out[i] == stop_ids[0] || out[i] == stop_ids[1]) { out.resize(i); break; }
+    return tok->decode(out);
+  }
   std::string skip_ffn_str;
   std::mutex search_mu;
   static std::string query_param(const std::string& path, const std::string& key, const std::string& def = "") {
@@ -376,7 +410,78 @@ struct Server {
       QE_LOG("[server] request: model=%s think=%d effort=%s max_tokens=%d tools=%zu roles=%s\n", mname.c_str(), (int)thinking,
              effort.empty() ? (thinking ? "xhigh" : "-") : effort.c_str(), req_max, tools.is_array() ? tools.arr().size() : (size_t)0,
              roles.c_str());
-      prompt = chat_render(chat_messages_from_json(b["messages"]), true, thinking, tools, effort);
+      std::vector<ChatMessage> msgs = chat_messages_from_json(b["messages"]);
+      // Compaction: a conversation that no longer fits the context (prompt + room for the answer)
+      // loses its oldest messages after the leading system prompt; the last user turn always stays,
+      // and the kept part starts at a user message.  A note in the system prompt says how many were
+      // dropped.  (Crude by design: no summarization.)
+      const int reserve = std::clamp(req_max > 0 ? req_max : 8192, 1024, 16384);
+      const int limit = opt.ctx - reserve;
+      std::string rendered = chat_render(msgs, true, thinking, tools, effort);
+      int ntok = (int)tok->encode(rendered, true).size();
+      if (ntok > limit) {
+        size_t first = 0;
+        while (first < msgs.size() && (msgs[first].role == "system" || msgs[first].role == "developer")) first++;
+        size_t last_user = msgs.size();
+        for (size_t i = msgs.size(); i-- > first;) if (msgs[i].role == "user") { last_user = i; break; }
+        std::vector<int> cost(msgs.size(), 0);
+        for (size_t i = first; i < msgs.size(); i++)
+          cost[i] = (int)tok->encode(msgs[i].content + msgs[i].reasoning + (msgs[i].tool_calls.is_array() ? msgs[i].tool_calls.dump() : ""), false).size() + 8;
+        size_t cut = first;  // messages [first, cut) are dropped
+        int over = ntok - limit;
+        auto advance = [&] {
+          if (cut < last_user) { over -= cost[cut]; cut++; }
+          while (cut < last_user && msgs[cut].role != "user") { over -= cost[cut]; cut++; }  // keep starting at a user turn
+        };
+        while (over > 0 && cut < last_user) advance();
+        // summary of the dropped prefix [first, cut): reuse the longest cached prefix summary and fold
+        // the newly dropped messages into it
+        auto prefix_hash = [&](size_t end) {
+          size_t h = 1469598103934665603ull;
+          for (size_t i = first; i < end; i++) h = (h ^ std::hash<std::string>()(msgs[i].role + "\x1f" + msgs[i].content)) * 1099511628211ull;
+          return h;
+        };
+        std::string summary;
+        size_t sum_cut = first;
+        auto make_summary = [&] {
+          if (cut == sum_cut) return;
+          const size_t hc = prefix_hash(cut);
+          std::lock_guard<std::mutex> g(mu);
+          if (summaries.count(hc)) { summary = summaries[hc]; sum_cut = cut; return; }
+          size_t j = cut;
+          std::string prev;
+          while (j > first) {  // longest cached prefix
+            j--;
+            auto it = summaries.find(prefix_hash(j));
+            if (it != summaries.end()) { prev = it->second; break; }
+          }
+          if (j == first && prev.empty()) j = first;
+          const double ts = qe_now();
+          summary = summarize(std::vector<ChatMessage>(msgs.begin() + j, msgs.begin() + cut), prev);
+          summaries[hc] = summary;
+          sum_cut = cut;
+          QE_LOG("[server] compaction: summarized messages %zu..%zu (%zu chars) in %.1f s\n", j - first, cut - first,
+                 summary.size(), qe_now() - ts);
+        };
+        for (;;) {
+          std::vector<ChatMessage> kept(msgs.begin(), msgs.begin() + first);
+          kept.insert(kept.end(), msgs.begin() + cut, msgs.end());
+          make_summary();
+          const std::string note = "（注: 会話が文脈長の上限を超えたため、古いメッセージ " + std::to_string(cut - first) +
+                                   " 件を次の要約に置き換えています。）\n【これまでの会話の要約】\n" + summary;
+          if (cut > first) {
+            if (first > 0) kept[0].content += "\n\n" + note;
+            else kept.insert(kept.begin(), ChatMessage{"system", note, "", Json()});
+          }
+          rendered = chat_render(kept, true, thinking, tools, effort);
+          ntok = (int)tok->encode(rendered, true).size();
+          if (ntok <= limit || cut >= last_user) break;
+          advance();
+        }
+        QE_LOG("[server] compaction: dropped %zu of %zu messages, prompt now %d tokens (limit %d)\n", cut - first, msgs.size(),
+               ntok, limit);
+      }
+      prompt = rendered;
     } else {
       prompt = b.get_str("prompt");
     }
