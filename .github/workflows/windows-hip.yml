@@ -81,6 +81,38 @@ jobs:
           Copy-Item "$hip\bin\amdhip64_*.dll" dist-hip\
           Copy-Item "$hip\bin\amd_comgr_*.dll" dist-hip\
           Copy-Item "$hip\bin\*hipblas*.dll" dist-hip\ -ErrorAction SilentlyContinue
+          # Close the DLL dependency graph: the first real-machine run exited with
+          # STATUS_DLL_NOT_FOUND, so walk dumpbin dependents of everything in
+          # dist-hip and pull any missing DLL that lives in the ROCm bin dir.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
+          Write-Host "dumpbin=$dumpbin"
+          function Get-Deps([string]$file) {
+            & $dumpbin /dependents $file 2>$null |
+              Select-String '^\s+(\S+\.dll)\s*$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }
+          }
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          Get-ChildItem dist-hip | ForEach-Object { $queue.Enqueue($_.FullName) }
+          $seen = @{}
+          while ($queue.Count -gt 0) {
+            $f = $queue.Dequeue()
+            foreach ($dep in Get-Deps $f) {
+              if ($seen.ContainsKey($dep)) { continue }
+              $seen[$dep] = $true
+              $dst = Join-Path 'dist-hip' $dep
+              if (Test-Path $dst) { $queue.Enqueue((Resolve-Path $dst).Path); continue }
+              $src = Join-Path "$hip\bin" $dep
+              if (Test-Path $src) {
+                Write-Host "adding dependency $dep (needed by $(Split-Path $f -Leaf))"
+                Copy-Item $src dist-hip\
+                $queue.Enqueue((Resolve-Path $dst).Path)
+              } else {
+                Write-Host "external (not in ROCm bin): $dep (needed by $(Split-Path $f -Leaf))"
+              }
+            }
+          }
           Get-ChildItem dist-hip | Format-Table Name, Length
 
       - name: Upload executables
