@@ -322,9 +322,9 @@ class Model : public IModel {
   float *x_ = nullptr, *xn_ = nullptr, *t0_ = nullptr, *t1_ = nullptr, *t2_ = nullptr,
         *t3_ = nullptr, *t4_ = nullptr;
   float *g_ = nullptr, *beta_ = nullptr;
-  // tensor-core small-batch matvec (qk::matvec_tq) for verify passes: B >= 4 tokens with K >= 6144
-  // (down projections etc.) or B >= 7 (measured per type and shape on the RTX 3080); QE_TQ=0 off,
-  // QE_TQ=2 for every supported matrix with B >= 2
+  // tensor-core small-batch matvec (qk::matvec_tq) for verify passes from the batch where it beats
+  // the dp4a kernels (qk::matvec_tq_min_batch, per type and K); QE_TQ=0 off, QE_TQ=2 for every
+  // supported matrix with B >= 2
   static constexpr int kTqMaxK = 32768;
   int8_t* xq256_ = nullptr;
   float* xd256_ = nullptr;
@@ -333,7 +333,7 @@ class Model : public IModel {
   bool use_tq(const Mat& m, int T) const {
     static const int mode = getenv("QE_TQ") ? atoi(getenv("QE_TQ")) : 1;
     if (mode == 0 || T < 2 || m.K % 256 || m.K > kTqMaxK || !qk::matvec_tq_supported(m.type)) return false;
-    return mode == 2 || (T >= 4 && m.K >= 6144) || T >= 7;
+    return mode == 2 || T >= qk::matvec_tq_min_batch(m.type, m.K);
   }
   int8_t* xq_ = nullptr;
   float* xd_ = nullptr;

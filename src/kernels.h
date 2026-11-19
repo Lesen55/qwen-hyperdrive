@@ -31,6 +31,7 @@ void quantize_q8_256(const float* x, int8_t* xq, float* xd, int K, int T, cudaSt
 // Tensor-core small-batch matvec for IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS (B <= kMaxB tokens,
 // K % 256 == 0); activations from quantize_q8_256.
 bool matvec_tq_supported(uint32_t type);
+int matvec_tq_min_batch(uint32_t type, int K);  // smallest B where matvec_tq beats qk::matvec
 void matvec_tq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq256, const float* xd256, int B,
                float* y, int ldy, bool acc, cudaStream_t s);
 bool mmq_supported(uint32_t type);

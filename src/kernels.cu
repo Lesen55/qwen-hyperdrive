@@ -2230,15 +2230,20 @@ constexpr int TQ_WARPS = 4;  // the warps of a CTA split the K range of one 16-r
 // Each warp stages the raw bytes of its 16 rows x one super-block in shared memory (coalesced 4-byte
 // cp.async, double-buffered: the next super-block streams in while this one is decoded), since the
 // fragment layout would otherwise read a few bytes from each of 16 rows per load.
-template <int T, int B>
-__global__ void __launch_bounds__(TQ_WARPS * 32)
+// RP: register-prefetched single stage (the next super-block's raw words wait in registers while the
+// current one is decoded from shared memory; half the shared memory of the cp.async double buffer,
+// so about twice the warps per SM)
+// MB: min CTAs per SM for the register allocation (a cap that raises occupancy where it pays)
+template <int T, int B, bool RP, int MB>
+__global__ void __launch_bounds__(TQ_WARPS * 32, MB)
     k_mmv_tq(const uint8_t* __restrict__ W, size_t rb, int K, int N, const int8_t* __restrict__ xq,
              const float* __restrict__ xd, float* __restrict__ y, int ldy, int acc) {
   using Q = QInt<T>;
   using P = QPiece<T>;
   constexpr int BB = QDec<T>::BB;
   constexpr int BW = (BB + 3 + 3) / 4 + 1;  // 4-byte words per staged row (aligned-down start)
-  __shared__ __align__(16) uint32_t stage[TQ_WARPS][2][16][BW];
+  constexpr int NS = RP ? 1 : 2, PW = (16 * BW + 31) / 32;
+  __shared__ __align__(16) uint32_t stage[TQ_WARPS][NS][16][BW];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tq = lane & 3;
   const int row0 = blockIdx.x * 16;
   const int nb = K / 256;
@@ -2256,13 +2261,42 @@ __global__ void __launch_bounds__(TQ_WARPS * 32)
     }
     cp_async_commit();
   };
+  uint32_t pre[RP ? PW : 1];
+  auto gload = [&](int j) {
+#pragma unroll
+    for (int k = 0; k < PW; k++) {
+      const int i = lane + 32 * k;
+      if (i < 16 * BW) {
+        const int r = i / BW, wd = i % BW;
+        const uint8_t* src = W + (size_t)min(row0 + r, N - 1) * rb + (size_t)j * BB;
+        pre[RP ? k : 0] = __ldg((const uint32_t*)((uintptr_t)src & ~(uintptr_t)3) + wd);
+      }
+    }
+  };
+  auto sstore = [&]() {
+#pragma unroll
+    for (int k = 0; k < PW; k++) {
+      const int i = lane + 32 * k;
+      if (i < 16 * BW) stage[warp][0][i / BW][i % BW] = pre[RP ? k : 0];
+    }
+  };
   float acc4[4] = {0.f, 0.f, 0.f, 0.f};
-  if (j0 < j1) issue(j0, 0);
+  if constexpr (RP) {
+    if (j0 < j1) { gload(j0); sstore(); }
+  } else {
+    if (j0 < j1) issue(j0, 0);
+  }
   for (int j = j0; j < j1; j++) {
-    const int st = (j - j0) & 1;
-    if (j + 1 < j1) issue(j + 1, st ^ 1); else cp_async_commit();
-    cp_async_wait<1>();
-    __syncwarp();
+    int st = 0;
+    if constexpr (RP) {
+      __syncwarp();
+      if (j + 1 < j1) gload(j + 1);  // in flight during this super-block's decode
+    } else {
+      st = (j - j0) & 1;
+      if (j + 1 < j1) issue(j + 1, st ^ 1); else cp_async_commit();
+      cp_async_wait<1>();
+      __syncwarp();
+    }
     const size_t oa = ((size_t)min(row0 + g, N - 1) * rb + (size_t)j * BB) & 3;
     const size_t ob = ((size_t)min(row0 + g + 8, N - 1) * rb + (size_t)j * BB) & 3;
     const uint8_t* ba = (const uint8_t*)stage[warp][st][g] + oa;
@@ -2303,6 +2337,9 @@ __global__ void __launch_bounds__(TQ_WARPS * 32)
     acc4[2] += (float)ci[2] * fb * x0;
     acc4[3] += (float)ci[3] * fb * x1;
     __syncwarp();  // the stage is refilled by the next iteration's issue
+    if constexpr (RP) {
+      if (j + 1 < j1) sstore();
+    }
   }
   __shared__ float red[TQ_WARPS][4][32];
 #pragma unroll
@@ -2335,12 +2372,32 @@ static void launch_tq(const void* W, size_t rb, int K, int N, const int8_t* xq, 
                       int ldy, bool acc, cudaStream_t s) {
   const uint8_t* w = (const uint8_t*)W;
   const int grid = cdiv(N, 16);
-  switch (B) {
-#define CASE(n) case n: k_mmv_tq<T, n><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;
-    CASE(1) CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
-#undef CASE
-    default: QE_FATAL("matvec_tq: batch %d", B);
+  // per type (qe_bench_mv ... types, RTX 3080): IQ3_S prefers the register-prefetched single stage,
+  // IQ3_XXS / IQ2_XXS the cp.async double buffer with registers capped for 8 CTAs / SM, the others
+  // the plain double buffer.  QE_TQ_MODE=0|1|2 forces double buffer / register prefetch / capped.
+  static const int force = getenv("QE_TQ_MODE") ? atoi(getenv("QE_TQ_MODE")) : -1;
+  const int mode = force >= 0 ? force : T == QT_IQ3_S ? 1 : (T == QT_IQ3_XXS || T == QT_IQ2_XXS) ? 2 : 0;
+#define LAUNCH(RP, MB)                                                                                         \
+  switch (B) {                                                                                                 \
+    case 1: k_mmv_tq<T, 1, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 2: k_mmv_tq<T, 2, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 3: k_mmv_tq<T, 3, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 4: k_mmv_tq<T, 4, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 5: k_mmv_tq<T, 5, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 6: k_mmv_tq<T, 6, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 7: k_mmv_tq<T, 7, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    case 8: k_mmv_tq<T, 8, RP, MB><<<grid, TQ_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;    \
+    default: QE_FATAL("matvec_tq: batch %d", B);                                                               \
   }
+  if (mode == 1) { LAUNCH(true, 1) }
+  else if (mode == 2) { LAUNCH(false, 8) }
+  else { LAUNCH(false, 1) }
+#undef LAUNCH
+}
+int matvec_tq_min_batch(uint32_t type, int K) {
+  // smallest batch where the tensor-core kernel beats the dp4a kernels (same benchmark)
+  if (type == QT_IQ3_S) return K >= 6144 ? 4 : 5;
+  return K >= 6144 ? 4 : 7;
 }
 void matvec_tq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq256, const float* xd256, int B,
                float* y, int ldy, bool acc, cudaStream_t s) {
