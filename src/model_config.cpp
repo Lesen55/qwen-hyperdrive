@@ -1,4 +1,9 @@
 // qwen35 hyper-parameters from GGUF metadata (shared by the CUDA and Vulkan backends)
+#ifdef _WIN32
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES  // MSVC CRT hides M_PI unless this is defined before <cmath>
+#endif
+#endif
 #include "common.h"
 #include "gguf.h"
 #include "imodel.h"
