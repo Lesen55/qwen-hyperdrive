@@ -28,7 +28,7 @@ New-Item -ItemType Directory -Force $ResultsDir | Out-Null
 $stamp = Get-Date -Format "yyyy-MM-dd-HHmmss"
 $logPath = Join-Path $ResultsDir "$stamp-$Label.server.log"
 
-$prompt = "日本の四季について、春夏秋冬それぞれの特徴と、季節ごとに楽しめる行事や食べ物を詳しく説明してください。"
+$prompt = "日本の四季について、春・夏・秋・冬のそれぞれについて、気候の特徴、代表的な行事、旬の食べ物、自然の景色の変化を、季節ごとに600字以上かけて詳しく説明してください。全体で3000字以上の長文でお願いします。"
 
 $serverArgs = @("-m", $ModelPath, "-c", $ContextSize, "--port", $Port, "--host", "127.0.0.1")
 if ($Draft -ge 0) { $serverArgs += @("--draft", $Draft) }
