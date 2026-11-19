@@ -1,0 +1,80 @@
+name: windows-hip
+
+# HIP backend for AMD Radeon on Windows: the CUDA sources compiled as HIP
+# (QE_HIP=ON) with the ROCm clang from the Windows HIP SDK. The SDK install is
+# shared with the windows-hip-spike workflow through the Actions cache.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [windows-port, hip-backend]
+    paths:
+      - '.github/workflows/windows-hip.yml'
+      - 'src/**'
+      - 'CMakeLists.txt'
+
+env:
+  HIPSDK_INSTALLER_VERSION: "26.Q1"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache HIP SDK
+        id: cache-rocm
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-win2022
+
+      - name: Download and install HIP SDK
+        if: steps.cache-rocm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-Win11-For-HIP.exe"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\rocm-install.exe"
+          Start-Process "$env:RUNNER_TEMP\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -Wait
+          Write-Host "Install finished"
+
+      - name: Configure (HIP only, ROCm clang)
+        shell: pwsh
+        run: |
+          $hip = (Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          Write-Host "HIP_PATH=$hip"
+          $env:HIP_PATH = $hip
+          $clangxx = "$hip\lib\llvm\bin\clang++.exe"
+          & $clangxx --version
+          cmake -S . -B build-hip -G Ninja `
+            -DQE_CUDA=OFF -DQE_VULKAN=OFF -DQE_HIP=ON `
+            -DCMAKE_C_COMPILER="$hip\lib\llvm\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="$clangxx" `
+            -DCMAKE_HIP_COMPILER="$clangxx" `
+            -DCMAKE_HIP_ARCHITECTURES=gfx1100 `
+            -DCMAKE_PREFIX_PATH="$hip" `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build-hip --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $hip = (Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force dist-hip | Out-Null
+          Copy-Item build-hip\qwen35-server-hip.exe dist-hip\
+          Copy-Item build-hip\qwen35-engine-hip.exe dist-hip\
+          Copy-Item "$hip\bin\amdhip64_*.dll" dist-hip\
+          Copy-Item "$hip\bin\amd_comgr_*.dll" dist-hip\
+          Copy-Item "$hip\bin\*hipblas*.dll" dist-hip\ -ErrorAction SilentlyContinue
+          Get-ChildItem dist-hip | Format-Table Name, Length
+
+      - name: Upload executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-hyperdrive-windows-hip
+          path: dist-hip
+          if-no-files-found: error
