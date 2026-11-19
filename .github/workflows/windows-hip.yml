@@ -113,6 +113,29 @@ jobs:
               }
             }
           }
+          # rocBLAS/hipBLASLt load their Tensile kernel libraries at first GEMM
+          # from <dll dir>\<lib>\library\. Ship only the gfx1100 (RX 7900 XTX)
+          # files plus arch-neutral indexes to keep the artifact lean.
+          foreach ($lib in 'rocblas','hipblaslt') {
+            $libsrc = "$hip\bin\$lib\library"
+            if (Test-Path $libsrc) {
+              $libdst = "dist-hip\$lib\library"
+              New-Item -ItemType Directory -Force $libdst | Out-Null
+              Get-ChildItem $libsrc -Recurse -File |
+                Where-Object { $_.Name -match 'gfx1100' -or $_.Name -notmatch 'gfx[0-9]' } |
+                ForEach-Object {
+                  $rel = $_.FullName.Substring($libsrc.Length).TrimStart('\')
+                  $target = Join-Path $libdst $rel
+                  New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+                  Copy-Item $_.FullName $target
+                }
+              $sz = (Get-ChildItem $libdst -Recurse -File | Measure-Object Length -Sum).Sum
+              Write-Host "$lib library packaged: $sz bytes"
+              Get-ChildItem $libdst -Recurse -File | Format-Table FullName, Length
+            } else {
+              Write-Host "no $lib library dir at $libsrc"
+            }
+          }
           Get-ChildItem dist-hip | Format-Table Name, Length
 
       - name: Upload executables
