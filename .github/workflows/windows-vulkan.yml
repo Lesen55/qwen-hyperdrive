@@ -12,12 +12,16 @@ jobs:
       - uses: actions/checkout@v4
 
       # The windows-latest image ships Clang 20, but its Visual Studio 18 STL
-      # hard-rejects anything below Clang 22 (error STL1000). Install a current
-      # LLVM so the compiler and the MSVC STL agree.
-      - name: Install LLVM 22
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "22.1"
+      # hard-rejects anything below Clang 22 (error STL1000). Install the
+      # official LLVM 22.1.0 win64 build (the install-llvm-action does not
+      # carry Windows assets for 22.x, so fetch it straight from llvm-project).
+      - name: Install LLVM 22.1.0
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.0/LLVM-22.1.0-win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-22.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\llvm-22.exe" -ArgumentList "/S" -Wait
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Check clang (LLVM, GNU-style driver targeting the MSVC ABI)
         shell: pwsh
