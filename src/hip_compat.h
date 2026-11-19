@@ -17,7 +17,10 @@
 #define cudaStream_t hipStream_t
 #define cudaEvent_t hipEvent_t
 #define cudaDeviceProp hipDeviceProp_t
-#define CUdeviceptr hipDeviceptr_t
+// CUDA's CUdeviceptr is an integer; HIP's hipDeviceptr_t is void* on Windows,
+// which breaks address arithmetic in the model code. Keep the integer type and
+// convert at the stream-value call sites below.
+#define CUdeviceptr unsigned long long
 
 // ---- runtime API values
 #define cudaSuccess hipSuccess
@@ -26,7 +29,7 @@
 #define cudaDeviceScheduleBlockingSync hipDeviceScheduleBlockingSync
 #define cudaEventDisableTiming hipEventDisableTiming
 #define CUstream hipStream_t
-#define CU_STREAM_WRITE_VALUE_DEFAULT hipStreamWriteValueDefault
+#define CU_STREAM_WRITE_VALUE_DEFAULT 0u  // hipStreamWriteValueDefault; not exported by the 7.1 Windows headers
 #define CU_STREAM_WAIT_VALUE_GEQ hipStreamWaitValueGte
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -50,8 +53,8 @@
 #define cudaMemcpy2D hipMemcpy2D
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaSetDeviceFlags hipSetDeviceFlags
-#define cuStreamWriteValue32 hipStreamWriteValue32
-#define cuStreamWaitValue32 hipStreamWaitValue32
+#define cuStreamWriteValue32 qeStreamWriteValue32
+#define cuStreamWaitValue32 qeStreamWaitValue32
 #define cudaMemcpyToSymbol hipMemcpyToSymbol
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaHostAlloc hipHostMalloc
@@ -68,9 +71,37 @@
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEventElapsedTime hipEventElapsedTime
-#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncSetAttribute qeFuncSetAttribute
+
+// ---- wrappers whose HIP signatures differ from CUDA's
+// Kernel function references (incl. dependent template instantiations) do not
+// implicitly convert to const void* under HIP clang; cast explicitly.
+template <typename F>
+static inline hipError_t qeFuncSetAttribute(F func, hipFuncAttribute attr, int value) {
+  return hipFuncSetAttribute((const void*)func, attr, value);
+}
+// Stream write/wait value take an integer address here (see CUdeviceptr note).
+static inline hipError_t qeStreamWriteValue32(hipStream_t s, unsigned long long addr, unsigned int v,
+                                              unsigned int flags) {
+  return hipStreamWriteValue32(s, (hipDeviceptr_t)(uintptr_t)addr, v, flags);
+}
+static inline hipError_t qeStreamWaitValue32(hipStream_t s, unsigned long long addr, unsigned int v,
+                                             unsigned int flags) {
+  return hipStreamWaitValue32(s, (hipDeviceptr_t)(uintptr_t)addr, v, flags);
+}
 
 // ---- device intrinsics HIP does not ship
+// __dp4a: 4-way signed/unsigned byte dot product plus accumulator.
+static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
+#pragma unroll
+  for (int i = 0; i < 4; i++) c += (int)(int8_t)(a >> (8 * i)) * (int)(int8_t)(b >> (8 * i));
+  return c;
+}
+static __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c) {
+#pragma unroll
+  for (int i = 0; i < 4; i++) c += ((a >> (8 * i)) & 0xffu) * ((b >> (8 * i)) & 0xffu);
+  return c;
+}
 // __vsub4: per-byte wrapping subtraction (CUDA __nvvm vsub4).
 static __device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) {
   unsigned int r = 0;
