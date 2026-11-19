@@ -21,7 +21,13 @@
 
 // ---- runtime API values
 #define cudaSuccess hipSuccess
+#define CUDA_SUCCESS hipSuccess
 #define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaDeviceScheduleBlockingSync hipDeviceScheduleBlockingSync
+#define cudaEventDisableTiming hipEventDisableTiming
+#define CUstream hipStream_t
+#define CU_STREAM_WRITE_VALUE_DEFAULT hipStreamWriteValueDefault
+#define CU_STREAM_WAIT_VALUE_GEQ hipStreamWaitValueGte
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
@@ -41,6 +47,11 @@
 #define cudaFree hipFree
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpy2D hipMemcpy2D
+#define cudaMemcpy2DAsync hipMemcpy2DAsync
+#define cudaSetDeviceFlags hipSetDeviceFlags
+#define cuStreamWriteValue32 hipStreamWriteValue32
+#define cuStreamWaitValue32 hipStreamWaitValue32
 #define cudaMemcpyToSymbol hipMemcpyToSymbol
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaHostAlloc hipHostMalloc
@@ -58,6 +69,18 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaFuncSetAttribute hipFuncSetAttribute
+
+// ---- device intrinsics HIP does not ship
+// __vsub4: per-byte wrapping subtraction (CUDA __nvvm vsub4).
+static __device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) {
+  unsigned int r = 0;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const unsigned int x = (a >> (8 * i)) & 0xffu, y = (b >> (8 * i)) & 0xffu;
+    r |= ((x - y) & 0xffu) << (8 * i);
+  }
+  return r;
+}
 
 // ---- cuBLAS -> hipBLAS
 #define cublasHandle_t hipblasHandle_t
