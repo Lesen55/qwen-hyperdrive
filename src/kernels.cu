@@ -773,14 +773,14 @@ __global__ void __launch_bounds__(WARPS * 32)
   const int r = min(rbase + n, N - 1);
   const uint8_t* wr = W + (size_t)r * rb;
   for (int j = warp; j < nsb; j += WARPS) {
-    // v3: only lanes 0..15 decode (one per row); the W32 words are exactly the
-    // two B-fragment halves, distributed to lanes 16..31 with shuffles. No
-    // shared-memory staging and no syncwarp in the group loop.
+    // v2 (best of the WMMA variants): decode this lane's own row in registers
+    // (lanes n and n+16 duplicate the work) -- the W32 words are exactly the
+    // two B-fragment halves, so no shared-memory staging and no syncwarp in
+    // the group loop. v3 (decode on lanes 0..15 + shfl distribution) measured
+    // slower: the bpermute chain costs more than the duplicate decode saves.
     W32 w;
-    if (lane < 16) D::dec(wr + (size_t)(j >> 3) * D::BB, j & 7, w);
-#pragma unroll
-    for (int i = 0; i < 8; i++) w.w[i] = __shfl_sync(0xffffffffu, w.w[i], n);
-    const float ws = __shfl_sync(0xffffffffu, w.sc[0], n);
+    D::dec(wr + (size_t)(j >> 3) * D::BB, j & 7, w);
+    const float ws = w.sc[0];
     const float xs_own = tok_ok ? xd[(size_t)n * nsb + j] : 0.f;
     wmma_i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
