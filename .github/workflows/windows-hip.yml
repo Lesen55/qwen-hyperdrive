@@ -78,11 +78,18 @@ jobs:
           $objdump = @("$hip\bin\llvm-objdump.exe", "$hip\lib\llvm\bin\llvm-objdump.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           $obj = Get-ChildItem build-hip -Recurse -Filter 'kernels.cu.obj' | Select-Object -First 1 -ExpandProperty FullName
           if ($objdump -and $obj) {
-            $n = (& $objdump --offload -d $obj 2>$null | Select-String 'v_dot4' | Measure-Object).Count
+            Write-Host "object: $obj"
+            & $objdump --section-headers $obj 2>$null | Select-Object -First 40 | Write-Host
+            $out = & $objdump --offload -d $obj 2>$null
+            Write-Host "offload disassembly lines: $($out.Count)"
+            $n = ($out | Select-String 'v_dot4' | Measure-Object).Count
             Write-Host "v_dot4 instructions in kernels.cu.obj: $n"
+            $out | Select-String 'v_dot' | Select-Object -First 5 | Write-Host
+            $out | Select-String 'v_mul_i32|v_mad_i32' | Select-Object -First 3 | Write-Host
           } else {
             Write-Host "llvm-objdump or kernels.cu.obj not found; ISA check skipped"
           }
+          exit 0
 
       - name: Package
         shell: pwsh
