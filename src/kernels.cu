@@ -13,6 +13,12 @@
 #include <tuple>
 #include "quant.h"
 
+#ifdef QE_HIP
+// Enable dot1-insts for this whole TU so the hardware __dp4a (hip_compat.h)
+// can inline into every kernel; gfx1100 lowers sdot4 to v_dot4_i32_iu8.
+#pragma clang attribute push(__attribute__((target("dot1-insts"))), apply_to = function)
+#endif
+
 namespace qk {
 
 static __device__ __forceinline__ float warp_sum(float v) {
@@ -4508,3 +4514,7 @@ void mhc_leave(float* y, const float* a, const float* b, int64_t n, cudaStream_t
   k_mhc_leave<<<cdiv(n, 256), 256, 0, s>>>(y, a, b, n);
 }
 }  // namespace qk
+
+#ifdef QE_HIP
+#pragma clang attribute pop
+#endif
