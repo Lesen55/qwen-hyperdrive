@@ -110,10 +110,15 @@ static __device__ __forceinline__ T qe_shfl_sync(unsigned int mask, T var, int l
 // Phase 2: gfx1100 has a hardware dot4 (v_dot4_i32_i8); the AMDGCN builtin
 // lowers to it. The previous scalar expansion cost ~12 instructions per call
 // in dot_w32, the inner loop of every quantized matvec.
-static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
+// The sdot4 builtin is feature-gated on "dot1-insts", which gfx1100 does not
+// enable by default even though LLVM lowers sdot4 to v_dot4_i32_iu8 (signed)
+// on gfx11. Opt in per-function via the target attribute.
+static __device__ __forceinline__ __attribute__((target("dot1-insts"))) int __dp4a(int a, int b, int c) {
   return __builtin_amdgcn_sdot4(a, b, c, false);
 }
-static __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c) {
+static __device__ __forceinline__ __attribute__((target("dot1-insts"))) unsigned int __dp4a(unsigned int a,
+                                                                                            unsigned int b,
+                                                                                            unsigned int c) {
   return (unsigned int)__builtin_amdgcn_udot4((int)a, (int)b, (int)c, false);
 }
 // __vsub4: per-byte wrapping subtraction (CUDA __nvvm vsub4).
