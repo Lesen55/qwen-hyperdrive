@@ -744,11 +744,105 @@ __global__ void __launch_bounds__(TC_WARPS * 32)
   if (r + 1 < N) o[1] = acc ? o[1] + v1 : v1;
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// WMMA (RDNA3) tensor-core matvec, IQ3_S only for now. Fragment layout pinned
+// empirically by hip-spike/wmma.hip.cpp on a real 7900 XTX (2026-11-20):
+//   A fragment: lane l holds token (l % 16), 16 consecutive int8 along K.
+//   B fragment: lane l holds weight row (l % 16), 16 consecutive int8 along K.
+//   C fragment: element i on lane l -> (token 2*i + (l / 16), row l % 16).
+//   The builtin's bool args are per-operand signedness (true = signed); the
+//   trailing bool is a saturating clamp (unused). One block covers 16 rows;
+//   warps split the 32-group range with a strided loop, partial sums are
+//   reduced through shared memory like k_mmv_tc2.
+using wmma_i32x4 = int __attribute__((ext_vector_type(4)));
+using wmma_i32x8 = int __attribute__((ext_vector_type(8)));
+
+template <int WARPS>
+__global__ void __launch_bounds__(WARPS * 32)
+    k_mmv_wmma_iq3s(const uint8_t* __restrict__ W, size_t rb, int K, int N, const int8_t* __restrict__ xq,
+                    const float* __restrict__ xd, int B, float* __restrict__ y, int ldy, int acc) {
+  using D = QDec<QT_IQ3_S>;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int rbase = blockIdx.x * 16;
+  const int nsb = K / 32;
+  const int n = lane % 16;        // this lane's weight row / output column
+  const int hi = lane / 16;       // token parity held by this lane's C fragment
+  const bool tok_ok = n < B;      // A rows are tokens: lane % 16 doubles as token index
+  __shared__ int8_t smc[WARPS][16][32];
+  __shared__ float sms[WARPS][16];
+  __shared__ float red[WARPS][32][8];
+  float accv[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const int r = min(rbase + lane, N - 1);
+  for (int j = warp; j < nsb; j += WARPS) {
+    if (lane < 16) {
+      W32 w;
+      D::dec(W + (size_t)r * rb + (size_t)(j >> 3) * D::BB, j & 7, w);
+      int* dst = (int*)&smc[warp][lane][0];
+#pragma unroll
+      for (int i = 0; i < 8; i++) dst[i] = w.w[i];
+      sms[warp][lane] = w.sc[0];
+    }
+    __syncwarp();
+    wmma_i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+      wmma_i32x4 a4 = {0, 0, 0, 0};
+      if (tok_ok) {
+        const uint4 v = *(const uint4*)(xq + (size_t)n * K + 32 * j + 16 * h);
+        a4[0] = (int)v.x;
+        a4[1] = (int)v.y;
+        a4[2] = (int)v.z;
+        a4[3] = (int)v.w;
+      }
+      const uint4 bv = *(const uint4*)&smc[warp][n][16 * h];
+      wmma_i32x4 b4;
+      b4[0] = (int)bv.x;
+      b4[1] = (int)bv.y;
+      b4[2] = (int)bv.z;
+      b4[3] = (int)bv.w;
+      c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a4, true, b4, c, false);
+    }
+    const float ws = sms[warp][n];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int tok = 2 * i + hi;
+      const float xs = tok < B ? xd[(size_t)tok * nsb + j] : 0.f;
+      accv[i] += (float)c[i] * ws * xs;
+    }
+    __syncwarp();
+  }
+#pragma unroll
+  for (int i = 0; i < 8; i++) red[warp][lane][i] = accv[i];
+  __syncthreads();
+  if (warp != 0) return;
+  const int row = rbase + n;
+  if (row >= N) return;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const int tok = 2 * i + hi;
+    if (tok >= B) continue;
+    float v = 0.f;
+#pragma unroll
+    for (int w2 = 0; w2 < WARPS; w2++) v += red[w2][lane][i];
+    float* o = y + (size_t)tok * ldy + row;
+    *o = acc ? *o + v : v;
+  }
+}
+#endif  // __HIP_PLATFORM_AMD__
+
 template <int T>
 static bool launch_mmv_tc(const uint8_t* w, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B,
                           float* y, int ldy, bool acc, cudaStream_t s) {
 #ifdef __HIP_PLATFORM_AMD__
-  return false;  // HIP v1: no tensor-core matvec (mma helpers are stubs)
+  // HIP: WMMA tensor-core matvec (k_mmv_wmma_iq3s), QE_MMV_TC=2, IQ3_S only.
+  static const int tc_mode = getenv("QE_MMV_TC") ? atoi(getenv("QE_MMV_TC")) : 0;
+  if constexpr (T == QT_IQ3_S) {
+    if (tc_mode == 2 && B >= 2 && B <= 8 && K % 32 == 0) {
+      k_mmv_wmma_iq3s<TC_WARPS><<<cdiv(N, 16), TC_WARPS * 32, 0, s>>>(w, rb, K, N, xq, xd, B, y, ldy, acc);
+      return true;
+    }
+  }
+  return false;
 #endif
   static const int mode = getenv("QE_MMV_TC") ? atoi(getenv("QE_MMV_TC")) : 0;
   constexpr bool tc2_ok = T != QT_Q2_K && T != QT_Q4_K && T != QT_Q5_K;  // min terms not foldable
