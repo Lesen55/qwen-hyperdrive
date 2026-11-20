@@ -107,15 +107,14 @@ static __device__ __forceinline__ T qe_shfl_sync(unsigned int mask, T var, int l
 
 // ---- device intrinsics HIP does not ship
 // __dp4a: 4-way signed/unsigned byte dot product plus accumulator.
+// Phase 2: gfx1100 has a hardware dot4 (v_dot4_i32_i8); the AMDGCN builtin
+// lowers to it. The previous scalar expansion cost ~12 instructions per call
+// in dot_w32, the inner loop of every quantized matvec.
 static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
-#pragma unroll
-  for (int i = 0; i < 4; i++) c += (int)(int8_t)(a >> (8 * i)) * (int)(int8_t)(b >> (8 * i));
-  return c;
+  return __builtin_amdgcn_sdot4(a, b, c, false);
 }
 static __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c) {
-#pragma unroll
-  for (int i = 0; i < 4; i++) c += ((a >> (8 * i)) & 0xffu) * ((b >> (8 * i)) & 0xffu);
-  return c;
+  return (unsigned int)__builtin_amdgcn_udot4((int)a, (int)b, (int)c, false);
 }
 // __vsub4: per-byte wrapping subtraction (CUDA __nvvm vsub4).
 static __device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) {
