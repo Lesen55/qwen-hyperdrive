@@ -768,21 +768,17 @@ __global__ void __launch_bounds__(WARPS * 32)
   const int n = lane % 16;        // this lane's weight row / output column
   const int hi = lane / 16;       // token parity held by this lane's C fragment
   const bool tok_ok = n < B;      // A rows are tokens: lane % 16 doubles as token index
-  __shared__ int8_t smc[WARPS][16][32];
-  __shared__ float sms[WARPS][16];
   __shared__ float red[WARPS][32][8];
   float accv[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  const int r = min(rbase + lane, N - 1);
+  const int r = min(rbase + n, N - 1);
+  const uint8_t* wr = W + (size_t)r * rb;
   for (int j = warp; j < nsb; j += WARPS) {
-    if (lane < 16) {
-      W32 w;
-      D::dec(W + (size_t)r * rb + (size_t)(j >> 3) * D::BB, j & 7, w);
-      int* dst = (int*)&smc[warp][lane][0];
-#pragma unroll
-      for (int i = 0; i < 8; i++) dst[i] = w.w[i];
-      sms[warp][lane] = w.sc[0];
-    }
-    __syncwarp();
+    // v2: decode this lane's own row in registers (lanes n and n+16 duplicate
+    // the work) -- the W32 words are exactly the two B-fragment halves, so no
+    // shared-memory staging and no syncwarp in the group loop.
+    W32 w;
+    D::dec(wr + (size_t)(j >> 3) * D::BB, j & 7, w);
+    const float xs_own = tok_ok ? xd[(size_t)n * nsb + j] : 0.f;
     wmma_i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
     for (int h = 0; h < 2; h++) {
@@ -794,22 +790,19 @@ __global__ void __launch_bounds__(WARPS * 32)
         a4[2] = (int)v.z;
         a4[3] = (int)v.w;
       }
-      const uint4 bv = *(const uint4*)&smc[warp][n][16 * h];
       wmma_i32x4 b4;
-      b4[0] = (int)bv.x;
-      b4[1] = (int)bv.y;
-      b4[2] = (int)bv.z;
-      b4[3] = (int)bv.w;
+      b4[0] = w.w[4 * h + 0];
+      b4[1] = w.w[4 * h + 1];
+      b4[2] = w.w[4 * h + 2];
+      b4[3] = w.w[4 * h + 3];
       c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a4, true, b4, c, false);
     }
-    const float ws = sms[warp][n];
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-      const int tok = 2 * i + hi;
-      const float xs = tok < B ? xd[(size_t)tok * nsb + j] : 0.f;
-      accv[i] += (float)c[i] * ws * xs;
+      // token (2i + hi)'s activation scale lives on lane (2i + hi)
+      const float xs = __shfl_sync(0xffffffffu, xs_own, 2 * i + hi);
+      accv[i] += (float)c[i] * w.sc[0] * xs;
     }
-    __syncwarp();
   }
 #pragma unroll
   for (int i = 0; i < 8; i++) red[warp][lane][i] = accv[i];
