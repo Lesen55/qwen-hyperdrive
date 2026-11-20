@@ -71,6 +71,19 @@ jobs:
         shell: pwsh
         run: cmake --build build-hip --parallel
 
+      - name: Check dot4 in device ISA (informational)
+        shell: pwsh
+        run: |
+          $hip = (Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          $objdump = @("$hip\bin\llvm-objdump.exe", "$hip\lib\llvm\bin\llvm-objdump.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $obj = Get-ChildItem build-hip -Recurse -Filter 'kernels.cu.obj' | Select-Object -First 1 -ExpandProperty FullName
+          if ($objdump -and $obj) {
+            $n = (& $objdump --offload -d $obj 2>$null | Select-String 'v_dot4' | Measure-Object).Count
+            Write-Host "v_dot4 instructions in kernels.cu.obj: $n"
+          } else {
+            Write-Host "llvm-objdump or kernels.cu.obj not found; ISA check skipped"
+          }
+
       - name: Package
         shell: pwsh
         run: |
