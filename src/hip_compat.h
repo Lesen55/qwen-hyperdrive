@@ -108,23 +108,18 @@ static __device__ __forceinline__ T qe_shfl_sync(unsigned int mask, T var, int l
 // ---- device intrinsics HIP does not ship
 // __dp4a: 4-way signed/unsigned byte dot product plus accumulator.
 // gfx1100 has no v_dot4_i32_i8 (that is the CDNA encoding); its native int8
-// dot4 is v_dot4_i32_iu8 via __builtin_amdgcn_sudot4 (first operand signed,
-// second unsigned), which needs no extra target feature. (The sdot4 builtin
-// is feature-gated on dot1-insts, and opting into that feature per-function
-// or TU-wide broke kernel registration at runtime -- do not go back there.)
-// Signed x signed and unsigned x unsigned are recovered exactly by biasing
-// one operand's bytes by +128 (xor 0x80) and correcting with the other
-// operand's byte sum, also computed with sudot4: 2 dot4 + a few ops instead
-// of the ~12-instruction scalar expansion.
+// dot4 is v_dot4_i32_iu8 via __builtin_amdgcn_sudot4, whose 6-argument form
+// takes each operand's signedness as an explicit flag -- the exact call
+// ROCm's own device library (ockl/src/dots.cl, __ockl_sdot4) uses on gfx11.
+// (The sdot4 builtin is feature-gated on dot1-insts, and opting into that
+// feature per-function or TU-wide broke kernel registration at runtime --
+// do not go back there.) This replaces the ~12-instruction scalar expansion
+// that used to sit in dot_w32, the inner loop of every quantized matvec.
 static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
-  const int biased = __builtin_amdgcn_sudot4(a, b ^ (int)0x80808080, c);
-  const int sum_a = __builtin_amdgcn_sudot4(a, 0x01010101, 0);
-  return biased - (sum_a << 7);
+  return (int)__builtin_amdgcn_sudot4(true, (unsigned int)a, true, (unsigned int)b, (unsigned int)c, false);
 }
 static __device__ __forceinline__ unsigned int __dp4a(unsigned int a, unsigned int b, unsigned int c) {
-  const int biased = __builtin_amdgcn_sudot4((int)(a ^ 0x80808080u), (int)b, (int)c);
-  const int sum_b = __builtin_amdgcn_sudot4(0x01010101, (int)b, 0);
-  return (unsigned int)(biased + (sum_b << 7));
+  return __builtin_amdgcn_sudot4(false, a, false, b, c, false);
 }
 // __vsub4: per-byte wrapping subtraction (CUDA __nvvm vsub4).
 static __device__ __forceinline__ unsigned int __vsub4(unsigned int a, unsigned int b) {
