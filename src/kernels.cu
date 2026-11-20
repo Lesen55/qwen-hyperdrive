@@ -3884,13 +3884,146 @@ __global__ void k_wht_rows(float* x, int rows) {
 
 size_t attn_prefill_work_bytes(int T, int nh, int hd) { return (size_t)T * nh * hd * 2; }
 
+#ifdef __HIP_PLATFORM_AMD__
+// SIMT flash attention for HIP prefill (QE_FA_SIMT=1). One block = one kv head
+// x BQ queries (BQ*G rows); KV is streamed in 32-position tiles, dequantized
+// once into shared memory and reused by all rows of the block -- the v1 HIP
+// fallback (attn_decode in chunks of 4) re-dequantizes and re-streams the KV
+// prefix for every chunk and pays a split+combine launch pair per chunk.
+// Numerics match the CUDA k_fa: Q comes from k_fa_prep_q (WHT-rotated for
+// quantized caches, pre-scaled by scale*log2(e)), scores/softmax run in log2
+// space with exp2f, and k_wht_rows undoes the output rotation afterwards.
+constexpr int FA_SIMT_BQ = 8;   // queries per block
+constexpr int FA_SIMT_BN = 32;  // KV tile positions
+
+template <int KT, int G>  // G = nh / nkv (6 for the target model)
+__global__ void __launch_bounds__(256)
+    k_fa_simt(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+              const __half* __restrict__ q16, float* __restrict__ out, int nh, int pos0, int T,
+              int recb, KVMap bs) {
+  __shared__ __align__(16) __half Ks[FA_SIMT_BN][FA_QLD];
+  __shared__ __align__(16) __half Vs[FA_SIMT_BN][FA_QLD];
+  __shared__ float qs[8][FA_D];   // current row's q (per warp)
+  __shared__ float wsm[8][FA_SIMT_BN];
+  constexpr int ROWS = FA_SIMT_BQ * G, RPW = ROWS / 8;  // rows per warp
+  const int kvh = blockIdx.y;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int q0 = blockIdx.x * FA_SIMT_BQ;
+  const int ptot = pos0 + T;
+  const int kt_max = pos0 + min(q0 + FA_SIMT_BQ, T) - 1;  // last key any row may see
+
+  int rt_[RPW], rh_[RPW];
+  float o_[RPW][8], m_[RPW], l_[RPW];
+#pragma unroll
+  for (int i = 0; i < RPW; i++) {
+    const int rr = warp * RPW + i;
+    rt_[i] = q0 + rr / G;
+    rh_[i] = kvh * G + rr % G;
+    m_[i] = -1e30f;
+    l_[i] = 0.f;
+#pragma unroll
+    for (int d = 0; d < 8; d++) o_[i][d] = 0.f;
+  }
+
+  for (int kt = 0; kt <= kt_max; kt += FA_SIMT_BN) {
+    // cooperative tile fill: 32 positions x 32 chunks of 8 dims
+    for (int idx = tid; idx < FA_SIMT_BN * 32; idx += 256) {
+      const int pi = idx >> 5, c = idx & 31;
+      const int p = min(kt + pi, ptot - 1);
+      const uint4 kk = kv_read8h<KT>(kc + kv_off(kvh, p, bs, recb), c);
+      const uint4 vv = kv_read8h<KT>(vc + kv_off(kvh, p, bs, recb), c);
+      *(uint4*)&Ks[pi][8 * c] = kk;
+      *(uint4*)&Vs[pi][8 * c] = vv;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < RPW; i++) {
+      if (rt_[i] >= T) continue;
+      const int t = rt_[i];
+      // stage this row's q (lane owns dims 8*lane..+7)
+      const __half* qp = q16 + ((size_t)t * nh + rh_[i]) * FA_D + 8 * lane;
+#pragma unroll
+      for (int d = 0; d < 8; d++) qs[warp][8 * lane + d] = __half2float(qp[d]);
+      __syncwarp();
+      const int p = kt + lane;
+      float score = -1e30f;
+      if (p <= pos0 + t) {
+        score = 0.f;
+#pragma unroll
+        for (int c = 0; c < 32; c++) {
+          const uint4 kv4 = *(const uint4*)&Ks[lane][8 * c];
+          const __half* kh = (const __half*)&kv4;
+#pragma unroll
+          for (int d = 0; d < 8; d++) score += qs[warp][8 * c + d] * __half2float(kh[d]);
+        }
+      }
+      float mt = score;
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+      const float mn = fmaxf(m_[i], mt);
+      const float al = exp2f(m_[i] - mn);
+      const float wp = score <= -1e29f ? 0.f : exp2f(score - mn);
+      wsm[warp][lane] = wp;
+      float ls = wp;
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
+      l_[i] = l_[i] * al + ls;
+      m_[i] = mn;
+#pragma unroll
+      for (int d = 0; d < 8; d++) o_[i][d] *= al;
+      __syncwarp();
+#pragma unroll
+      for (int pi = 0; pi < FA_SIMT_BN; pi++) {
+        const float wgt = wsm[warp][pi];
+        if (wgt == 0.f) continue;
+        const uint4 vv = *(const uint4*)&Vs[pi][8 * lane];
+        const __half* vh = (const __half*)&vv;
+#pragma unroll
+        for (int d = 0; d < 8; d++) o_[i][d] += wgt * __half2float(vh[d]);
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < RPW; i++) {
+    if (rt_[i] >= T) continue;
+    const float il = l_[i] > 0.f ? 1.f / l_[i] : 0.f;
+    float* op = out + ((size_t)rt_[i] * nh + rh_[i]) * FA_D + 8 * lane;
+#pragma unroll
+    for (int d = 0; d < 8; d++) op[d] = o_[i][d] * il;
+  }
+}
+#endif  // __HIP_PLATFORM_AMD__
+
 void attn_prefill(int kvtype, const void* kcache, const void* vcache, const float* q, int qhs,
                   int qts, float* out, int nh, int nkv, int hd, int pos0, int T, float scale,
                   void* work, KVMap bs, cudaStream_t s) {
 #ifdef __HIP_PLATFORM_AMD__
-  // HIP v1: no tensor-core flash attention; run the decode path in chunks of 4
+  // HIP prefill attention: SIMT flash attention when QE_FA_SIMT=1 (and the
+  // shape matches), else the v1 fallback -- the decode path in chunks of 4
   // (exactly the engine's own QE_SLOW_ATTN reference route).
-  (void)work;
+  static const bool fa_simt = getenv("QE_FA_SIMT") && atoi(getenv("QE_FA_SIMT")) == 1;
+  if (fa_simt && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
+    const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
+    const float sl2 = scale * 1.4426950408889634f;
+    __half* q16 = (__half*)work;
+    const uint8_t* kc = (const uint8_t*)kcache;
+    const uint8_t* vc = (const uint8_t*)vcache;
+    const dim3 grid(cdiv(T, FA_SIMT_BQ), nkv);
+    switch (kvtype) {
+#define FA_SIMT_CASE(KT)                                                                 \
+  case KT:                                                                               \
+    k_fa_prep_q<KT><<<cdiv(T * nh, 8), 256, 0, s>>>(q, qhs, qts, nh, T, sl2, q16);       \
+    k_fa_simt<KT, 6><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);      \
+    if (KT != KV_F16) k_wht_rows<<<cdiv(T * nh, 8), 256, 0, s>>>(out, T * nh);           \
+    break;
+      FA_SIMT_CASE(KV_Q4) FA_SIMT_CASE(KV_Q8) FA_SIMT_CASE(KV_Q3) FA_SIMT_CASE(KV_F16)
+#undef FA_SIMT_CASE
+      default:
+        break;
+    }
+    if (kvtype == KV_Q4 || kvtype == KV_Q8 || kvtype == KV_Q3 || kvtype == KV_F16) return;
+  }
   for (int t0 = 0; t0 < T; t0 += 4) {
     const int nt = T - t0 < 4 ? T - t0 : 4;
     attn_decode(kvtype, kcache, vcache, q + (size_t)t0 * qts, qhs, qts, out + (size_t)t0 * nh * hd,
