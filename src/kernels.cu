@@ -773,11 +773,14 @@ __global__ void __launch_bounds__(WARPS * 32)
   const int r = min(rbase + n, N - 1);
   const uint8_t* wr = W + (size_t)r * rb;
   for (int j = warp; j < nsb; j += WARPS) {
-    // v2: decode this lane's own row in registers (lanes n and n+16 duplicate
-    // the work) -- the W32 words are exactly the two B-fragment halves, so no
+    // v3: only lanes 0..15 decode (one per row); the W32 words are exactly the
+    // two B-fragment halves, distributed to lanes 16..31 with shuffles. No
     // shared-memory staging and no syncwarp in the group loop.
     W32 w;
-    D::dec(wr + (size_t)(j >> 3) * D::BB, j & 7, w);
+    if (lane < 16) D::dec(wr + (size_t)(j >> 3) * D::BB, j & 7, w);
+#pragma unroll
+    for (int i = 0; i < 8; i++) w.w[i] = __shfl_sync(0xffffffffu, w.w[i], n);
+    const float ws = __shfl_sync(0xffffffffu, w.sc[0], n);
     const float xs_own = tok_ok ? xd[(size_t)n * nsb + j] : 0.f;
     wmma_i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
@@ -801,7 +804,7 @@ __global__ void __launch_bounds__(WARPS * 32)
     for (int i = 0; i < 8; i++) {
       // token (2i + hi)'s activation scale lives on lane (2i + hi)
       const float xs = __shfl_sync(0xffffffffu, xs_own, 2 * i + hi);
-      accv[i] += (float)c[i] * w.sc[0] * xs;
+      accv[i] += (float)c[i] * ws * xs;
     }
   }
 #pragma unroll
