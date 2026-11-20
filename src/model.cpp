@@ -32,9 +32,12 @@ struct Prof {
   bool on = getenv("QE_PROFILE") && atoi(getenv("QE_PROFILE")) == 1;
   double t[16] = {};
   const char* names[16] = {"attn_layer", "gdn_layer", "ffn", "fa_kernel", "gemm", "dequant", "gdn_core", "gdn_rec"};
-  ~Prof() {
-    if (!on) return;
+  long nscope = 0;
+  void flush() {
     for (int i = 0; i < 8; i++) fprintf(stderr, "[prof] %-12s %8.3f s\n", names[i], t[i]);
+  }
+  ~Prof() {
+    if (on) flush();
   }
 } g_prof;
 struct ProfScope {
@@ -43,7 +46,13 @@ struct ProfScope {
     if (g_prof.on) { cudaStreamSynchronize(s); t0 = qe_now(); }
   }
   ~ProfScope() {
-    if (g_prof.on) { cudaStreamSynchronize(s); g_prof.t[cat] += qe_now() - t0; }
+    if (g_prof.on) {
+      cudaStreamSynchronize(s);
+      g_prof.t[cat] += qe_now() - t0;
+      // The exit-time print never runs when the server is stopped with Ctrl+C
+      // (no static destructors), so also flush the cumulative totals in flight.
+      if (++g_prof.nscope % 512 == 0) g_prof.flush();
+    }
   }
 };
 
