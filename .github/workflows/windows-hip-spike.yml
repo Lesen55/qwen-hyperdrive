@@ -8,7 +8,7 @@ name: windows-hip-spike
 on:
   workflow_dispatch:
   push:
-    branches: [windows-port]
+    branches: [windows-port, hip-backend]
     paths:
       - '.github/workflows/windows-hip-spike.yml'
       - 'hip-spike/**'
@@ -49,8 +49,11 @@ jobs:
           & "$hip\bin\hipcc.bat" --version
           & "$hip\bin\hipcc.bat" -O2 --offload-arch=gfx1100 hip-spike\hello.hip.cpp -o hip-spike.exe
           if ($LASTEXITCODE -ne 0) { throw "hipcc failed: $LASTEXITCODE" }
+          & "$hip\bin\hipcc.bat" -O2 --offload-arch=gfx1100 -mno-wavefrontsize64 hip-spike\wmma.hip.cpp -o wmma-spike.exe
+          if ($LASTEXITCODE -ne 0) { throw "hipcc (wmma) failed: $LASTEXITCODE" }
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item hip-spike.exe dist\
+          Copy-Item wmma-spike.exe dist\
           Copy-Item "$hip\bin\amdhip64_*.dll" dist\
           Copy-Item "$hip\bin\amd_comgr_*.dll" dist\
           Get-ChildItem dist | Format-Table Name, Length
