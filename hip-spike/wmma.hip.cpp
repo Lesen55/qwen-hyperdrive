@@ -46,7 +46,7 @@ __global__ void wmma_tile(const int8_t* A, const int8_t* B, int* out) {
     else pb[e] = B[l * 16 + e];                               // B row l
   }
   i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
-  c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(FA, a4, FB, b4, c);
+  c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(FA, a4, FB, b4, c, false);
   for (int i = 0; i < 8; i++) out[lane * 8 + i] = c[i];
 }
 
