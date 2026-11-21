@@ -1,6 +1,10 @@
 #include <set>
 #include <thread>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)  // MSVC CRT has no POSIX mkdir
+#endif
 #include "model.h"
 #include "requant.h"
 
