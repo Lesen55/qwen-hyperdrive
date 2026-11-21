@@ -59,6 +59,8 @@ class Generator {
   void set_ngram(bool on, int n = 3) { ngram_on_ = on; ngram_n_ = n < 2 ? 2 : n; }
   // separate draft model (same tokenizer, e.g. Qwen3.5-0.8B) for targets without an MTP head
   void set_draft_model(IModel* d) { dm_ = d; }
+  // after a cancelled start(): the model state is partial, so forget it (no prefix reuse from it)
+  void abandon() { committed().clear(); m_.reset(); history_.clear(); pos_ = 0; }
   // Process the prompt; returns the first generated token.  If the model state currently holds a
   // strict prefix of `prompt` (previous conversation turn), only the new suffix is processed.
   int start(const std::vector<int>& prompt, bool allow_reuse = true, int reserve = 4096);

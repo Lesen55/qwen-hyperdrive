@@ -108,6 +108,8 @@ class Model : public IModel {
   }
   bool rope_table_ = false;  // RoPE from the (YaRN) frequency table
   bool state_save() override;
+  void set_cancel(const std::atomic<bool>* c) override { cancel_ = c; }
+  const std::atomic<bool>* cancel_ = nullptr;
   void state_restore() override;
   uint8_t* state_bk_dev_ = nullptr;
   void set_carry_row(int row) override;  // carried hidden := row of the last forward (for prefix continuation)
