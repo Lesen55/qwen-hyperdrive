@@ -61,6 +61,17 @@ function(qe_frontends suffix backend)
     # cudadevrt) and ws2_32; the clang/GNU-style driver cannot resolve those
     # as linker inputs. Let nvcc (MSVC host) drive the link instead.
     set_target_properties(qwen35-engine${suffix} qwen35-server${suffix} PROPERTIES LINKER_LANGUAGE CUDA)
+    # The clang-compiled CPU objects reference __cpu_model/__cpu_features2
+    # (__builtin_cpu_supports), which live in compiler-rt builtins. The clang
+    # driver adds that library automatically; the nvcc-driven link does not.
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-resource-dir
+      OUTPUT_VARIABLE QE_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+    find_library(QE_CLANG_BUILTINS NAMES clang_rt.builtins-x86_64
+      HINTS "${QE_CLANG_RESOURCE_DIR}/lib/windows" NO_DEFAULT_PATH)
+    if(QE_CLANG_BUILTINS)
+      target_link_libraries(qwen35-engine${suffix} PRIVATE ${QE_CLANG_BUILTINS})
+      target_link_libraries(qwen35-server${suffix} PRIVATE ${QE_CLANG_BUILTINS})
+    endif()
   endif()
   install(TARGETS qwen35-engine${suffix} qwen35-server${suffix} RUNTIME DESTINATION bin)
 endfunction()
