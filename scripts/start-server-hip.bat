@@ -11,6 +11,9 @@ set PORT=8081
 rem R4=0: 2 rows/warp in the fallback matvec (measured +10% decode on the
 rem 7900 XTX, 2026-11-20; the 4-row default is tuned for sm_86).
 set QE_MMV_R4=0
+rem FA_SIMT=1: SIMT flash attention for prefill (measured 654 vs ~590-614 tok/s
+rem on the standard config, 2026-11-21; =2 selects the 16-position tile variant).
+set QE_FA_SIMT=1
 cd /d %~dp0
 qwen35-server-hip.exe --draft 3 --host 0.0.0.0 -m "%MODEL%" --port %PORT% %*
 pause
