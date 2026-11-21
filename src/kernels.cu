@@ -4226,15 +4226,15 @@ size_t attn_prefill_work_bytes(int T, int nh, int hd) { return (size_t)T * nh * 
 constexpr int FA_SIMT_BQ = 8;   // queries per block
 constexpr int FA_SIMT_BN = 32;  // KV tile positions
 
-template <int KT, int G>  // G = nh / nkv (6 for the target model)
+template <int KT, int G, int BN = FA_SIMT_BN>  // G = nh / nkv (6 for the target model); BN = KV tile (32 = v1, 16 = v2: ~26KB smem, 2 blocks/CU)
 __global__ void __launch_bounds__(256)
     k_fa_simt(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
               const __half* __restrict__ q16, float* __restrict__ out, int nh, int pos0, int T,
               int recb, KVMap bs) {
-  __shared__ __align__(16) __half Ks[FA_SIMT_BN][FA_QLD];
-  __shared__ __align__(16) __half Vs[FA_SIMT_BN][FA_QLD];
+  __shared__ __align__(16) __half Ks[BN][FA_QLD];
+  __shared__ __align__(16) __half Vs[BN][FA_QLD];
   __shared__ float qs[8][FA_D];   // current row's q (per warp)
-  __shared__ float wsm[8][FA_SIMT_BN];
+  __shared__ float wsm[8][BN];
   constexpr int ROWS = FA_SIMT_BQ * G, RPW = ROWS / 8;  // rows per warp
   const int kvh = blockIdx.y;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -4255,9 +4255,9 @@ __global__ void __launch_bounds__(256)
     for (int d = 0; d < 8; d++) o_[i][d] = 0.f;
   }
 
-  for (int kt = 0; kt <= kt_max; kt += FA_SIMT_BN) {
+  for (int kt = 0; kt <= kt_max; kt += BN) {
     // cooperative tile fill: 32 positions x 32 chunks of 8 dims
-    for (int idx = tid; idx < FA_SIMT_BN * 32; idx += 256) {
+    for (int idx = tid; idx < BN * 32; idx += 256) {
       const int pi = idx >> 5, c = idx & 31;
       const int p = min(kt + pi, ptot - 1);
       const uint4 kk = kv_read8h<KT>(kc + kv_off(kvh, p, bs, recb), c);
@@ -4277,7 +4277,7 @@ __global__ void __launch_bounds__(256)
       __syncwarp();
       const int p = kt + lane;
       float score = -1e30f;
-      if (p <= pos0 + t) {
+      if (lane < BN && p <= pos0 + t) {
         score = 0.f;
 #pragma unroll
         for (int c = 0; c < 32; c++) {
@@ -4293,7 +4293,7 @@ __global__ void __launch_bounds__(256)
       const float mn = fmaxf(m_[i], mt);
       const float al = exp2f(m_[i] - mn);
       const float wp = score <= -1e29f ? 0.f : exp2f(score - mn);
-      wsm[warp][lane] = wp;
+      if (lane < BN) wsm[warp][lane] = wp;
       float ls = wp;
 #pragma unroll
       for (int off = 16; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
@@ -4303,7 +4303,7 @@ __global__ void __launch_bounds__(256)
       for (int d = 0; d < 8; d++) o_[i][d] *= al;
       __syncwarp();
 #pragma unroll
-      for (int pi = 0; pi < FA_SIMT_BN; pi++) {
+      for (int pi = 0; pi < BN; pi++) {
         const float wgt = wsm[warp][pi];
         if (wgt == 0.f) continue;
         const uint4 vv = *(const uint4*)&Vs[pi][8 * lane];
@@ -4332,8 +4332,8 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   // HIP prefill attention: SIMT flash attention when QE_FA_SIMT=1 (and the
   // shape matches), else the v1 fallback -- the decode path in chunks of 4
   // (exactly the engine's own QE_SLOW_ATTN reference route).
-  static const bool fa_simt = getenv("QE_FA_SIMT") && atoi(getenv("QE_FA_SIMT")) == 1;
-  if (fa_simt && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
+  static const int fa_simt_v = getenv("QE_FA_SIMT") ? atoi(getenv("QE_FA_SIMT")) : 0;
+  if ((fa_simt_v == 1 || fa_simt_v == 2) && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
     const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
     const float sl2 = scale * 1.4426950408889634f;
     __half* q16 = (__half*)work;
@@ -4344,7 +4344,8 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
 #define FA_SIMT_CASE(KT)                                                                 \
   case KT:                                                                               \
     k_fa_prep_q<KT><<<cdiv(T * nh, 8), 256, 0, s>>>(q, qhs, qts, nh, T, sl2, q16);       \
-    k_fa_simt<KT, 6><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);      \
+    if (fa_simt_v == 2) k_fa_simt<KT, 6, 16><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
+    else k_fa_simt<KT, 6><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);      \
     if (KT != KV_F16) k_wht_rows<<<cdiv(T * nh, 8), 256, 0, s>>>(out, T * nh);           \
     break;
       FA_SIMT_CASE(KV_Q4) FA_SIMT_CASE(KV_Q8) FA_SIMT_CASE(KV_Q3) FA_SIMT_CASE(KV_F16)
