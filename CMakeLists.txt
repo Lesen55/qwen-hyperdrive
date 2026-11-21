@@ -56,6 +56,12 @@ function(qe_frontends suffix backend)
     target_link_libraries(qwen35-server${suffix} PRIVATE ws2_32)
   endif()
   target_compile_options(qwen35-server${suffix} PRIVATE ${QE_CPU_FLAGS})
+  if(QE_CUDA AND WIN32)
+    # CMake emits bare .lib names for the CUDA runtime (cudart_static,
+    # cudadevrt) and ws2_32; the clang/GNU-style driver cannot resolve those
+    # as linker inputs. Let nvcc (MSVC host) drive the link instead.
+    set_target_properties(qwen35-engine${suffix} qwen35-server${suffix} PROPERTIES LINKER_LANGUAGE CUDA)
+  endif()
   install(TARGETS qwen35-engine${suffix} qwen35-server${suffix} RUNTIME DESTINATION bin)
 endfunction()
 
