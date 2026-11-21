@@ -2589,10 +2589,99 @@ void matvec_tq(uint32_t type, const void* W, size_t rb, int K, int N, const int8
   }
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// WMMA int8 GEMM for HIP prefill (MMQ), IQ3_S only. Block: 64 output rows x
+// 64 tokens, 8 warps owning two 16x16 WMMA tiles each. K is staged in
+// 128-wide chunks: weights are decoded once per block into shared memory
+// (QDec, exact float scales per 32-group -- the same numbers the dp4a decode
+// path produces), activations are staged alongside, so no f16 weight
+// expansion ever happens. Fragment layout per hip-spike/wmma.hip.cpp.
+constexpr int MQH_BM = 64, MQH_BN = 64, MQH_LD = 144, MQH_GC = 4;  // groups per K chunk
+
+__global__ void __launch_bounds__(256)
+    k_mmq_wmma_iq3s(const uint8_t* __restrict__ W, size_t rb, int K, int N, const int8_t* __restrict__ xq,
+                    const float* __restrict__ xd, int Tt, float* __restrict__ y, int ldy, int accum, int gs) {
+  using D = QDec<QT_IQ3_S>;
+  __shared__ __align__(16) int8_t sW[MQH_BM][MQH_LD];
+  __shared__ __align__(16) int8_t sX[MQH_BN][MQH_LD];
+  __shared__ float sws[MQH_BM][MQH_GC];
+  __shared__ float sxs[MQH_BN][MQH_GC];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int n0 = blockIdx.x * MQH_BM, t0 = blockIdx.y * MQH_BN;
+  const int nsb = K / 32;                          // 32-groups in K
+  const int xstride = gs == 32 ? nsb : nsb / 8;    // xd floats per token
+  const int tn = (warp & 3) * 16;                  // this warp's token tile
+  const int nn0 = (warp >> 2) * 16;                // first of its two row tiles (+32)
+  const int nloc = lane % 16, hi = lane / 16;
+  float acc[2][8] = {};
+  for (int kb = 0; kb < nsb; kb += MQH_GC) {
+    {  // stage weights: thread tid decodes row (tid >> 2), group (kb + (tid & 3))
+      const int row = tid >> 2, gl = tid & 3;
+      const int r = min(n0 + row, N - 1);
+      W32 w;
+      D::dec(W + (size_t)r * rb + (size_t)((kb + gl) >> 3) * D::BB, (kb + gl) & 7, w);
+      int* dst = (int*)&sW[row][gl * 32];
+#pragma unroll
+      for (int i = 0; i < 8; i++) dst[i] = w.w[i];
+      sws[row][gl] = w.sc[0];
+    }
+#pragma unroll
+    for (int u = 0; u < 2; u++) {  // stage activations: 512 uint4 over 256 threads
+      const int idx = tid + u * 256;
+      const int row = idx >> 3, ch = idx & 7;
+      const int t = t0 + row;
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (t < Tt) v = *(const uint4*)(xq + (size_t)t * K + kb * 32 + ch * 16);
+      *(uint4*)&sX[row][ch * 16] = v;
+    }
+    {  // stage activation scales: 64 tokens x 4 groups, one float per thread
+      const int row = tid >> 2, gl = tid & 3;
+      const int t = t0 + row;
+      const int g = kb + gl;
+      sxs[row][gl] = t < Tt ? xd[(size_t)t * xstride + (gs == 32 ? g : (g >> 3))] : 0.f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int gl = 0; gl < MQH_GC; gl++) {
+#pragma unroll
+      for (int b = 0; b < 2; b++) {
+        const int nn = nn0 + b * 32;
+        wmma_i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          const uint4 av = *(const uint4*)&sX[tn + nloc][gl * 32 + h * 16];
+          wmma_i32x4 a4;
+          a4[0] = (int)av.x; a4[1] = (int)av.y; a4[2] = (int)av.z; a4[3] = (int)av.w;
+          const uint4 bv = *(const uint4*)&sW[nn + nloc][gl * 32 + h * 16];
+          wmma_i32x4 b4;
+          b4[0] = (int)bv.x; b4[1] = (int)bv.y; b4[2] = (int)bv.z; b4[3] = (int)bv.w;
+          c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a4, true, b4, c, false);
+        }
+        const float wsc = sws[nn + nloc][gl];
+#pragma unroll
+        for (int i = 0; i < 8; i++) acc[b][i] += (float)c[i] * wsc * sxs[tn + 2 * i + hi][gl];
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int b = 0; b < 2; b++) {
+    const int n = n0 + nn0 + b * 32 + nloc;
+    if (n >= N) continue;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int t = t0 + tn + 2 * i + hi;
+      if (t >= Tt) continue;
+      float* o = y + (size_t)t * ldy + n;
+      *o = accum ? *o + acc[b][i] : acc[b][i];
+    }
+  }
+}
+#endif  // __HIP_PLATFORM_AMD__
+
 bool mmq_supported(uint32_t type) {
 #ifdef __HIP_PLATFORM_AMD__
-  (void)type;
-  return false;  // HIP v1: prefill goes through dequant_f16 + hipBLAS instead
+  return type == QT_IQ3_S;  // WMMA int8 GEMM (k_mmq_wmma_iq3s); other types keep dequant + hipBLAS
 #else
   switch (type) {
     case QT_Q2_K: case QT_Q3_K: case QT_Q4_K: case QT_Q5_K: case QT_Q6_K: case QT_IQ2_XXS: case QT_IQ2_XS: case QT_IQ2_S:
@@ -2606,6 +2695,15 @@ bool mmq_supported(uint32_t type) {
 
 void mmq(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd, int Tt, float* y,
          int ldy, bool acc, int gs, cudaStream_t s) {
+#ifdef __HIP_PLATFORM_AMD__
+  if (type == QT_IQ3_S) {
+    QE_ASSERT(K % 128 == 0);  // K staging runs in 4-group (128-wide) chunks
+    const dim3 grid(cdiv(N, MQH_BM), cdiv(Tt, MQH_BN));
+    k_mmq_wmma_iq3s<<<grid, 256, 0, s>>>((const uint8_t*)W, rb, K, N, xq, xd, Tt, y, ldy, acc, gs);
+    return;
+  }
+  QE_FATAL("mmq: unsupported type %u on HIP", type);
+#endif
   switch (type) {
 #define T(t) case t: if (gs == 32) launch_mmq_t<t, 32>(W, rb, K, N, xq, xd, Tt, y, ldy, acc, s); \
                      else launch_mmq_t<t, 256>(W, rb, K, N, xq, xd, Tt, y, ldy, acc, s); break;
