@@ -35,7 +35,12 @@ jobs:
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           Import-Module "$vsPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $vsPath -DevCmdArguments '-arch=x64' -SkipAutomaticLocation
-          $cl = (Get-Command cl.exe).Source
+          # DevShell puts VS's bundled Clang 19 first in PATH; prefer the LLVM 22
+          # install (same toolchain as the Vulkan build).
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          # Forward slashes: CMake's CUDA compiler-id step mangles backslashes
+          # in the -ccbin path it builds for nvcc.
+          $cl = (Get-Command cl.exe).Source -replace '\\', '/'
           Write-Host "nvcc host compiler: $cl"
           clang --version
           nvcc --version
