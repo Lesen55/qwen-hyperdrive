@@ -5,6 +5,9 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
+#include <intrin.h>  // __popcnt for the MSVC host build
+#endif
 
 #ifdef __CUDACC__
 #define QE_HD __host__ __device__ __forceinline__
@@ -104,6 +107,8 @@ QE_HD void q4k_scale_min(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
 QE_HD uint8_t iq2_signs8(uint32_t s7) {  // == ksigns_iq2xs[s7]
 #ifdef __CUDA_ARCH__
   return (uint8_t)(s7 | ((__popc(s7) & 1) << 7));
+#elif defined(_MSC_VER)
+  return (uint8_t)(s7 | ((__popcnt(s7) & 1) << 7));  // nvcc's MSVC host pass has no __builtin_popcount
 #else
   return (uint8_t)(s7 | ((__builtin_popcount(s7) & 1) << 7));
 #endif
