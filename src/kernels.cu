@@ -2163,11 +2163,109 @@ void gq_xsum(const int8_t* xq, int K, int T, int16_t* xs, cudaStream_t s) {
   k_gq_xsum<<<(int)((n + 255) / 256), 256, 0, s>>>(xq, K, T, xs);
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+// WMMA int8 GEMM over gq_decode's decode-once buffers (IQ3_S, no xsum term):
+//   out[t][n] = sum_kb fac[n][kb] * xd256[t][kb] * sum_{j in kb} s_int[n][j] * dot32(xq[t], w8[n])
+// with QInt's factorization fac * s_int == QDec's per-group scale exactly.
+// Block: 64 rows x 64 tokens, 8 warps owning two 16x16 WMMA tiles each; K is
+// staged in 128-wide chunks from the pre-decoded int8 codes, so the weight
+// decode cost is paid once per row chunk (in gq_decode), not once per block.
+constexpr int GQH_BM = 64, GQH_BN = 64, GQH_LD = 144, GQH_GC = 4;  // groups per K chunk
+
+__global__ void __launch_bounds__(256)
+    k_gq_wmma_iq3s(const int8_t* __restrict__ w8, const int8_t* __restrict__ s8, const float* __restrict__ fac,
+                   int K, int N, const int8_t* __restrict__ xq, const float* __restrict__ xd256, int Tt,
+                   float* __restrict__ y, int ldy, int accum) {
+  __shared__ __align__(16) int8_t sW[GQH_BM][GQH_LD];
+  __shared__ __align__(16) int8_t sX[GQH_BN][GQH_LD];
+  __shared__ float sws[GQH_BM][GQH_GC];  // integer sub-scales as float
+  __shared__ float sfac[GQH_BM];         // per-row superblock factor
+  __shared__ float sxd[GQH_BN];          // per-token superblock scale
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int n0 = blockIdx.x * GQH_BM, t0 = blockIdx.y * GQH_BN;
+  const int nkb = K / 256;  // superblocks in K
+  const int tn = (warp & 3) * 16;
+  const int nn0 = (warp >> 2) * 16;
+  const int nloc = lane % 16, hi = lane / 16;
+  float acc[2][8] = {};
+  for (int kb = 0; kb < nkb; kb++) {
+    if (tid < GQH_BM) sfac[tid] = fac[(size_t)min(n0 + tid, N - 1) * nkb + kb];
+    if (tid >= GQH_BM && tid < GQH_BM + GQH_BN) {
+      const int t = t0 + (tid - GQH_BM);
+      sxd[tid - GQH_BM] = t < Tt ? xd256[(size_t)t * nkb + kb] : 0.f;
+    }
+    float bacc[2][8] = {};  // this superblock's integer-scale accumulation
+    for (int g0 = 0; g0 < 8; g0 += GQH_GC) {
+#pragma unroll
+      for (int u = 0; u < 2; u++) {  // stage weight codes: 512 uint4 over 256 threads
+        const int idx = tid + u * 256, row = idx >> 3, ch = idx & 7;
+        const int n = min(n0 + row, N - 1);
+        *(uint4*)&sW[row][ch * 16] = *(const uint4*)(w8 + (size_t)n * K + kb * 256 + g0 * 32 + ch * 16);
+      }
+#pragma unroll
+      for (int u = 0; u < 2; u++) {  // stage activations
+        const int idx = tid + u * 256, row = idx >> 3, ch = idx & 7;
+        const int t = t0 + row;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (t < Tt) v = *(const uint4*)(xq + (size_t)t * K + kb * 256 + g0 * 32 + ch * 16);
+        *(uint4*)&sX[row][ch * 16] = v;
+      }
+      {  // stage sub-scales: s8 holds one int8 per 16 weights; SC=1 duplicates the 32-group value
+        const int row = tid >> 2, gl = tid & 3;
+        const int n = min(n0 + row, N - 1);
+        sws[row][gl] = (float)s8[(size_t)n * (K / 16) + (size_t)(kb * 8 + g0 + gl) * 2];
+      }
+      __syncthreads();
+#pragma unroll
+      for (int gl = 0; gl < GQH_GC; gl++) {
+#pragma unroll
+        for (int b = 0; b < 2; b++) {
+          const int nn = nn0 + b * 32;
+          wmma_i32x8 c = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+          for (int h = 0; h < 2; h++) {
+            const uint4 av = *(const uint4*)&sX[tn + nloc][gl * 32 + h * 16];
+            wmma_i32x4 a4;
+            a4[0] = (int)av.x; a4[1] = (int)av.y; a4[2] = (int)av.z; a4[3] = (int)av.w;
+            const uint4 bv = *(const uint4*)&sW[nn + nloc][gl * 32 + h * 16];
+            wmma_i32x4 b4;
+            b4[0] = (int)bv.x; b4[1] = (int)bv.y; b4[2] = (int)bv.z; b4[3] = (int)bv.w;
+            c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a4, true, b4, c, false);
+          }
+          const float s = sws[nn + nloc][gl];
+#pragma unroll
+          for (int i = 0; i < 8; i++) bacc[b][i] += (float)c[i] * s;
+        }
+      }
+      __syncthreads();
+    }
+#pragma unroll
+    for (int b = 0; b < 2; b++) {
+      const float f = sfac[nn0 + b * 32 + nloc];
+#pragma unroll
+      for (int i = 0; i < 8; i++) acc[b][i] += bacc[b][i] * f * sxd[tn + 2 * i + hi];
+    }
+    __syncthreads();  // sfac/sxd are rewritten at the top of the next superblock
+  }
+#pragma unroll
+  for (int b = 0; b < 2; b++) {
+    const int n = n0 + nn0 + b * 32 + nloc;
+    if (n >= N) continue;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int t = t0 + tn + 2 * i + hi;
+      if (t >= Tt) continue;
+      float* o = y + (size_t)t * ldy + n;
+      *o = accum ? *o + acc[b][i] : acc[b][i];
+    }
+  }
+}
+#endif  // __HIP_PLATFORM_AMD__
+
 bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K || type == QT_Q5_K; }  // IQ1_S: min folded
 bool gq_supported(uint32_t type) {
 #ifdef __HIP_PLATFORM_AMD__
-  (void)type;
-  return false;  // follows from mmq_supported() == false on HIP
+  return type == QT_IQ3_S;  // WMMA int8 GEMM over gq_decode buffers (k_gq_wmma_iq3s)
 #else
   static const bool all = getenv("QE_GQ_MIN") && atoi(getenv("QE_GQ_MIN")) != 0;  // MIN types: +0.4% PPL so far
   return mmq_supported(type) && (all || !gq_needs_xsum(type));
@@ -2182,6 +2280,15 @@ void gq_gemm(uint32_t type, const void* buf, int K, int N, const int8_t* xq, con
   const int8_t* m8 = s8 + al((size_t)N * (K / 16));
   const float* fac = (const float*)(m8 + al((size_t)N * (K / 16)));
   const float* mfac = (const float*)((const uint8_t*)fac + al((size_t)N * (K / 256) * 4));
+#ifdef __HIP_PLATFORM_AMD__
+  if (type == QT_IQ3_S) {
+    QE_ASSERT(K % 256 == 0);
+    const dim3 grid(cdiv(N, GQH_BM), cdiv(T, GQH_BN));
+    k_gq_wmma_iq3s<<<grid, 256, 0, s>>>(w8, s8, fac, K, N, xq, xd256, T, y, ldy, accumulate);
+    return;
+  }
+  QE_FATAL("gq_gemm: unsupported type %u on HIP", type);
+#endif
   const bool sc2 = type == QT_Q2_K || type == QT_Q3_K || type == QT_Q6_K || type == QT_IQ2_XS || type == QT_IQ2_S;
   const bool mn = gq_needs_xsum(type);
 #define L(a, b, mt)                                                                                    \
