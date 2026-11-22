@@ -187,4 +187,10 @@ if(QE_HIP)
   set_target_properties(qehip PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(qehip PUBLIC qecommon hip::host roc::hipblas)
   qe_frontends("-hip" qehip)
+  # Stage-0 spike for WMMA flash attention: dumps the fp16 WMMA fragment
+  # layouts on real hardware (see src/wmma_spike.cpp).
+  add_executable(qe-wmma-spike src/wmma_spike.cpp)
+  set_source_files_properties(src/wmma_spike.cpp PROPERTIES LANGUAGE HIP)
+  target_compile_options(qe-wmma-spike PRIVATE -mno-wavefrontsize64)
+  target_link_libraries(qe-wmma-spike PRIVATE hip::host)
 endif()
