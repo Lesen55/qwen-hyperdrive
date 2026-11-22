@@ -4444,6 +4444,111 @@ __global__ void __launch_bounds__(256)
     for (int d = 0; d < 8; d++) op[d] = o_[i][d] * il;
   }
 }
+// FA_SIMT v4 (QE_FA_SIMT=4): dim-chunk score decomposition. Each lane owns 8
+// dims of the query row in registers (loaded straight from q16, no qs smem)
+// and computes its partial dot for every tile position; a warp reduction
+// yields each score on all lanes. v2/v3 read the full Q row AND the full K
+// row from smem per score (2x256 halfs); v4 reads K once per (position, lane
+// chunk) and Q never from smem, halving score-phase smem traffic -- v3's flat
+// result showed the score phase is LDS-bound, not FMA-bound. Softmax and the
+// PV phase keep v2's tile-level online structure. Smem ~17KB (Ks+Vs+wsm).
+template <int KT, int G>
+__global__ void __launch_bounds__(256)
+    k_fa_simt4(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+               const __half* __restrict__ q16, float* __restrict__ out, int nh, int pos0, int T,
+               int recb, KVMap bs) {
+  constexpr int BN = 16;
+  __shared__ __align__(16) __half Ks[BN][FA_QLD];
+  __shared__ __align__(16) __half Vs[BN][FA_QLD];
+  __shared__ float wsm[8][BN];
+  constexpr int ROWS = FA_SIMT_BQ * G, RPW = ROWS / 8;
+  const int kvh = blockIdx.y;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int q0 = blockIdx.x * FA_SIMT_BQ;
+  const int ptot = pos0 + T;
+  const int kt_max = pos0 + min(q0 + FA_SIMT_BQ, T) - 1;
+
+  int rt_[RPW], rh_[RPW];
+  float o_[RPW][8], m_[RPW], l_[RPW];
+#pragma unroll
+  for (int i = 0; i < RPW; i++) {
+    const int rr = warp * RPW + i;
+    rt_[i] = q0 + rr / G;
+    rh_[i] = kvh * G + rr % G;
+    m_[i] = -1e30f;
+    l_[i] = 0.f;
+#pragma unroll
+    for (int d = 0; d < 8; d++) o_[i][d] = 0.f;
+  }
+
+  for (int kt = 0; kt <= kt_max; kt += BN) {
+    for (int idx = tid; idx < BN * 32; idx += 256) {
+      const int pi = idx >> 5, c = idx & 31;
+      const int p = min(kt + pi, ptot - 1);
+      const uint4 kk = kv_read8h<KT>(kc + kv_off(kvh, p, bs, recb), c);
+      const uint4 vv = kv_read8h<KT>(vc + kv_off(kvh, p, bs, recb), c);
+      *(uint4*)&Ks[pi][8 * c] = kk;
+      *(uint4*)&Vs[pi][8 * c] = vv;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < RPW; i++) {
+      if (rt_[i] >= T) continue;
+      const int t = rt_[i];
+      const __half* qp = q16 + ((size_t)t * nh + rh_[i]) * FA_D + 8 * lane;
+      float qreg[8];
+#pragma unroll
+      for (int d = 0; d < 8; d++) qreg[d] = __half2float(qp[d]);
+      float sarr[BN];
+#pragma unroll
+      for (int j = 0; j < BN; j++) {
+        const uint4 kv4 = *(const uint4*)&Ks[j][8 * lane];
+        const __half* kh = (const __half*)&kv4;
+        float part = 0.f;
+#pragma unroll
+        for (int d = 0; d < 8; d++) part += qreg[d] * __half2float(kh[d]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
+        sarr[j] = (kt + j <= pos0 + t) ? part : -1e30f;
+      }
+      float mt = sarr[0];
+#pragma unroll
+      for (int j = 1; j < BN; j++) mt = fmaxf(mt, sarr[j]);
+      const float mn = fmaxf(m_[i], mt);
+      const float al = exp2f(m_[i] - mn);
+      float ls = 0.f;
+#pragma unroll
+      for (int j = 0; j < BN; j++) {
+        const float wp = sarr[j] <= -1e29f ? 0.f : exp2f(sarr[j] - mn);
+        if (lane == 0) wsm[warp][j] = wp;
+        ls += wp;
+      }
+      l_[i] = l_[i] * al + ls;
+      m_[i] = mn;
+#pragma unroll
+      for (int d = 0; d < 8; d++) o_[i][d] *= al;
+      __syncwarp();
+#pragma unroll
+      for (int pi = 0; pi < BN; pi++) {
+        const float wgt = wsm[warp][pi];
+        if (wgt == 0.f) continue;
+        const uint4 vv = *(const uint4*)&Vs[pi][8 * lane];
+        const __half* vh = (const __half*)&vv;
+#pragma unroll
+        for (int d = 0; d < 8; d++) o_[i][d] += wgt * __half2float(vh[d]);
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < RPW; i++) {
+    if (rt_[i] >= T) continue;
+    const float il = l_[i] > 0.f ? 1.f / l_[i] : 0.f;
+    float* op = out + ((size_t)rt_[i] * nh + rh_[i]) * FA_D + 8 * lane;
+#pragma unroll
+    for (int d = 0; d < 8; d++) op[d] = o_[i][d] * il;
+  }
+}
 #endif  // __HIP_PLATFORM_AMD__
 
 void attn_prefill(int kvtype, const void* kcache, const void* vcache, const float* q, int qhs,
@@ -4454,7 +4559,7 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   // shape matches), else the v1 fallback -- the decode path in chunks of 4
   // (exactly the engine's own QE_SLOW_ATTN reference route).
   static const int fa_simt_v = getenv("QE_FA_SIMT") ? atoi(getenv("QE_FA_SIMT")) : 0;
-  if ((fa_simt_v == 1 || fa_simt_v == 2 || fa_simt_v == 3) && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
+  if ((fa_simt_v == 1 || fa_simt_v == 2 || fa_simt_v == 3 || fa_simt_v == 4) && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
     const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
     const float sl2 = scale * 1.4426950408889634f;
     __half* q16 = (__half*)work;
@@ -4465,6 +4570,7 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
 #define FA_SIMT_CASE(KT)                                                                 \
   case KT:                                                                               \
     k_fa_prep_q<KT><<<cdiv(T * nh, 8), 256, 0, s>>>(q, qhs, qts, nh, T, sl2, q16);       \
+    if (fa_simt_v == 4) k_fa_simt4<KT, 6><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
     if (fa_simt_v == 3) k_fa_simt<KT, 6, 16, true><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
     else if (fa_simt_v == 2) k_fa_simt<KT, 6, 16><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
     else k_fa_simt<KT, 6><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);      \
