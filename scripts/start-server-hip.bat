@@ -14,6 +14,9 @@ set QE_MMV_R4=0
 rem FA_SIMT=2: SIMT flash attention for prefill, 16-position tiles (measured
 rem 764 vs 654 tok/s for =1 and ~590-614 without, 2026-11-21).
 set QE_FA_SIMT=2
+rem GQ_T128=1: 128-token GEMM tiles (measured 786 vs 764 tok/s prefill at ~4k
+rem context, no regression at ~10k, 2026-11-22).
+set QE_GQ_T128=1
 cd /d %~dp0
 qwen35-server-hip.exe --draft 3 --host 0.0.0.0 -m "%MODEL%" --port %PORT% %*
 pause
