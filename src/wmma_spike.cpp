@@ -9,10 +9,10 @@
 //          (times a permutation), so value*256-1 decodes to (m*16 + k).
 //   Run 2: roles swapped (A = identity, B coded) for the B-side view.
 //
-// Fragments are loaded with the hypothesized standard layout:
-//   A/B frag: lane l, element e -> matrix[l % 16][(l / 16) * 8 + e]
-// The dump does not depend on the hypothesis being right: we print exactly
-// which values each lane fed and exactly which values came back per slot.
+// Fragment loads mirror the int8 WMMA style used by the engine's GEMM
+// kernels: lane l feeds row (l % 16), all 16 K elements (v16f16 operand).
+// The dump does not depend on that being the hardware's interpretation: we
+// print exactly which values each lane fed and what came back per slot.
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -20,22 +20,22 @@
 #include <cstdio>
 #include <cstring>
 
-typedef __half __attribute__((ext_vector_type(8))) half8;
-typedef float __attribute__((ext_vector_type(8))) float8;
+typedef __fp16 __attribute__((ext_vector_type(16))) f16x16;
+typedef float __attribute__((ext_vector_type(8))) f32x8;
 
 __global__ void wmma_probe(const __half* __restrict__ A, const __half* __restrict__ B,
                            float* __restrict__ dumpA, float* __restrict__ dumpB,
                            float* __restrict__ dumpC) {
   const int lane = threadIdx.x & 31;
-  half8 a, b;
-  const int r = lane & 15, half = (lane >> 4) * 8;
-  for (int e = 0; e < 8; e++) {
-    a[e] = A[r * 16 + half + e];
-    b[e] = B[r * 16 + half + e];
-    dumpA[lane * 8 + e] = __half2float(a[e]);
-    dumpB[lane * 8 + e] = __half2float(b[e]);
+  f16x16 a, b;
+  const int r = lane & 15;
+  for (int e = 0; e < 16; e++) {
+    a[e] = (__fp16)__half2float(A[r * 16 + e]);
+    b[e] = (__fp16)__half2float(B[r * 16 + e]);
+    dumpA[lane * 16 + e] = __half2float(A[r * 16 + e]);
+    dumpB[lane * 16 + e] = __half2float(B[r * 16 + e]);
   }
-  float8 c = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  f32x8 c = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
   for (int i = 0; i < 8; i++) dumpC[lane * 8 + i] = c[i];
 }
@@ -43,38 +43,38 @@ __global__ void wmma_probe(const __half* __restrict__ A, const __half* __restric
 static void run_one(const char* label, const __half* hA, const __half* hB) {
   __half *dA, *dB;
   float *dDA, *dDB, *dDC;
-  hipMalloc(&dA, 256 * sizeof(__half));
-  hipMalloc(&dB, 256 * sizeof(__half));
-  hipMalloc(&dDA, 256 * sizeof(float));
-  hipMalloc(&dDB, 256 * sizeof(float));
-  hipMalloc(&dDC, 256 * sizeof(float));
-  hipMemcpy(dA, hA, 256 * sizeof(__half), hipMemcpyHostToDevice);
-  hipMemcpy(dB, hB, 256 * sizeof(__half), hipMemcpyHostToDevice);
+  (void)hipMalloc(&dA, 256 * sizeof(__half));
+  (void)hipMalloc(&dB, 256 * sizeof(__half));
+  (void)hipMalloc(&dDA, 512 * sizeof(float));
+  (void)hipMalloc(&dDB, 512 * sizeof(float));
+  (void)hipMalloc(&dDC, 256 * sizeof(float));
+  (void)hipMemcpy(dA, hA, 256 * sizeof(__half), hipMemcpyHostToDevice);
+  (void)hipMemcpy(dB, hB, 256 * sizeof(__half), hipMemcpyHostToDevice);
   wmma_probe<<<1, 32>>>(dA, dB, dDA, dDB, dDC);
   hipError_t err = hipDeviceSynchronize();
   if (err != hipSuccess) {
     printf("%s: HIP error %s\n", label, hipGetErrorString(err));
     return;
   }
-  float DA[256], DB[256], DC[256];
-  hipMemcpy(DA, dDA, 256 * sizeof(float), hipMemcpyDeviceToHost);
-  hipMemcpy(DB, dDB, 256 * sizeof(float), hipMemcpyDeviceToHost);
-  hipMemcpy(DC, dDC, 256 * sizeof(float), hipMemcpyDeviceToHost);
+  float DA[512], DB[512], DC[256];
+  (void)hipMemcpy(DA, dDA, 512 * sizeof(float), hipMemcpyDeviceToHost);
+  (void)hipMemcpy(DB, dDB, 512 * sizeof(float), hipMemcpyDeviceToHost);
+  (void)hipMemcpy(DC, dDC, 256 * sizeof(float), hipMemcpyDeviceToHost);
   printf("== %s ==\n", label);
   for (int lane = 0; lane < 32; lane++) {
     printf("lane %2d A:", lane);
-    for (int e = 0; e < 8; e++) printf(" %d", (int)(DA[lane * 8 + e] * 256.f + 0.5f) - 1);
+    for (int e = 0; e < 16; e++) printf(" %d", (int)(DA[lane * 16 + e] * 256.f + 0.5f) - 1);
     printf("  B:");
-    for (int e = 0; e < 8; e++) printf(" %d", (int)(DB[lane * 8 + e] * 256.f + 0.5f) - 1);
+    for (int e = 0; e < 16; e++) printf(" %d", (int)(DB[lane * 16 + e] * 256.f + 0.5f) - 1);
     printf("  C:");
     for (int i = 0; i < 8; i++) printf(" %d", (int)(DC[lane * 8 + i] * 256.f + 0.5f) - 1);
     printf("\n");
   }
-  hipFree(dA);
-  hipFree(dB);
-  hipFree(dDA);
-  hipFree(dDB);
-  hipFree(dDC);
+  (void)hipFree(dA);
+  (void)hipFree(dB);
+  (void)hipFree(dDA);
+  (void)hipFree(dDB);
+  (void)hipFree(dDC);
 }
 
 int main() {
