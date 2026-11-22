@@ -154,18 +154,6 @@ canvas { width: 100%; height: 70px; display: block; }
       <div class="kv" id="memKv"></div>
     </div>
     <div class="card">
-      <h3>GPU <span id="gpuName"></span></h3>
-      <div class="kv" id="gpuKv"></div>
-      <canvas id="cGpu"></canvas>
-      <div class="legend"><span><i style="background:var(--hot)"></i>温度 °C</span><span><i style="background:var(--warn)"></i>電力 W</span><span><i style="background:var(--acc2)"></i>使用率 %</span><span><i style="background:var(--acc)"></i>PCIe RX GB/s ×10</span></div>
-    </div>
-    <div class="card">
-      <h3>CPU / RAM <span id="cpuName"></span></h3>
-      <div class="kv" id="cpuKv"></div>
-      <canvas id="cCpu"></canvas>
-      <div class="legend"><span><i style="background:var(--hot)"></i>温度 °C</span><span><i style="background:var(--acc2)"></i>使用率 %</span></div>
-    </div>
-    <div class="card">
       <h3>Config</h3>
       <div class="kv" id="cfgKv"></div>
     </div>
@@ -591,32 +579,6 @@ async function poll() {
     ["FFN 層: PCIe ストリーム", `${k.streamed}`],
     ["キャッシュ会話", `${k.seqs} (host 退避 ${k.seqs_offloaded}, ${fmt(k.host_mb, 0)} MiB)`],
   ]);
-  if (g.ok) {
-    $("gpuName").textContent = g.name;
-    const vp = (100 * g.mem_used_mb) / g.mem_total_mb, pp = (100 * g.power_w) / g.power_limit_w;
-    $("gpuKv").innerHTML = kvHtml([
-      ["温度", `${g.temp_c} °C · fan ${g.fan_pct} %`, [g.temp_c, heat(g.temp_c)]],
-      ["電力", `${fmt(g.power_w, 0)} / ${fmt(g.power_limit_w, 0)} W`, [pp, heat(pp)]],
-      ["使用率", `GPU ${g.util_gpu} % · mem ${g.util_mem} %`, [g.util_gpu]],
-      ["VRAM", `${fmt(g.mem_used_mb / 1024, 2)} / ${fmt(g.mem_total_mb / 1024, 1)} GiB`, [vp, heat(vp)]],
-      ["クロック", `${g.clock_gpu_mhz} MHz · mem ${g.clock_mem_mhz} MHz`],
-      ["PCIe", `Gen${g.pcie_gen} x${g.pcie_width} · RX ${fmt(g.pcie_rx_mbs / 1024, 1)} GB/s`, [(100 * g.pcie_rx_mbs / 1024) / 26]],
-    ]);
-    push(series.gpuT, g.temp_c); push(series.gpuP, g.power_w); push(series.gpuU, g.util_gpu); push(series.rx, (g.pcie_rx_mbs / 1024) * 10);
-    chart($("cGpu"), [[series.gpuT, css("--hot")], [series.gpuP, css("--warn")], [series.gpuU, css("--acc2")], [series.rx, css("--acc")]], Math.max(320, g.power_limit_w || 0));
-  } else {
-    $("gpuKv").innerHTML = kvHtml([["NVML", "取得できません"]]);
-  }
-  $("cpuName").textContent = (c.name || "").replace(/\s+\d+-Core Processor/, "");
-  const rp = (100 * c.ram_used_mb) / c.ram_total_mb;
-  $("cpuKv").innerHTML = kvHtml([
-    ["温度", `${fmt(c.temp_c, 1)} °C`, [c.temp_c, heat(c.temp_c)]],
-    ["使用率", `${fmt(c.util_pct, 0)} % (${c.threads} threads)`, [c.util_pct]],
-    ["クロック", `avg ${fmt(c.freq_avg_mhz, 0)} · max ${fmt(c.freq_max_mhz, 0)} MHz`],
-    ["RAM", `${fmt(c.ram_used_mb / 1024, 1)} / ${fmt(c.ram_total_mb / 1024, 1)} GiB`, [rp, heat(rp)]],
-  ]);
-  push(series.cpuT, c.temp_c); push(series.cpuU, c.util_pct);
-  chart($("cCpu"), [[series.cpuT, css("--hot")], [series.cpuU, css("--acc2")]], 100);
   $("cfgKv").innerHTML = kvHtml([
     ["KV 形式", cf.kv_type],
     ["MTP", cf.mtp ? `on · draft ≤ ${cf.draft_max}` : "off"],
