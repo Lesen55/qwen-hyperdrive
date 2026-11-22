@@ -98,6 +98,7 @@ jobs:
           New-Item -ItemType Directory -Force dist-hip | Out-Null
           Copy-Item build-hip\qwen35-server-hip.exe dist-hip\
           Copy-Item build-hip\qwen35-engine-hip.exe dist-hip\
+          Copy-Item build-hip\qe-wmma-spike.exe dist-hip\
           Copy-Item "$hip\bin\amdhip64_*.dll" dist-hip\
           Copy-Item "$hip\bin\amd_comgr_*.dll" dist-hip\
           Copy-Item "$hip\bin\*hipblas*.dll" dist-hip\ -ErrorAction SilentlyContinue
