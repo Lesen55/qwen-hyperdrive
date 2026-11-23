@@ -96,7 +96,9 @@ class VkModel : public IModel {
   uint32_t wg_target_ = 512;
   size_t reserve_ = 0;
   bool drop_pages_ = false;
+#ifndef _WIN32
   int model_fd_ = -1;
+#endif
   // unified memory (iGPU): weight matrices are GPU views of the mmapped model file itself (no copy,
   // no second copy in RAM); the file is split into page-aligned chunks that each hold whole tensors
   // CPU / GPU co-execution of the FFN gate / up projections on unified memory (decode and verify

@@ -31,13 +31,18 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # ---- backend-independent core: GGUF, tokenizer, chat template, sampling / generator, server helpers
-set(QE_COMMON_SRC src/gguf.cpp src/tokenizer.cpp src/chat.cpp src/json.cpp src/engine.cpp src/hwmon.cpp
+set(QE_COMMON_SRC src/gguf.cpp src/tokenizer.cpp src/chat.cpp src/json.cpp src/engine.cpp src/hwmon.cpp src/cache.cpp
                   src/websearch.cpp src/requant.cpp src/cpu_ffn.cpp src/model_config.cpp)
 add_library(qecommon STATIC ${QE_COMMON_SRC})
 target_include_directories(qecommon PUBLIC src)
 target_compile_options(qecommon PRIVATE ${QE_CPU_FLAGS} -Wall -Wno-unused-function)
 set_target_properties(qecommon PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(qecommon PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+if(WIN32)
+  find_library(QE_POWER_LIBRARY NAMES PowrProf HINTS ENV LIB REQUIRED)
+  find_library(QE_WINSOCK_LIBRARY NAMES ws2_32 HINTS ENV LIB REQUIRED)
+  target_link_libraries(qecommon PUBLIC ${QE_POWER_LIBRARY})
+endif()
 
 # web UI: web/index.html embedded as a raw string (re-generated when the file changes)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/web/index.html)
@@ -53,25 +58,12 @@ function(qe_frontends suffix backend)
   target_include_directories(qwen35-server${suffix} PRIVATE ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(qwen35-server${suffix} PRIVATE ${backend})
   if(WIN32)  # Winsock for the server's HTTP sockets
-    target_link_libraries(qwen35-server${suffix} PRIVATE ws2_32)
+    target_link_libraries(qwen35-server${suffix} PRIVATE ${QE_WINSOCK_LIBRARY})
   endif()
   target_compile_options(qwen35-server${suffix} PRIVATE ${QE_CPU_FLAGS})
-  if(QE_CUDA AND WIN32)
-    # CMake emits bare .lib names for the CUDA runtime (cudart_static,
-    # cudadevrt) and ws2_32; the clang/GNU-style driver cannot resolve those
-    # as linker inputs. Let nvcc (MSVC host) drive the link instead.
+  if(WIN32 AND backend STREQUAL "qecore")
+    # Use nvcc's MSVC linker for the CUDA runtime's bare .lib names.
     set_target_properties(qwen35-engine${suffix} qwen35-server${suffix} PROPERTIES LINKER_LANGUAGE CUDA)
-    # The clang-compiled CPU objects reference __cpu_model/__cpu_features2
-    # (__builtin_cpu_supports), which live in compiler-rt builtins. The clang
-    # driver adds that library automatically; the nvcc-driven link does not.
-    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-resource-dir
-      OUTPUT_VARIABLE QE_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
-    find_library(QE_CLANG_BUILTINS NAMES clang_rt.builtins-x86_64
-      HINTS "${QE_CLANG_RESOURCE_DIR}/lib/windows" NO_DEFAULT_PATH)
-    if(QE_CLANG_BUILTINS)
-      target_link_libraries(qwen35-engine${suffix} PRIVATE ${QE_CLANG_BUILTINS})
-      target_link_libraries(qwen35-server${suffix} PRIVATE ${QE_CLANG_BUILTINS})
-    endif()
   endif()
   install(TARGETS qwen35-engine${suffix} qwen35-server${suffix} RUNTIME DESTINATION bin)
 endfunction()
@@ -79,11 +71,16 @@ endfunction()
 # ---- CUDA backend
 if(QE_CUDA)
   find_package(CUDAToolkit REQUIRED)
+  if(WIN32)
+    set(QE_NVCC_HOST_FLAGS -Xcompiler=/arch:AVX2)
+  else()
+    set(QE_NVCC_HOST_FLAGS -Xcompiler=-mavx2,-mfma,-mf16c)
+  endif()
   add_library(qecore STATIC src/model.cpp src/backend_cuda.cpp src/kernels.cu src/inkling.cpp src/inkling_dspark.cpp src/inkling_kernels.cu)
   target_include_directories(qecore PUBLIC src)
   target_compile_options(qecore PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${QE_CPU_FLAGS} -Wall -Wno-unused-function>
-    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -lineinfo --expt-relaxed-constexpr -Xcompiler=-mavx2,-mfma,-mf16c>)
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -lineinfo --expt-relaxed-constexpr ${QE_NVCC_HOST_FLAGS}>)
   set_target_properties(qecore PROPERTIES CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(qecore PUBLIC qecommon CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   qe_frontends("" qecore)
@@ -95,6 +92,9 @@ if(QE_CUDA)
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE qecore)
     target_compile_options(${n} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${QE_CPU_FLAGS}>)
+    if(WIN32)
+      set_target_properties(${n} PROPERTIES LINKER_LANGUAGE CUDA)
+    endif()
   endforeach()
 endif()
 

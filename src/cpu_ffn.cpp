@@ -11,7 +11,7 @@
 #include <windows.h>
 #include <intrin.h>
 
-#include <thread>
+#include <bit>
 #else
 #include <pthread.h>
 #include <sched.h>
@@ -213,7 +213,7 @@ void r4_convert(uint32_t type, const uint8_t* src, size_t src_rb, int K, int N, 
 // checks directly (with the OS XCR0 state checks the builtin also performs).
 static bool qe_cpu_has(const char* name) {
   struct Feats {
-    bool avx2, fma, f16c, avxvnni, avx512f, avx512bw, avx512vl, avx512vnni, avx512bf16, avxvnniint8, amx_int8;
+    bool avx2, fma, f16c, bmi2, avxvnni, avx512f, avx512bw, avx512vl, avx512vnni, avx512bf16, avxvnniint8, amx_int8;
   };
   static const Feats ft = [] {
     Feats f{};
@@ -224,7 +224,7 @@ static bool qe_cpu_has(const char* name) {
     if (max_leaf >= 1) __cpuidex(l1, 1, 0);
     if (max_leaf >= 7) {
       __cpuidex(l7, 7, 0);
-      __cpuidex(l7s1, 7, 1);
+      if (l7[0] >= 1) __cpuidex(l7s1, 7, 1);
     }
     const bool osxsave = (l1[2] >> 27) & 1;
     const unsigned long long xcr0 = osxsave ? (unsigned long long)_xgetbv(0) : 0;
@@ -233,6 +233,7 @@ static bool qe_cpu_has(const char* name) {
     f.fma = ((l1[2] >> 12) & 1) && os_avx;
     f.f16c = ((l1[2] >> 29) & 1) && os_avx;
     f.avx2 = ((l7[1] >> 5) & 1) && os_avx;
+    f.bmi2 = (l7[1] >> 8) & 1;
     f.avxvnni = ((l7s1[0] >> 4) & 1) && os_avx;
     f.avx512f = ((l7[1] >> 16) & 1) && os_512;
     f.avx512bw = ((l7[1] >> 30) & 1) && os_512;
@@ -246,6 +247,7 @@ static bool qe_cpu_has(const char* name) {
   if (!strcmp(name, "avx2")) return ft.avx2;
   if (!strcmp(name, "fma")) return ft.fma;
   if (!strcmp(name, "f16c")) return ft.f16c;
+  if (!strcmp(name, "bmi2")) return ft.bmi2;
   if (!strcmp(name, "avxvnni")) return ft.avxvnni;
   if (!strcmp(name, "avx512f")) return ft.avx512f;
   if (!strcmp(name, "avx512bw")) return ft.avx512bw;
@@ -262,6 +264,11 @@ static bool qe_cpu_has(const char* name) {
 #define QE_CPU_INIT() __builtin_cpu_init()
 #define QE_CPU_HAS(name) __builtin_cpu_supports(name)
 #endif
+bool baseline_supported() {
+  QE_CPU_INIT();
+  return QE_CPU_HAS("avx2") && QE_CPU_HAS("fma") && QE_CPU_HAS("f16c") && QE_CPU_HAS("bmi2");
+}
+
 static Isa detect_isa() {
   QE_CPU_INIT();
   const bool a512 = QE_CPU_HAS("avx512f") && QE_CPU_HAS("avx512bw") &&
@@ -351,6 +358,42 @@ void matvec(uint32_t type, const uint8_t* W, size_t rb, int K, int r0, int r1, c
 // One logical CPU per physical core (SMT siblings share the core's load ports and caches), fastest
 // cores first: Intel hybrid parts list their P-cores in /sys/devices/cpu_core/cpus, other systems
 // may report cpu_capacity; ties keep the CPU numbering.
+#ifdef _WIN32
+struct WindowsCore {
+  int cpu;
+  unsigned efficiency;
+};
+
+static const std::vector<WindowsCore>& windows_cores() {
+  static const auto cores = [] {
+    std::vector<WindowsCore> result;
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    std::vector<uint64_t> storage((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    auto* data = reinterpret_cast<unsigned char*>(storage.data());
+    if (!bytes || !GetLogicalProcessorInformationEx(RelationProcessorCore,
+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(data), &bytes)) return result;
+    DWORD_PTR process_mask = ~DWORD_PTR{0};
+    if (GetActiveProcessorGroupCount() == 1) {
+      DWORD_PTR process = 0, system = 0;
+      if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) process_mask = process;
+    }
+    for (DWORD offset = 0; offset < bytes;) {
+      const auto& entry = *reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(data + offset);
+      const auto& core = entry.Processor;
+      const auto& group = core.GroupMask[0];  // a physical core belongs to one processor group
+      const KAFFINITY mask = group.Mask & process_mask;
+      if (mask) result.push_back({int(group.Group) * 64 + std::countr_zero(mask), core.EfficiencyClass});
+      offset += entry.Size;
+    }
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+      return a.efficiency == b.efficiency ? a.cpu < b.cpu : a.efficiency > b.efficiency;
+    });
+    return result;
+  }();
+  return cores;
+}
+#else
 static std::vector<int> read_cpu_list(const char* path) {
   std::vector<int> v;
   FILE* f = fopen(path, "r");
@@ -370,13 +413,12 @@ static std::vector<int> read_cpu_list(const char* path) {
   }
   return v;
 }
+#endif
 const std::vector<int>& core_order() {
   static const std::vector<int> order = [] {
 #ifdef _WIN32
-    // no /sys topology on Windows: all logical CPUs, in order (no SMT / hybrid ranking in v1)
-    const unsigned n = std::thread::hardware_concurrency();
     std::vector<int> o;
-    for (unsigned i = 0; i < (n ? n : 1); i++) o.push_back((int)i);
+    for (const auto& core : windows_cores()) o.push_back(core.cpu);
     return o;
 #else
     std::vector<int> online = read_cpu_list("/sys/devices/system/cpu/online");
@@ -415,6 +457,14 @@ const std::vector<int>& core_order() {
 // cores finish their row share last and the whole job waits for them (Core Ultra 5 228V: 4 P-cores
 // 57.6 GB/s, all 8 cores 19.3 GB/s).
 int fast_cores() {
+#ifdef _WIN32
+  const auto& cores = windows_cores();
+  if (cores.empty()) return std::max(1u, std::thread::hardware_concurrency());
+  static const int n = (int)std::count_if(cores.begin(), cores.end(), [&](const auto& core) {
+    return core.efficiency == cores.front().efficiency;
+  });
+  return n;
+#else
   static const int n = [] {
     const std::vector<int> pcores = read_cpu_list("/sys/devices/cpu_core/cpus");
     const std::vector<int>& order = core_order();
@@ -436,6 +486,7 @@ int fast_cores() {
     return std::max(1, k ? k : (int)order.size());
   }();
   return n;
+#endif
 }
 
 ThreadPool::ThreadPool(int n) : n_(n) {
@@ -471,7 +522,10 @@ void ThreadPool::worker(int idx) {
     if (!order.empty()) {
       const int cpu = order[idx % order.size()];
 #ifdef _WIN32
-      if (cpu < 64) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpu);
+      GROUP_AFFINITY affinity{};
+      affinity.Group = (WORD)(cpu / 64);
+      affinity.Mask = KAFFINITY{1} << (cpu % 64);
+      SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr);
 #else
       cpu_set_t cs;
       CPU_ZERO(&cs);

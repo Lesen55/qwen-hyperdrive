@@ -1,10 +1,5 @@
-#include <set>
-#include <thread>
 #include <sys/stat.h>
-#ifdef _WIN32
-#include <direct.h>
-#define mkdir(path, mode) _mkdir(path)  // MSVC CRT has no POSIX mkdir
-#endif
+#include "cache.h"
 #include "model.h"
 #include "requant.h"
 
@@ -90,36 +85,11 @@ Model::Model(const EngineOptions& opt) : opt_(opt) {
   plan_and_load();
 }
 
-// Host-side machine parameters the planner uses: physical cores, PCIe host->device bandwidth and DRAM
-// read bandwidth, measured at start-up unless given explicitly (they decide the CPU/GPU split).
-static int physical_cores() {
-#ifdef _WIN32
-  return (int)std::thread::hardware_concurrency();  // no /sys topology on Windows
-#else
-  std::set<std::pair<int, int>> cores;
-  for (int cpu = 0; cpu < 1024; cpu++) {
-    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
-    FILE* f1 = fopen((base + "core_id").c_str(), "r");
-    if (!f1) break;
-    int core = -1, pkg = 0;
-    if (fscanf(f1, "%d", &core) != 1) core = cpu;
-    fclose(f1);
-    if (FILE* f2 = fopen((base + "physical_package_id").c_str(), "r")) {
-      if (fscanf(f2, "%d", &pkg) != 1) pkg = 0;
-      fclose(f2);
-    }
-    cores.insert({pkg, core});
-  }
-  return cores.empty() ? (int)std::thread::hardware_concurrency() : (int)cores.size();
-#endif
-}
-
 void Model::calibrate_host() {
-  if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c") ||
-      !__builtin_cpu_supports("bmi2"))
+  if (!cpu::baseline_supported())
     QE_FATAL("CPU without AVX2/FMA/F16C/BMI2 (x86-64-v3) is not supported");
   // big cores only on hybrid CPUs (P-cores; the E-cores would hold every parallel matvec back)
-  if (opt_.cpu_threads <= 0) opt_.cpu_threads = std::clamp(std::min(physical_cores(), cpu::fast_cores()), 1, 32);
+  if (opt_.cpu_threads <= 0) opt_.cpu_threads = std::clamp(cpu::fast_cores(), 1, 32);
   if (opt_.pcie_gbps <= 0) {
     const size_t n = 256ull << 20;
     void* h = nullptr;
@@ -144,21 +114,21 @@ void Model::calibrate_host() {
     measured_pcie_ = gbps;
   }
   if (opt_.dram_gbps <= 0) {
-    const size_t n = 512ull << 20, nt = std::max(1, opt_.cpu_threads);
+    const size_t n = 512ull << 20;
+    const int nt = std::max(1, opt_.cpu_threads);
     std::vector<uint64_t> buf(n / 8, 1);
     std::vector<uint64_t> sums(nt);
+    cpu::ThreadPool workers(nt);
     double best = 1e9;
     for (int rep = 0; rep < 3; rep++) {
       const double t0 = qe_now();
-      std::vector<std::thread> th;
-      for (size_t t = 0; t < nt; t++)
-        th.emplace_back([&, t] {
-          const size_t a = buf.size() * t / nt, b = buf.size() * (t + 1) / nt;
-          uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-          for (size_t i = a; i + 3 < b; i += 4) { s0 += buf[i]; s1 += buf[i + 1]; s2 += buf[i + 2]; s3 += buf[i + 3]; }
-          sums[t] = s0 + s1 + s2 + s3;
-        });
-      for (auto& x : th) x.join();
+      workers.start([&](int t) {
+        const size_t a = buf.size() * t / nt, b = buf.size() * (t + 1) / nt;
+        uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        for (size_t i = a; i + 3 < b; i += 4) { s0 += buf[i]; s1 += buf[i + 1]; s2 += buf[i + 2]; s3 += buf[i + 3]; }
+        sums[t] = s0 + s1 + s2 + s3;
+      });
+      workers.wait();
       best = std::min(best, qe_now() - t0);
     }
     opt_.dram_gbps = n / best / 1e9;
@@ -192,13 +162,16 @@ void Model::requant_mtp() {
   // cache keyed by the model file identity
   struct stat st{};
   stat(opt_.model_path.c_str(), &st);
-  const char* xdg = getenv("XDG_CACHE_HOME");
-  const std::string dir = xdg && *xdg ? std::string(xdg) + "/qwen-hyperdrive" : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/.cache/qwen-hyperdrive";
-  const std::string path = dir + (ffn_only ? "/mtp-ffn-iq4xs-v1-" : "/mtp-iq4xs-v1-") + std::to_string((long long)st.st_size) + "-" + std::to_string((long long)st.st_mtime) + ".bin";
+  const auto dir = cache_directory();
+  std::filesystem::path path;
+  if (!dir.empty() && stat(opt_.model_path.c_str(), &st) == 0) {
+    const char* prefix = ffn_only ? "mtp-ffn-iq4xs-v1-" : "mtp-iq4xs-v1-";
+    path = dir / (prefix + std::to_string((long long)st.st_size) + "-" + std::to_string((long long)st.st_mtime) + ".bin");
+  }
   requant_store_.emplace_back(total);
   uint8_t* buf = requant_store_.back().data();
   bool cached = false;
-  if (FILE* f = fopen(path.c_str(), "rb")) {
+  if (FILE* f = open_cache_file(path)) {
     cached = fread(buf, 1, total, f) == total && fgetc(f) == EOF;
     fclose(f);
   }
@@ -213,15 +186,7 @@ void Model::requant_mtp() {
     m->host = buf + off;
     off += m->bytes;
   }
-  if (!cached) {
-    mkdir(dir.c_str(), 0755);
-    const std::string tmp = path + ".tmp";
-    if (FILE* f = fopen(tmp.c_str(), "wb")) {
-      const bool ok = fwrite(buf, 1, total, f) == total;
-      fclose(f);
-      if (ok) rename(tmp.c_str(), path.c_str());
-    }
-  }
+  if (!cached) write_cache_file(path, buf, total);
   QE_LOG("[plan] MTP block Q6_K -> IQ4_XS: %.0f -> %.0f MiB (%s, %.1f s)\n", before / (double)MiB, total / (double)MiB,
          cached ? "cached" : "requantized", qe_now() - t0);
 }

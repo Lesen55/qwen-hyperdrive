@@ -1,6 +1,5 @@
 #pragma once
-// Hardware telemetry for the web UI: GPU via NVML (dlopen'ed at runtime, no build dependency),
-// CPU / RAM via /proc and /sys.
+// Hardware telemetry for the web UI: GPU via NVML loaded at runtime, CPU and RAM via OS APIs.
 #include <string>
 
 struct GpuStats {

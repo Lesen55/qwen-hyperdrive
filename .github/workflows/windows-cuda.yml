@@ -51,7 +51,7 @@ jobs:
             -DCMAKE_CUDA_HOST_COMPILER="$cl" `
             -DCMAKE_BUILD_TYPE=Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --parallel --target qwen35-server qwen35-engine
+          cmake --build build --parallel --target qwen35-server qwen35-engine qe_test_cpu qe_ink_spec_test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package

@@ -4,11 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#ifdef _WIN32
-#include <filesystem>
-#include <system_error>
-#endif
-
+#include "cache.h"
 #include "common.h"
 #include "spv_all.h"
 
@@ -282,15 +278,11 @@ VkCtx::VkCtx() {
   }
   // pipeline cache on disk: ~/.cache/qwen-hyperdrive/vk-<vendor>-<device>-<driver>.bin
   std::vector<char> blob;
-  const char* home_env = getenv("HOME");
-#ifdef _WIN32
-  if (!home_env) home_env = getenv("USERPROFILE");
-#endif
-  if (const char* home = home_env) {
+  if (const auto dir = cache_directory(); !dir.empty()) {
     char nm[128];
     snprintf(nm, sizeof nm, "vk-%x-%x-%x.bin", p2.properties.vendorID, p2.properties.deviceID, p2.properties.driverVersion);
-    cache_path_ = std::string(home) + "/.cache/qwen-hyperdrive/" + nm;
-    if (FILE* f = fopen(cache_path_.c_str(), "rb")) {
+    cache_path_ = dir / nm;
+    if (FILE* f = open_cache_file(cache_path_)) {
       fseek(f, 0, SEEK_END);
       blob.resize((size_t)std::max(0L, ftell(f)));
       fseek(f, 0, SEEK_SET);
@@ -419,19 +411,7 @@ void VkCtx::warm_pipelines() {
     vkGetPipelineCacheData(dev_, cache_, &n, nullptr);
     std::vector<char> blob(n);
     if (n && vkGetPipelineCacheData(dev_, cache_, &n, blob.data()) == VK_SUCCESS) {
-      const std::string dir = cache_path_.substr(0, cache_path_.rfind('/'));
-#ifdef _WIN32
-      std::error_code ec;
-      std::filesystem::create_directories(dir, ec);
-#else
-      (void)!system(("mkdir -p '" + dir + "'").c_str());
-#endif
-      const std::string tmp = cache_path_ + ".tmp";
-      if (FILE* f = fopen(tmp.c_str(), "wb")) {
-        const bool ok = fwrite(blob.data(), 1, n, f) == n;
-        fclose(f);
-        if (ok) rename(tmp.c_str(), cache_path_.c_str());
-      }
+      write_cache_file(cache_path_, blob.data(), n);
     }
   }
   QE_DBG("[vk] %zu pipelines ready in %.0f ms\n", sizeof(kSpv) / sizeof(kSpv[0]), (qe_now() - t0) * 1e3);

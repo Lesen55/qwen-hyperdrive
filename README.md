@@ -236,7 +236,8 @@ LLM_ENGINE_BACKEND=vulkan ./hd/bin/llm-engine -m model.gguf --port 8080
 ## 制限
 
 - 対象アーキテクチャは `qwen35`（Qwen3.5/3.8 系 dense ハイブリッド、注意ヘッド次元 256・DeltaNet 状態 128）のみ。
-- 動作環境は Linux（x86-64-v3 以上）のみ。
+- 動作環境は Linux と Windows（x86-64-v3 以上）。Windows のビルド手順は [CUDA](.github/workflows/windows-cuda.yml) と [Vulkan](.github/workflows/windows-vulkan.yml) のワークフローを参照。
+- Windows の Vulkan はモデル重みを GPU バッファにコピーする。内蔵 GPU ではコピー済みページをプロセスのワーキングセットから外す。ディスクリート GPU でも `QE_VK_DROP_PAGES=1` で同じ動作を有効にできる。
 - Vulkan 版は CPU への FFN 分担（ストリーミング + CPU 計算）を持たない。ただしユニファイドメモリでの同時実行はある。KV は q8 / f16 のみ。
 - RX 7900 XTX など AMD GPU は、仕組み（判別・自動調整）だけで実機未確認。
 - 同時処理は 1 リクエスト（サーバーは直列化、WebUI は順番待ち中に「待機中」と表示）。

@@ -4,6 +4,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -110,7 +111,7 @@ class VkCtx {
   VkFence fence_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
   VkPipelineCache cache_ = VK_NULL_HANDLE;
-  std::string cache_path_;  // on-disk pipeline cache (per device + driver version)
+  std::filesystem::path cache_path_;  // on-disk pipeline cache (per device + driver version)
   std::map<std::pair<std::string, PipeOpt>, VkPipeline> pipes_;
   VkPhysicalDeviceMemoryProperties mprops_{};
   bool budget_ext_ = false;

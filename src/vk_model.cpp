@@ -4,18 +4,15 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#else
+#include "win_compat.h"
 #endif
-#include <immintrin.h>
-#ifdef _WIN32
-#include <filesystem>
-#include <system_error>
-#endif
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
 
+#include "cache.h"
 #include "common.h"
 #include "gguf.h"
 #include "quant.h"
@@ -136,14 +133,14 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   // unified memory: use the weights in place from the mapped model file (QE_VK_ZEROCOPY=1, experimental)
   // opt-in only: Mesa ANV cannot pin read-only file pages and loses the device when the import fails
 #ifdef _WIN32
-  // no zero-copy import of the mapped file and no page-cache dropping on Windows (v1):
-  // weights always go through the copy path into GPU buffers
+  // Windows drivers do not have a validated path for importing the read-only file mapping.
   zero_copy_ = false;
-  drop_pages_ = false;
 #else
   zero_copy_ = vk_->host_import && getenv("QE_VK_ZEROCOPY") && atoi(getenv("QE_VK_ZEROCOPY")) != 0;
   if (zero_copy_) zc_plan();
+#endif
   drop_pages_ = !zero_copy_ && (vk_->integrated || getenv("QE_VK_DROP_PAGES"));
+#ifndef _WIN32
   if (drop_pages_) model_fd_ = open(opt.model_path.c_str(), O_RDONLY);
 #endif
 
@@ -405,14 +402,22 @@ bool VkModel::zc_view(const uint8_t* data, size_t bytes, VBuf& out) {
   return true;
 }
 
-// iGPU: once a tensor is in GPU memory (= system RAM), drop the model file's page-cache copy of it so
-// the weights are not held twice (32 GB Arc 130V laptops); token_embd stays mapped for embedding
+// On integrated GPUs, release the uploaded weight pages so the file mapping and
+// GPU buffers do not both consume the process's working set. Keep the mapping readable.
 void VkModel::release_pages(const void* p, size_t n) {
+  if (!drop_pages_ || !n) return;
 #ifdef _WIN32
-  (void)p;
-  (void)n;  // no page-cache management in the Windows port
+  static const uintptr_t page = [] {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+  }();
+  const uintptr_t start = ((uintptr_t)p + page - 1) / page * page;
+  const uintptr_t end = ((uintptr_t)p + n) / page * page;
+  // On unlocked pages Windows trims the working set and returns ERROR_NOT_LOCKED.
+  if (end > start) VirtualUnlock(reinterpret_cast<void*>(start), end - start);
 #else
-  if (model_fd_ < 0 || !n) return;
+  if (model_fd_ < 0) return;
   const uintptr_t pg = 4096, a = ((uintptr_t)p + pg - 1) & ~(pg - 1), e = ((uintptr_t)p + n) & ~(pg - 1);
   if (e > a) madvise((void*)a, e - a, MADV_DONTNEED);
   posix_fadvise(model_fd_, (off_t)((const uint8_t*)p - gguf_->base()), (off_t)n, POSIX_FADV_DONTNEED);
@@ -555,11 +560,8 @@ void VkModel::autotune() {
   snprintf(key, sizeof key, "vk-tune-v4-%x-%x-%x-%s%dx%d-%s%dx%d-ub%d", vk_->vendor_id, vk_->device_id,
            vk_->driver_version, type_tag(mats[0]->type), mats[0]->N, mats[0]->K, type_tag(mats[1]->type), mats[1]->N,
            mats[1]->K, ub_);
-  const char* home = getenv("HOME");
-#ifdef _WIN32
-  if (!home) home = getenv("USERPROFILE");
-#endif
-  const std::string path = home ? std::string(home) + "/.cache/qwen-hyperdrive/" + key + ".txt" : "";
+  const auto dir = cache_directory();
+  const auto path = dir.empty() ? dir : dir / (std::string(key) + ".txt");
   // cooperative-matrix shapes this device offers (preferred order per vendor: Intel XMX is 8 x 16 x 16)
   std::vector<std::string> cms;
   {
@@ -581,7 +583,7 @@ void VkModel::autotune() {
     return;
   }
   if (!path.empty() && !getenv("QE_VK_RETUNE")) {
-    if (FILE* f = fopen(path.c_str(), "r")) {
+    if (FILE* f = open_cache_file(path)) {
       char g[64] = "";
       Tune t;
       int coop = 0, i8 = 0;
@@ -745,17 +747,11 @@ void VkModel::autotune() {
                    std::to_string(tune_.cm_r) + ": " + std::to_string((int)c4) + " us)").c_str(),
          tune_.gemm.c_str(), best * 1e3, ub_);
   if (!path.empty()) {
-#ifdef _WIN32
-    std::error_code ec;
-    std::filesystem::create_directories(path.substr(0, path.rfind('/')), ec);
-#else
-    (void)!system(("mkdir -p '" + path.substr(0, path.rfind('/')) + "'").c_str());
-#endif
-    if (FILE* f = fopen(path.c_str(), "w")) {
-      fprintf(f, "%d %d %u %d %d %d %d %d %d %d %d %s\n", tune_.mv_teams, tune_.mv_r, tune_.mv_sg, tune_.mm_teams, tune_.mm_r,
-              tune_.coop ? 1 : 0, tune_.c_teams, tune_.c_r, tune_.cm_teams, tune_.cm_r, tune_.i8 ? 1 : 0, tune_.gemm.c_str());
-      fclose(f);
-    }
+    char line[256];
+    const int len = snprintf(line, sizeof line, "%d %d %u %d %d %d %d %d %d %d %d %s\n", tune_.mv_teams, tune_.mv_r,
+                             tune_.mv_sg, tune_.mm_teams, tune_.mm_r, tune_.coop ? 1 : 0, tune_.c_teams, tune_.c_r,
+                             tune_.cm_teams, tune_.cm_r, tune_.i8 ? 1 : 0, tune_.gemm.c_str());
+    if (len > 0 && (size_t)len < sizeof line) write_cache_file(path, line, (size_t)len);
   }
 }
 
