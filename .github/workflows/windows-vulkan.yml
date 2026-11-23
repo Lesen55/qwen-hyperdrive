@@ -1,13 +1,12 @@
 name: windows-vulkan
 
 on:
-  push:
-    branches: [windows-port]
-  workflow_dispatch:
+  workflow_call:
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -54,14 +53,14 @@ jobs:
         shell: pwsh
         run: cmake --build build --parallel
 
+      - name: Package
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Backend vulkan -BuildDirectory build -OutputDirectory dist
+
       - name: Upload executables
         uses: actions/upload-artifact@v4
         with:
-          name: qwen-hyperdrive-windows-vulkan
-          path: |
-            build/qwen35-server-vk.exe
-            build/qwen35-engine-vk.exe
-            build/qe_vk_test.exe
-            build/qe_test_cpu.exe
-            scripts/start-server.bat
+          name: qwen-hyperdrive-windows-vulkan-x64
+          path: dist/qwen-hyperdrive-windows-vulkan-x64.zip
+          compression-level: 0
           if-no-files-found: error

@@ -178,6 +178,15 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 開発: `nix develop` → `cmake -S . -B build -G Ninja && ninja -C build`。
 CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）。
 
+### Windows バイナリ
+
+`winport` への push と `main` 向け PR で、[Windows builds](.github/workflows/windows-distribution.yml) が ZIP を生成する。`winport` 上のコミットに `winport-v*` タグを付けて push すると、両ビルドが成功した時点で ZIP と SHA-256 を GitHub Releases のプレリリースに公開する。
+
+- **CUDA x64** — Ampere、Ada、Hopper、Blackwell（SM 80 / 86 / 89 / 90 / 100 / 120）。CUDA 12.8 のランタイム DLL を同梱する。対応する NVIDIA ドライバーを使用する。
+- **Vulkan x64** — Vulkan 1.2 と必要なサブグループ機能を備えた AMD・Intel・NVIDIA GPU 向け。GPU に合ったカーネルを起動時に自動選択する。
+
+Visual C++ 再頒布可能パッケージ（x64）とモデルの GGUF を用意し、展開したフォルダーで `qwen35-server.exe -m model.gguf` または `qwen35-server-vk.exe -m model.gguf` を実行する。
+
 Vulkan（AMD / Intel など）:
 
 ```sh
