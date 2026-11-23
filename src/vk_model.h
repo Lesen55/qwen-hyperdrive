@@ -36,6 +36,7 @@ class VkModel : public IModel {
   void forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax = nullptr,
                bool snapshot = false, bool mtp_prefill = false) override;
   void reset() override;
+  void set_cancel(const std::atomic<bool>* c) override { cancel_ = c; }
   void prepare_context(int npos, bool small_prefill = false) override;
   int seq_create() override { cur_seq_ = ++next_seq_; return cur_seq_; }
   void seq_select(int id) override { QE_ASSERT_SEQ(id); }
@@ -49,6 +50,7 @@ class VkModel : public IModel {
   PlanStats plan_stats() const override { return plan_; }
 
  private:
+  const std::atomic<bool>* cancel_ = nullptr;
   static constexpr int kCkSlots = 4;
   static constexpr int kLogitRows = 16;  // logits rows computed per submission
   struct VMat {

@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
+#include <filesystem>
+#include <system_error>
+#endif
 
 #include "common.h"
 #include "spv_all.h"
@@ -278,7 +282,11 @@ VkCtx::VkCtx() {
   }
   // pipeline cache on disk: ~/.cache/qwen-hyperdrive/vk-<vendor>-<device>-<driver>.bin
   std::vector<char> blob;
-  if (const char* home = getenv("HOME")) {
+  const char* home_env = getenv("HOME");
+#ifdef _WIN32
+  if (!home_env) home_env = getenv("USERPROFILE");
+#endif
+  if (const char* home = home_env) {
     char nm[128];
     snprintf(nm, sizeof nm, "vk-%x-%x-%x.bin", p2.properties.vendorID, p2.properties.deviceID, p2.properties.driverVersion);
     cache_path_ = std::string(home) + "/.cache/qwen-hyperdrive/" + nm;
@@ -412,7 +420,12 @@ void VkCtx::warm_pipelines() {
     std::vector<char> blob(n);
     if (n && vkGetPipelineCacheData(dev_, cache_, &n, blob.data()) == VK_SUCCESS) {
       const std::string dir = cache_path_.substr(0, cache_path_.rfind('/'));
+#ifdef _WIN32
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+#else
       (void)!system(("mkdir -p '" + dir + "'").c_str());
+#endif
       const std::string tmp = cache_path_ + ".tmp";
       if (FILE* f = fopen(tmp.c_str(), "wb")) {
         const bool ok = fwrite(blob.data(), 1, n, f) == n;

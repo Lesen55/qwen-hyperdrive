@@ -1,9 +1,13 @@
 #include "gguf.h"
 
+#ifdef _WIN32
+#include "win_compat.h"
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <chrono>
 
@@ -110,6 +114,16 @@ struct Reader {
 }  // namespace
 
 GGUFFile::GGUFFile(const std::string& path) : path_(path) {
+#ifdef _WIN32
+  auto* m = new QeFileMapping();
+  if (!qe_map_file_readonly(path.c_str(), *m)) {
+    delete m;
+    QE_FATAL("cannot open %s", path.c_str());
+  }
+  win_map_ = m;
+  size_ = m->size;
+  base_ = m->base;
+#else
   fd_ = open(path.c_str(), O_RDONLY);
   if (fd_ < 0) QE_FATAL("cannot open %s", path.c_str());
   struct stat st;
@@ -117,6 +131,7 @@ GGUFFile::GGUFFile(const std::string& path) : path_(path) {
   size_ = st.st_size;
   base_ = (uint8_t*)mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
   if (base_ == MAP_FAILED) QE_FATAL("mmap failed for %s", path.c_str());
+#endif
   Reader r{base_, base_ + size_};
   if (r.rd<uint32_t>() != 0x46554747u) QE_FATAL("%s is not a GGUF file", path.c_str());
   uint32_t ver = r.rd<uint32_t>();
@@ -150,8 +165,17 @@ GGUFFile::GGUFFile(const std::string& path) : path_(path) {
 }
 
 GGUFFile::~GGUFFile() {
+#ifdef _WIN32
+  if (win_map_) {
+    auto* m = (QeFileMapping*)win_map_;
+    qe_unmap_file(*m);
+    delete m;
+    win_map_ = nullptr;
+  }
+#else
   if (base_ && base_ != MAP_FAILED) munmap(base_, size_);
   if (fd_ >= 0) close(fd_);
+#endif
 }
 
 const GGUFValue* GGUFFile::get(const std::string& key) const {

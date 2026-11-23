@@ -5,6 +5,24 @@
 //   GET  /            web UI (chat + live hardware / engine dashboard)
 //   GET  /api/stats   telemetry for the web UI
 //   GET  /api/search?q=...&n=5&fetch=3   web search (DuckDuckGo) + page text for the UI
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <BaseTsd.h>
+#include <signal.h>
+typedef SSIZE_T ssize_t;
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0  // no SIGPIPE on Windows sockets
+#endif
+using QeSock = SOCKET;
+inline void qe_close_sock(QeSock s) { closesocket(s); }
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -12,6 +30,9 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+using QeSock = int;
+inline void qe_close_sock(QeSock s) { close(s); }
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -36,17 +57,18 @@
 #include "json.h"
 #include "tokenizer.h"
 
-// true when the peer has closed the connection (EOF or reset) - checked without blocking
-static bool client_gone(int fd) {
-  pollfd p{fd, (short)(POLLIN | POLLRDHUP), 0};
+// A receive-side EOF can still leave the peer reading our response.
+static bool client_gone(QeSock fd) {
+#ifdef _WIN32
+  WSAPOLLFD p{fd, POLLWRNORM, 0};
+  if (WSAPoll(&p, 1, 0) <= 0) return false;
+  // Winsock also reports POLLHUP when the peer only shuts down its send side.
+  return (p.revents & (POLLERR | POLLNVAL)) != 0;
+#else
+  pollfd p{fd, 0, 0};
   if (poll(&p, 1, 0) <= 0) return false;
-  if (p.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL)) return true;
-  if (p.revents & POLLIN) {
-    char c;
-    const ssize_t r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
-    return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
-  }
-  return false;
+  return (p.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+#endif
 }
 
 
@@ -58,17 +80,17 @@ struct Request {
   std::string body;
 };
 
-bool send_all(int fd, const std::string& s) {
+bool send_all(QeSock fd, const std::string& s) {
   size_t off = 0;
   while (off < s.size()) {
-    const ssize_t n = send(fd, s.data() + off, s.size() - off, MSG_NOSIGNAL);
+    const ssize_t n = send(fd, s.data() + off, (int)(s.size() - off), MSG_NOSIGNAL);
     if (n <= 0) return false;
     off += n;
   }
   return true;
 }
 
-bool read_request(int fd, Request& rq) {
+bool read_request(QeSock fd, Request& rq) {
   std::string buf;
   char tmp[65536];
   size_t hdr_end = std::string::npos;
@@ -105,7 +127,7 @@ bool read_request(int fd, Request& rq) {
 const char* kCors =
     "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
 
-void respond(int fd, int code, const std::string& body, const char* ctype = "application/json") {
+void respond(QeSock fd, int code, const std::string& body, const char* ctype = "application/json") {
   const char* msg = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error";
   send_all(fd, "HTTP/1.1 " + std::to_string(code) + " " + msg + "\r\nContent-Type: " + ctype +
                    "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n" + kCors + "Connection: close\r\n\r\n" + body);
@@ -333,9 +355,9 @@ struct Server {
     return sp;
   }
 
-  void handle(int fd) {
+  void handle(QeSock fd) {
     Request rq;
-    if (!read_request(fd, rq)) { close(fd); return; }
+    if (!read_request(fd, rq)) { qe_close_sock(fd); return; }
     if (rq.method == "OPTIONS") {
       send_all(fd, std::string("HTTP/1.1 204 No Content\r\n") + kCors + "Content-Length: 0\r\nConnection: close\r\n\r\n");
     } else if (rq.method == "GET" && rq.path == "/health") {
@@ -346,7 +368,7 @@ struct Server {
       respond(fd, 200, stats_json());
     } else if (rq.method == "GET" && rq.path.rfind("/api/search", 0) == 0) {
       const std::string q = query_param(rq.target, "q");
-      if (q.empty() || q.size() > 400) { respond(fd, 400, "{\"error\":{\"message\":\"q required\"}}"); close(fd); return; }
+      if (q.empty() || q.size() > 400) { respond(fd, 400, "{\"error\":{\"message\":\"q required\"}}"); qe_close_sock(fd); return; }
       const int n = std::clamp(atoi(query_param(rq.target, "n", "6").c_str()), 1, 10);
       const int nf = std::clamp(atoi(query_param(rq.target, "fetch", "3").c_str()), 0, 5);
       const int mc = std::clamp(atoi(query_param(rq.target, "chars", "2500").c_str()), 200, 8000);
@@ -392,10 +414,10 @@ struct Server {
     } else {
       respond(fd, 404, "{\"error\":{\"message\":\"not found\"}}");
     }
-    close(fd);
+    qe_close_sock(fd);
   }
 
-  void completion(int fd, const Json& b, bool chat) {
+  void completion(QeSock fd, const Json& b, bool chat) {
     std::string prompt;
     bool thinking = true;
     Json tools;
@@ -528,12 +550,13 @@ struct Server {
 
     const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++id_counter);
     const int64_t created = (int64_t)time(nullptr);
-    if (stream)
+    if (stream) {
       // no-transform / X-Accel-Buffering: keep proxies (Cloudflare, nginx) from compressing or buffering the
       // stream; the padded comment pushes past proxies that hold back the first few KB
-      send_all(fd, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
+      if (!send_all(fd, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
                                "Cache-Control: no-cache, no-transform\r\nX-Accel-Buffering: no\r\n") + kCors +
-                       "Connection: close\r\n\r\n:" + std::string(2048, ' ') + "\n\n");
+                       "Connection: close\r\n\r\n:" + std::string(2048, ' ') + "\n\n")) return;
+    }
     auto chunk = [&](const std::string& reasoning, const std::string& content, const char* finish) -> bool {
       Json c = Json::object();
       c["id"] = id;
@@ -563,11 +586,15 @@ struct Server {
     // The same thread watches the connection every second (streaming or not) and raises `cancel`
     // when the client has gone, which stops the prefill between chunks.
     std::atomic<bool> cancel{false};
-    auto keepalive = [&](auto&& fn) {
+    auto prefill = [&](const std::vector<int>& prompt) {
       std::mutex km;
       std::condition_variable kcv;
       bool kdone = false;
       model->set_cancel(&cancel);
+      struct ClearCancel {
+        IModel& model;
+        ~ClearCancel() { model.set_cancel(nullptr); }
+      } clear_cancel{*model};
       std::thread th([&] {
         std::unique_lock<std::mutex> lk(km);
         for (int tick = 1; !kcv.wait_for(lk, std::chrono::seconds(1), [&] { return kdone; }); tick++) {
@@ -579,9 +606,7 @@ struct Server {
         std::mutex& m; std::condition_variable& cv; bool& done; std::thread& t;
         ~Join() { { std::lock_guard<std::mutex> g(m); done = true; } cv.notify_all(); t.join(); }
       } join{km, kcv, kdone, th};
-      const int r = fn();
-      model->set_cancel(nullptr);
-      return r;
+      return gen->start(prompt, true, 4096, &cancel);
     };
 
     gen->set_sampling(sp);
@@ -605,13 +630,14 @@ struct Server {
       live.cur = rsn;
     }
     live_update("prefill", nullptr, false);
-    out.push_back(keepalive([&] { return gen->start(ids); }));
-    if (cancel) {  // the client left during the prompt: drop the partial state, send nothing
+    const int first = prefill(ids);
+    if (first == Generator::kCancelled || cancel) {
       gen->abandon();
       QE_LOG("[server] %s: client disconnected during prompt processing, cancelled\n", id.c_str());
       live_update("idle", nullptr, true);
       return;
     }
+    out.push_back(first);
     {
       const auto& st0 = gen->stats();
       reused0 = gen->reused();
@@ -691,8 +717,9 @@ struct Server {
         cont.insert(cont.end(), fx.begin(), fx.end());
         out.insert(out.end(), fx.begin(), fx.end());
         if (!looping) QE_LOG("[server] %s: thinking budget %d reached, closing the reasoning\n", id.c_str(), think_budget);
-        out.push_back(keepalive([&] { return gen->start(cont); }));
-        if (cancel) { gen->abandon(); alive = false; break; }
+        const int next = prefill(cont);
+        if (next == Generator::kCancelled || cancel) { gen->abandon(); alive = false; break; }
+        out.push_back(next);
         pre.t_decode += gen->stats().t_prefill;  // the forced tokens count as decode time
         continue;
       }
@@ -845,7 +872,12 @@ struct Server {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  WSADATA wsa;
+  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) QE_FATAL("WSAStartup failed");
+#else
   signal(SIGPIPE, SIG_IGN);
+#endif
   Server srv;
   std::string host = "127.0.0.1";
   int port = 8080;
@@ -909,9 +941,9 @@ int main(int argc, char** argv) {
     const size_t sl = p.find_last_of('/');
     srv.model_name = sl == std::string::npos ? p : p.substr(sl + 1);
   }
-  const int ls = socket(AF_INET, SOCK_STREAM, 0);
+  const QeSock ls = socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
-  setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
@@ -921,9 +953,9 @@ int main(int argc, char** argv) {
   QE_LOG("[server] listening on http://%s:%d  (model %s, ctx %d, mtp %s)\n", host.c_str(), port, srv.model_name.c_str(),
          srv.opt.ctx, srv.model->has_mtp() ? "on" : "off");
   for (;;) {
-    const int fd = accept(ls, nullptr, nullptr);
-    if (fd < 0) continue;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    const QeSock fd = accept(ls, nullptr, nullptr);
+    if (fd == (QeSock)-1) continue;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
     std::thread([&srv, fd] { srv.handle(fd); }).detach();
   }
 }

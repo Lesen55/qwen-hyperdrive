@@ -2,9 +2,19 @@
 
 #include "common.h"
 
+#ifndef _WIN32
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +25,61 @@ namespace {
 
 const char* kUA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
+#ifdef _WIN32
+// Windows: spawn the system curl.exe (ships with Windows 10 1803+) without a console
+// window, capture stdout through an anonymous pipe, stop at max_bytes like the POSIX path.
+std::wstring widen(const std::string& s) {
+  if (s.empty()) return L"";
+  const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+  std::wstring w(n, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+  return w;
+}
+
+std::string curl_get(const std::string& url, size_t max_bytes, int timeout_s) {
+  // Keep the quoted URL intact through Windows argument parsing and curl URL handling.
+  for (unsigned char c : url)
+    if (c <= ' ' || c == '\x7f' || c == '"' || c == '\\') return "";
+  const std::string to = std::to_string(timeout_s), mx = std::to_string(max_bytes * 4);
+  std::string cmd = "curl.exe -sL --globoff --compressed --max-time " + to + " --max-filesize " + mx +
+                    " --max-redirs 3 --proto =http,https --proto-redir =http,https -A \"" + kUA +
+                    "\" -H \"Accept-Language: ja,en;q=0.8\" -- \"" + url + "\"";
+  std::wstring wcmd = widen(cmd);
+
+  SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe(&rd, &wr, &sa, 0)) return "";
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = wr;
+  si.hStdError = nul;
+  si.hStdInput = nul;
+  PROCESS_INFORMATION pi{};
+  const BOOL ok = CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+  CloseHandle(wr);
+  if (nul) CloseHandle(nul);
+  if (!ok) { CloseHandle(rd); return ""; }
+
+  std::string out;
+  char buf[65536];
+  for (;;) {
+    DWORD n = 0;
+    if (!ReadFile(rd, buf, sizeof buf, &n, nullptr) || n == 0) break;
+    out.append(buf, n);
+    if (out.size() >= max_bytes) { TerminateProcess(pi.hProcess, 1); break; }
+  }
+  CloseHandle(rd);
+  if (WaitForSingleObject(pi.hProcess, (DWORD)(timeout_s + 5) * 1000) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  if (out.size() > max_bytes) out.resize(max_bytes);
+  return out;
+}
+#else
 // run curl (no shell), capture at most max_bytes of stdout
 std::string curl_get(const std::string& url, size_t max_bytes, int timeout_s) {
   // everything the child needs is built before fork (no allocation between fork and exec)
@@ -47,6 +112,7 @@ std::string curl_get(const std::string& url, size_t max_bytes, int timeout_s) {
   if (out.size() > max_bytes) out.resize(max_bytes);
   return out;
 }
+#endif  // _WIN32
 
 std::string url_encode(const std::string& s) {
   static const char* hex = "0123456789ABCDEF";
