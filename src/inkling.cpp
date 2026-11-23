@@ -96,6 +96,11 @@ InklingModel::Experts InklingModel::load_experts(const std::string& name, const 
 InklingModel::InklingModel(const EngineOptions& opt) : opt_(opt) {
   gguf_ = std::make_unique<GGUFFile>(opt.model_path);
   CUDA_CHECK(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking));
+  for (int b = 0; b < 2; b++) {
+    CUDA_CHECK(cudaEventCreateWithFlags(&stg_ready_[b], cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&stg_free_[b], cudaEventDisableTiming));
+  }
   CUBLAS_CHECK(cublasCreate(&cublas_));
   CUBLAS_CHECK(cublasSetStream(cublas_, s_));
   int dev = 0, nsm = 0;
@@ -225,8 +230,22 @@ void InklingModel::load() {
       static const char* nm[4] = {"q", "k", "v", "ffn"};
       for (int c = 0; c < 4; c++) {
         L.cdown[c] = upload_w(bn(il, (std::string("loop_") + nm[c] + "_ctrl_down.weight").c_str()));
-        L.cgain[c] = upload_w(bn(il, (std::string("loop_") + nm[c] + "_ctrl_gain.weight").c_str()));
-        L.cforget[c] = upload_w(bn(il, (std::string("loop_") + nm[c] + "_ctrl_forget.weight").c_str()));
+        // gain and forget share their input: one stacked [2E][rank] f32 matrix
+        const std::string gn = bn(il, (std::string("loop_") + nm[c] + "_ctrl_gain.weight").c_str());
+        const std::string fn = bn(il, (std::string("loop_") + nm[c] + "_ctrl_forget.weight").c_str());
+        const GGUFTensor& tg = g.need(gn);
+        const GGUFTensor& tf = g.need(fn);
+        QE_ASSERT(tg.type == QT_F32 && tf.type == QT_F32 && tg.ne[0] == tf.ne[0] && tg.rows() == tf.rows());
+        W gf;
+        gf.type = QT_F32;
+        gf.K = (int)tg.ne[0];
+        gf.N = (int)(tg.rows() + tf.rows());
+        gf.rb = (size_t)gf.K * 4;
+        uint8_t* d = (uint8_t*)dalloc(tg.nbytes + tf.nbytes);
+        CUDA_CHECK(cudaMemcpy(d, tg.data, tg.nbytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d + tg.nbytes, tf.data, tf.nbytes, cudaMemcpyHostToDevice));
+        gf.dev = d;
+        L.cgf[c] = gf;
       }
     }
   }
@@ -291,7 +310,7 @@ void InklingModel::load() {
   o2_ = (float*)dalloc(UE * 4);
   gcat_ = (float*)dalloc(2 * UE * 4);
   gd_ = (float*)dalloc((size_t)U_ * gate_rank_ * 4);
-  gg_ = (float*)dalloc(UE * 4);
+  gg_ = (float*)dalloc(2 * UE * 4);
   gf_ = (float*)dalloc(UE * 4);
   attn_work_bytes_ = 16;
   for (int t = 1; t <= kMaxTok; t++) attn_work_bytes_ = std::max(attn_work_bytes_, ik::attn_work_bytes(t, nh_, nkv_, ctx_));
@@ -304,15 +323,38 @@ void InklingModel::load() {
   tok_d_ = (int*)dalloc(A * 4);
   eid_d_ = (int*)dalloc(A * 4);
   inv_d_ = (int*)dalloc(A * 4);
-  ygu_ = (float*)dalloc(A * 2 * n_ff_ * 4);
-  yd_ = (float*)dalloc(A * E_ * 4);
-  h_ = (float*)dalloc(A * n_ff_ * 4);
-  xq_ = (int8_t*)dalloc(A * E_);
-  xd_ = (float*)dalloc(A * E_ / 32 * 4);
-  w16_elems_ = (size_t)std::max(nh_ * hd_, E_) * std::max(nh_ * hd_, E_);
-  w16_ = (__half*)dalloc(w16_elems_ * 2);
-  a16_elems_ = std::max(A * n_ff_, (size_t)U_ * nh_ * hd_);
-  a16_ = (__half*)dalloc(a16_elems_ * 2);
+  goff_d_ = (int*)dalloc((n_exp_ + 1) * 4);
+  {
+    // prefill-only buffers in one region (lent to the expert cache between prefills)
+    w16_elems_ = (size_t)std::max(nh_ * hd_, E_) * std::max(nh_ * hd_, E_);
+    a16_elems_ = std::max(A * n_ff_, (size_t)U_ * nh_ * hd_);
+    const size_t parts[] = {A * 2 * n_ff_ * 4, A * E_ * 4, A * n_ff_ * 4, A * E_, A * E_ / 32 * 4, A * n_ff_, A * n_ff_ / 32 * 4,
+                            w16_elems_ * 2, a16_elems_ * 2};
+    size_t off[9], b = 0;
+    for (int i = 0; i < 9; i++) {
+      off[i] = b;
+      b += (parts[i] + 255) & ~(size_t)255;
+    }
+    big_bytes_ = b;
+    big_ = (uint8_t*)dalloc(b);
+    ygu_ = (float*)(big_ + off[0]);
+    yd_ = (float*)(big_ + off[1]);
+    h_ = (float*)(big_ + off[2]);
+    xq_ = (int8_t*)(big_ + off[3]);
+    xd_ = (float*)(big_ + off[4]);
+    xq2_ = (int8_t*)(big_ + off[5]);
+    xd2_ = (float*)(big_ + off[6]);
+    w16_ = (__half*)(big_ + off[7]);
+    a16_ = (__half*)(big_ + off[8]);
+    // small-batch copies (decode / verify: <= kMaxTok tokens, kMaxTok * k_exp_ assignments)
+    const size_t As = (size_t)kMaxTok * k_exp_;
+    const size_t xs = std::max((size_t)kMaxTok * std::max(nh_ * hd_, 2 * E_), As * n_ff_);
+    xqs_ = (int8_t*)dalloc(xs);
+    xds_ = (float*)dalloc(xs / 32 * 4);
+    ygus_ = (float*)dalloc(As * 2 * n_ff_ * 4);
+    yds_ = (float*)dalloc(As * E_ * 4);
+    hs_ = (float*)dalloc(As * n_ff_ * 4);
+  }
   logits_d_ = (float*)dalloc((size_t)kMaxTok * n_vocab_ * 4);
   argmax_d_ = (int*)dalloc(kMaxTok * 4);
   CUDA_CHECK(cudaHostAlloc((void**)&ids_h_, 4 * A * 4, cudaHostAllocDefault));
@@ -351,8 +393,8 @@ void InklingModel::load() {
   plan_experts();
   QE_LOG("[inkling] %d layers (%d applied: core [%d,%d) x %d), %d experts top-%d, vocab %d, ctx %d, ubatch %d\n", n_phys_,
          cfg_.n_layer, core_start_, core_end_, n_pass_, n_exp_, k_exp_, n_vocab_, ctx_, U_);
-  QE_LOG("[inkling] VRAM: dense %.0f MiB, KV %.0f MiB, workspace %.0f MiB, experts resident in %d/%d layers + cache of %d "
-         "experts per host layer (total %.0f MiB)\n",
+  QE_LOG("[inkling] VRAM: dense %.0f MiB, KV %.0f MiB, workspace %.0f MiB, experts resident in %d/%d layers, expert cache %d "
+         "slots (total %.0f MiB)\n",
          dense_mb, kv_bytes / 1048576.0, ws_mb, ndev_layers_, n_phys_, cache_slots_, vram_used_ / 1048576.0);
   reset();
 }
@@ -380,30 +422,58 @@ void InklingModel::plan_experts() {
     L.resident = true;
     ndev_layers_++;
   }
-  // what is left: VRAM caches of the hottest experts of the host layers (filled by rebalance())
+  // what is left (plus the idle KV tail and the prefill workspace): the elastic cache of host-layer experts
   {
+    size_t gmax = 0, dmax = 0;
     int n_host = 0;
-    size_t per = 0;
     for (auto& L : L_)
       if (!L.resident) {
         n_host++;
-        per = std::max(per, L.gu.stride + L.dn.stride);
+        gmax = std::max(gmax, L.gu.stride);
+        dmax = std::max(dmax, L.dn.stride);
       }
-    const int slots = n_host ? (int)std::min<size_t>(n_exp_, budget / (per * n_host)) : 0;
-    static const int cap = getenv("QE_INK_CACHE") ? atoi(getenv("QE_INK_CACHE")) : 1 << 30;
     for (auto& L : L_) {
       L.slot_of.assign(n_exp_, -1);
       L.freq.assign(n_exp_, 0.0);
-      L.slot_of_d = (int*)dalloc(n_exp_ * 4);
-      CUDA_CHECK(cudaMemcpy(L.slot_of_d, L.slot_of.data(), n_exp_ * 4, cudaMemcpyHostToDevice));
-      if (L.resident) continue;
-      L.cache_n = std::min(slots, cap);
-      if (L.cache_n <= 0) continue;
-      L.cache_gu = (uint8_t*)dalloc(L.gu.stride * L.cache_n);
-      L.cache_dn = (uint8_t*)dalloc(L.dn.stride * L.cache_n);
-      L.slot_exp.assign(L.cache_n, -1);
     }
-    cache_slots_ = std::min(slots, cap);
+    static const bool no_cache = getenv("QE_INK_CACHE") && atoi(getenv("QE_INK_CACHE")) == 0;
+    if (n_host > 0 && !no_cache) {
+      const size_t g16 = (gmax + 255) & ~(size_t)255, sz = g16 + ((dmax + 255) & ~(size_t)255);
+      auto carve = [&](uint8_t* base, size_t bytes, int row_bytes, bool from_end) {
+        for (size_t k = 0; (k + 1) * sz <= bytes; k++) {
+          const size_t o = from_end ? bytes - (k + 1) * sz : k * sz;
+          CSlot c;
+          c.gu = base + o;
+          c.dn = base + o + g16;
+          c.kv_row = row_bytes > 0 ? (int)(o / row_bytes) : -1;
+          cslots_.push_back(c);
+          if (row_bytes > 0) cache_kv_slots_++;
+        }
+      };
+      // dedicated slots from the leftover budget (at most what the host layers can use)
+      const size_t need = (size_t)n_host * n_exp_;
+      const size_t ded = std::min(need, budget / sz);
+      if (ded > 0) carve((uint8_t*)dalloc(ded * sz), ded * sz, 0, false);
+      const size_t n_ded = cslots_.size();
+      for (auto& c : cslots_) c.kv_row = INT32_MAX;  // always valid
+      carve(big_, big_bytes_, 0, false);
+      // global layers' K and V rows beyond the context in use, from the end
+      for (auto& S : slots_)
+        if (!S.ring) {
+          const size_t bytes = (size_t)ctx_ * nkv_ * hd_ * 2;
+          carve((uint8_t*)S.kc, bytes, nkv_ * hd_ * 2, true);
+          carve((uint8_t*)S.vc, bytes, nkv_ * hd_ * 2, true);
+        }
+      cache_slots_ = (int)cslots_.size();
+      QE_LOG("[inkling] elastic expert cache: %zu dedicated + %zu workspace + %d KV-tail slots of %.1f MiB (host layers hold %zu "
+             "experts)\n", n_ded, cslots_.size() - n_ded - cache_kv_slots_, cache_kv_slots_, sz / 1048576.0, need);
+    }
+    const size_t tab = (size_t)2 * n_phys_ * n_exp_;
+    eptr_d_ = (const uint8_t**)dalloc(tab * sizeof(void*));
+    CUDA_CHECK(cudaHostAlloc((void**)&eptr_h_, tab * sizeof(void*), cudaHostAllocDefault));
+    host_allocs_.push_back((void*)eptr_h_);
+    memset((void*)eptr_h_, 0, tab * sizeof(void*));
+    CUDA_CHECK(cudaMemcpy(eptr_d_, eptr_h_, tab * sizeof(void*), cudaMemcpyHostToDevice));
     cnt_h_pending_.assign((size_t)n_phys_ * n_exp_, 0);
     cnt_d_ = (int*)dalloc((size_t)n_phys_ * n_exp_ * 4);
     CUDA_CHECK(cudaMemset(cnt_d_, 0, (size_t)n_phys_ * n_exp_ * 4));
@@ -432,47 +502,83 @@ void InklingModel::plan_experts() {
   }
 }
 
+void InklingModel::upload_eptr() {
+  CUDA_CHECK(cudaMemcpyAsync(eptr_d_, eptr_h_, (size_t)2 * n_phys_ * n_exp_ * sizeof(void*), cudaMemcpyHostToDevice, s_));
+  CUDA_CHECK(cudaStreamSynchronize(s_));  // the host table may change right after
+}
+
+// drop the cached experts of slots that are about to be overwritten (KV rows below kv_hi_, the workspace)
+void InklingModel::cache_evict(bool kv, bool ws) {
+  bool dirty = false;
+  for (auto& c : cslots_) {
+    if (c.layer < 0 || slot_valid(c)) continue;
+    if (!((kv && c.kv_row >= 0) || (ws && c.kv_row < 0))) continue;
+    eptr_h_[(size_t)c.layer * n_exp_ + c.expert] = nullptr;
+    eptr_h_[(size_t)(n_phys_ + c.layer) * n_exp_ + c.expert] = nullptr;
+    L_[c.layer].slot_of[c.expert] = -1;
+    c.layer = c.expert = -1;
+    dirty = true;
+  }
+  if (dirty) upload_eptr();
+}
+
 void InklingModel::rebalance() {
-  if (cache_slots_ <= 0) return;
+  if (cslots_.empty()) return;
   CUDA_CHECK(cudaMemcpyAsync(cnt_h_, cnt_d_, (size_t)n_phys_ * n_exp_ * 4, cudaMemcpyDeviceToHost, s_));
   CUDA_CHECK(cudaMemsetAsync(cnt_d_, 0, (size_t)n_phys_ * n_exp_ * 4, s_));
   CUDA_CHECK(cudaStreamSynchronize(s_));
+  // routing frequencies (decayed) of every host-layer expert
+  std::vector<std::pair<double, int>> cand;  // (freq, layer * n_exp + expert)
   for (PLayer& L : L_) {
-    if (L.resident || L.cache_n <= 0) continue;
+    if (L.resident) continue;
     for (int e = 0; e < n_exp_; e++) {
-      const double c = cnt_h_[(size_t)L.idx * n_exp_ + e] + cnt_h_pending_[(size_t)L.idx * n_exp_ + e];
-      if (L.slot_of[e] >= 0) cache_hits_ += cnt_h_[(size_t)L.idx * n_exp_ + e];
-      cache_uses_ += cnt_h_[(size_t)L.idx * n_exp_ + e];
-      L.freq[e] = L.freq[e] * 0.9 + c;
+      const size_t i = (size_t)L.idx * n_exp_ + e;
+      if (L.slot_of[e] >= 0) cache_hits_ += cnt_h_[i];
+      cache_uses_ += cnt_h_[i];
+      L.freq[e] = L.freq[e] * 0.9 + cnt_h_[i] + cnt_h_pending_[i];
+      if (L.freq[e] > 0) cand.push_back({L.freq[e], (int)i});
     }
-    std::vector<int> order(n_exp_);
-    for (int e = 0; e < n_exp_; e++) order[e] = e;
-    std::sort(order.begin(), order.end(), [&](int a, int b) { return L.freq[a] > L.freq[b]; });
-    std::vector<char> want(n_exp_, 0);
-    for (int i = 0; i < L.cache_n && i < n_exp_; i++)
-      if (L.freq[order[i]] > 0) want[order[i]] = 1;
-    bool changed = false;
-    for (int i = 0; i < L.cache_n && i < n_exp_; i++) {
-      const int e = order[i];
-      if (!want[e] || L.slot_of[e] >= 0) continue;
-      // a free slot or one holding an expert no longer wanted
-      int sl = -1;
-      for (int k = 0; k < L.cache_n; k++)
-        if (L.slot_exp[k] < 0 || !want[L.slot_exp[k]]) { sl = k; break; }
-      if (sl < 0) break;
-      if (L.slot_exp[sl] >= 0) L.slot_of[L.slot_exp[sl]] = -1;
-      L.slot_exp[sl] = e;
-      L.slot_of[e] = sl;
-      CUDA_CHECK(cudaMemcpyAsync(L.cache_gu + (size_t)sl * L.gu.stride, L.gu.host + (size_t)e * L.gu.stride, L.gu.stride,
-                                 cudaMemcpyHostToDevice, s_));
-      CUDA_CHECK(cudaMemcpyAsync(L.cache_dn + (size_t)sl * L.dn.stride, L.dn.host + (size_t)e * L.dn.stride, L.dn.stride,
-                                 cudaMemcpyHostToDevice, s_));
-      changed = true;
-    }
-    if (changed) CUDA_CHECK(cudaMemcpyAsync(L.slot_of_d, L.slot_of.data(), n_exp_ * 4, cudaMemcpyHostToDevice, s_));
   }
   std::fill(cnt_h_pending_.begin(), cnt_h_pending_.end(), 0);
-  CUDA_CHECK(cudaStreamSynchronize(s_));  // slot_of (host) is copied from
+  int nvalid = 0;
+  for (auto& c : cslots_) nvalid += slot_valid(c);
+  std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
+  if ((int)cand.size() > nvalid) cand.resize(nvalid);
+  std::vector<char> want((size_t)n_phys_ * n_exp_, 0);
+  for (auto& [f, i] : cand) want[i] = 1;
+  // free slots: valid ones that are empty or hold an expert no longer wanted
+  std::vector<int> fr;
+  for (int k = 0; k < (int)cslots_.size(); k++) {
+    const CSlot& c = cslots_[k];
+    if (!slot_valid(c)) continue;
+    if (c.layer < 0 || !want[(size_t)c.layer * n_exp_ + c.expert]) fr.push_back(k);
+  }
+  bool dirty = false;
+  size_t fi = 0, copied = 0;
+  static const size_t max_copy = 192;  // per call (~600 MB): the rest follows at the next rebalances
+  for (auto& [f, i] : cand) {
+    const int il = i / n_exp_, e = i % n_exp_;
+    PLayer& L = L_[il];
+    if (L.slot_of[e] >= 0) continue;
+    if (fi >= fr.size() || copied >= max_copy) break;
+    const int k = fr[fi++];
+    CSlot& c = cslots_[k];
+    if (c.layer >= 0) {
+      eptr_h_[(size_t)c.layer * n_exp_ + c.expert] = nullptr;
+      eptr_h_[(size_t)(n_phys_ + c.layer) * n_exp_ + c.expert] = nullptr;
+      L_[c.layer].slot_of[c.expert] = -1;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(c.gu, L.gu.host + (size_t)e * L.gu.stride, L.gu.stride, cudaMemcpyHostToDevice, s_));
+    CUDA_CHECK(cudaMemcpyAsync(c.dn, L.dn.host + (size_t)e * L.dn.stride, L.dn.stride, cudaMemcpyHostToDevice, s_));
+    c.layer = il;
+    c.expert = e;
+    L.slot_of[e] = k;
+    eptr_h_[(size_t)il * n_exp_ + e] = c.gu;
+    eptr_h_[(size_t)(n_phys_ + il) * n_exp_ + e] = c.dn;
+    copied++;
+    dirty = true;
+  }
+  if (dirty) upload_eptr();
 }
 
 // ring rows of positions [pos - swa, pos) as at most two contiguous row ranges
@@ -541,6 +647,7 @@ void InklingModel::ck_restore(int slot) {
 
 void InklingModel::reset() {
   pos_ = 0;
+  kv_hi_ = 0;  // a new sequence: the KV rows are free again (refilled by rebalance)
   for (auto& S : slots_)
     CUDA_CHECK(cudaMemsetAsync(S.hist, 0, 3 * (size_t)(2 * nkv_ * hd_ + 2 * E_) * 4, s_));
   CUDA_CHECK(cudaStreamSynchronize(s_));
@@ -564,9 +671,19 @@ KvInfo InklingModel::kv_info() const {
 }
 
 // ---------------------------------------------------------------------------------------------
-void InklingModel::lin(const W& w, const float* x, int T, float* y, int ldy, bool acc) {
+void InklingModel::lin(const W& w, const float* x, int T, float* y, int ldy, bool acc, bool reuse) {
   if (ldy < 0) ldy = w.N;
   if (T <= 0) return;
+  // reuse: x was the input of the previous quantizing lin (same contents): its xq_/xd_ are still valid
+  int8_t* xq = T <= kMaxTok ? xqs_ : xq_;
+  float* xd = T <= kMaxTok ? xds_ : xd_;
+  auto quant = [&] {
+    if (reuse && qx_ == x && qK_ == w.K && qT_ == T) return;
+    qk::quantize_q8(x, xq, xd, w.K, T, s_);
+    qx_ = x;
+    qK_ = w.K;
+    qT_ = T;
+  };
   if (w.type == QT_F32) {
     if (T <= kMaxTok) {
       qk::matvec(QT_F32, w.dev, w.rb, w.K, w.N, nullptr, nullptr, x, T, y, ldy, acc, s_);
@@ -578,16 +695,19 @@ void InklingModel::lin(const W& w, const float* x, int T, float* y, int ldy, boo
     return;
   }
   if (T <= kMaxTok) {
-    qk::quantize_q8(x, xq_, xd_, w.K, T, s_);
-    qk::matvec(w.type, w.dev, w.rb, w.K, w.N, xq_, xd_, nullptr, T, y, ldy, acc, s_);
+    quant();
+    qk::matvec(w.type, w.dev, w.rb, w.K, w.N, xq, xd, nullptr, T, y, ldy, acc, s_);
     return;
   }
-  if (qk::mmq_supported(w.type) && w.K % 256 == 0) {
-    qk::quantize_q8(x, xq_, xd_, w.K, T, s_);
+  static const bool no_q8mmq = getenv("QE_INK_NO_Q8MMQ") != nullptr;
+  const bool fsc = (w.type == QT_Q8_0 && !no_q8mmq) || w.type == QT_IQ4_NL || w.type == QT_NVFP4;  // K % 32 suffices
+  if ((qk::mmq_supported(w.type) && w.K % 256 == 0) || (fsc && w.K % 32 == 0)) {
+    quant();
     qk::mmq(w.type, w.dev, w.rb, w.K, w.N, xq_, xd_, T, y, ldy, acc, 32, s_);
     return;
   }
   QE_ASSERT((size_t)T * w.K <= a16_elems_);
+  qx_ = nullptr;
   qk::f32_to_f16(x, a16_, (int64_t)T * w.K, s_);
   const int rows_per = (int)std::min<size_t>(w.N, w16_elems_ / w.K);
   const float alpha = 1.f, beta = acc ? 1.f : 0.f;
@@ -602,12 +722,12 @@ void InklingModel::lin(const W& w, const float* x, int T, float* y, int ldy, boo
 void InklingModel::control(const float* cur, const float* msg, int c, const PLayer& L, float* out, int T) {
   ik::concat_rms(cur, msg, gcat_, E_, T, s_);
   lin(L.cdown[c], gcat_, T, gd_);
-  lin(L.cgain[c], gd_, T, gg_);
-  lin(L.cforget[c], gd_, T, gf_);
-  ik::ctrl_combine(out, cur, msg, gg_, gf_, (int64_t)T * E_, s_);
+  lin(L.cgf[c], gd_, T, gg_);
+  ik::ctrl_combine(out, cur, msg, gg_, E_, T, s_);
 }
 
 void InklingModel::moe(const PLayer& L, const float* x, int T, float* out) {
+  qx_ = nullptr;  // the MoE paths overwrite xq_
   lin(L.gate_inp, x, T, logit_e_);
   ik::moe_route(logit_e_, L.exp_b, n_exp_, k_exp_, route_scale_, T, ids_, w_e_, s_);
   if (T * k_exp_ <= stg_slots_ || (L.resident && T <= kMaxTok)) moe_small(L, x, T, out);
@@ -622,18 +742,19 @@ void InklingModel::moe_small(const PLayer& L, const float* x, int T, float* out)
   const uint8_t *const *pg = nullptr, *const *pd = nullptr;
   if (!L.resident) {
     // cached experts are read in place, the others are copied from host memory into staging slots
-    qk::gather_experts_cached(L.gu.host, L.gu.stride, ids_, A, L.slot_of_d, L.cache_gu, stg_gu_, ptr_gu_,
+    qk::gather_experts_cached(L.gu.host, L.gu.stride, ids_, A, eptr_d_ + (size_t)L.idx * n_exp_, stg_gu_, ptr_gu_,
                               cnt_d_ + (size_t)L.idx * n_exp_, s_);
-    qk::gather_experts_cached(L.dn.host, L.dn.stride, ids_, A, L.slot_of_d, L.cache_dn, stg_dn_, ptr_dn_, nullptr, s_);
+    qk::gather_experts_cached(L.dn.host, L.dn.stride, ids_, A, eptr_d_ + (size_t)(n_phys_ + L.idx) * n_exp_, stg_dn_,
+                              ptr_dn_, nullptr, s_);
     pg = ptr_gu_;
     pd = ptr_dn_;
   }
-  qk::quantize_q8(x, xq_, xd_, E_, T, s_);
-  qk::moe_matvec(L.gu.type, gu, L.gu.stride, L.gu.rb, L.gu.K, L.gu.N, A, ids, ids_, L.gu.scale, xq_, xd_, k_exp_, ygu_, s_, pg);
-  ik::situ(ygu_, A, n_ff_, situ_b_, situ_lb_, nullptr, nullptr, h_, s_);
-  qk::quantize_q8(h_, xq_, xd_, n_ff_, A, s_);
-  qk::moe_matvec(L.dn.type, dn, L.dn.stride, L.dn.rb, L.dn.K, L.dn.N, A, ids, ids_, L.dn.scale, xq_, xd_, 1, yd_, s_, pd);
-  ik::moe_combine(yd_, nullptr, w_e_, T, k_exp_, E_, out, s_);
+  qk::quantize_q8(x, xqs_, xds_, E_, T, s_);
+  qk::moe_matvec(L.gu.type, gu, L.gu.stride, L.gu.rb, L.gu.K, L.gu.N, A, ids, ids_, L.gu.scale, xqs_, xds_, k_exp_, ygus_, s_, pg);
+  ik::situ(ygus_, A, n_ff_, situ_b_, situ_lb_, nullptr, nullptr, hs_, s_);
+  qk::quantize_q8(hs_, xqs_, xds_, n_ff_, A, s_);
+  qk::moe_matvec(L.dn.type, dn, L.dn.stride, L.dn.rb, L.dn.K, L.dn.N, A, ids, ids_, L.dn.scale, xqs_, xds_, 1, yds_, s_, pd);
+  ik::moe_combine(yds_, nullptr, w_e_, T, k_exp_, E_, out, s_);
 }
 
 // prefill: assignments sorted by expert, one GEMM per expert
@@ -668,7 +789,7 @@ void InklingModel::moe_large(const PLayer& L, const float* x, int T, float* out)
   const bool dn_mmq = qk::mmq_supported(L.dn.type) && L.dn.K % 256 == 0;
   auto expert_ptr = [&](const Experts& X, int e, uint8_t* stg) -> const uint8_t* {
     if (X.dev) return X.dev + (size_t)e * X.stride;
-    if (L.slot_of[e] >= 0) return (&X == &L.gu ? L.cache_gu : L.cache_dn) + (size_t)L.slot_of[e] * X.stride;
+    if (L.slot_of[e] >= 0) return &X == &L.gu ? cslots_[L.slot_of[e]].gu : cslots_[L.slot_of[e]].dn;
     CUDA_CHECK(cudaMemcpyAsync(stg, X.host + (size_t)e * X.stride, X.stride, cudaMemcpyHostToDevice, s_));
     return stg;
   };
@@ -693,13 +814,88 @@ void InklingModel::moe_large(const PLayer& L, const float* x, int T, float* out)
       }
     }
   };
+  static const bool mprof = getenv("QE_INK_PROF") && getenv("QE_INK_PROF")[0] == '3';
+  cudaEvent_t ev[6];
+  auto mark = [&](int i) {
+    if (!mprof) return;
+    CUDA_CHECK(cudaEventCreate(&ev[i]));
+    CUDA_CHECK(cudaEventRecord(ev[i], s_));
+  };
+  mark(0);
+  auto grouped_ok = [](uint32_t t) { return t == QT_NVFP4 || t == QT_IQ4_NL || qk::mmq_supported(t); };
+  static const bool no_stream = getenv("QE_INK_NOGROUP") != nullptr;
+  if (!L.resident && gu_mmq && grouped_ok(L.dn.type) && !no_stream) {
+    // host layer: groups of G experts streamed into the two halves of the staging slots (copy stream) while the
+    // previous group runs as grouped GEMMs
+    const int G = stg_slots_ / 2;
+    CUDA_CHECK(cudaMemcpyAsync(goff_d_, off.data(), (n_exp_ + 1) * 4, cudaMemcpyHostToDevice, s_));
+    qk::quantize_q8(yd_, xq_, xd_, E_, A, s_);
+    for (int b = 0; b < 2; b++) CUDA_CHECK(cudaEventRecord(stg_free_[b], s_));
+    for (int e0 = 0, gi = 0; e0 < n_exp_; e0 += G, gi++) {
+      const int e1 = std::min(n_exp_, e0 + G), b = gi & 1;
+      const int r0 = off[e0], nr = off[e1] - off[e0];
+      if (nr == 0) continue;
+      uint8_t* sg = stg_gu_ + (size_t)b * G * L.gu.stride;
+      uint8_t* sd = stg_dn_ + (size_t)b * G * L.dn.stride;
+      CUDA_CHECK(cudaStreamWaitEvent(cs_, stg_free_[b], 0));
+      for (int e = e0; e < e1; e++) {
+        if (cnt[e] == 0) continue;
+        const int sl = L.slot_of[e];
+        const uint8_t* srcg = sl >= 0 ? cslots_[sl].gu : L.gu.host + (size_t)e * L.gu.stride;
+        const uint8_t* srcd = sl >= 0 ? cslots_[sl].dn : L.dn.host + (size_t)e * L.dn.stride;
+        const cudaMemcpyKind k = sl >= 0 ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
+        CUDA_CHECK(cudaMemcpyAsync(sg + (size_t)(e - e0) * L.gu.stride, srcg, L.gu.stride, k, cs_));
+        CUDA_CHECK(cudaMemcpyAsync(sd + (size_t)(e - e0) * L.dn.stride, srcd, L.dn.stride, k, cs_));
+      }
+      CUDA_CHECK(cudaEventRecord(stg_ready_[b], cs_));
+      CUDA_CHECK(cudaStreamWaitEvent(s_, stg_ready_[b], 0));
+      const int mx = *std::max_element(cnt.begin() + e0, cnt.begin() + e1);
+      qk::mmq_grouped(L.gu.type, sg, L.gu.stride, L.gu.rb, L.gu.K, L.gu.N, goff_d_ + e0, e1 - e0, mx, xq_, xd_, ygu_,
+                      L.gu.N, s_);
+      ik::situ(ygu_ + (size_t)r0 * 2 * n_ff_, nr, n_ff_, situ_b_, situ_lb_, eid_d_ + r0, L.gu.scale, h_ + (size_t)r0 * n_ff_, s_);
+      qk::quantize_q8(h_ + (size_t)r0 * n_ff_, xq2_ + (size_t)r0 * n_ff_, xd2_ + (size_t)r0 * (n_ff_ / 32), n_ff_, nr, s_);
+      qk::mmq_grouped(L.dn.type, sd, L.dn.stride, L.dn.rb, L.dn.K, L.dn.N, goff_d_ + e0, e1 - e0, mx, xq2_, xd2_, yd_,
+                      L.dn.N, s_);
+      CUDA_CHECK(cudaEventRecord(stg_free_[b], s_));
+    }
+    ik::moe_coef(w_e_, ids_, L.dn.scale, A, coef_, s_);
+    ik::moe_combine(yd_, inv_d_, coef_, T, k_exp_, E_, out, s_);
+    return;
+  }
   QE_ASSERT(gu_mmq || (size_t)A * E_ <= a16_elems_);
   QE_ASSERT(dn_mmq || (size_t)A * n_ff_ <= a16_elems_);
-  run(L.gu, gu_mmq, yd_, E_, ygu_, stg_gu_);
+  if (L.resident && gu_mmq && !getenv("QE_INK_NOGROUP")) {
+    // one launch for every expert
+    const int mx = *std::max_element(cnt.begin(), cnt.end());
+    CUDA_CHECK(cudaMemcpyAsync(goff_d_, off.data(), (n_exp_ + 1) * 4, cudaMemcpyHostToDevice, s_));
+    qk::quantize_q8(yd_, xq_, xd_, E_, A, s_);
+    qk::mmq_grouped(L.gu.type, L.gu.dev, L.gu.stride, L.gu.rb, L.gu.K, L.gu.N, goff_d_, n_exp_, mx, xq_, xd_, ygu_, L.gu.N, s_);
+  } else {
+    run(L.gu, gu_mmq, yd_, E_, ygu_, stg_gu_);
+  }
+  mark(1);
   ik::situ(ygu_, A, n_ff_, situ_b_, situ_lb_, eid_d_, L.gu.scale, h_, s_);
-  run(L.dn, dn_mmq, h_, n_ff_, yd_, stg_dn_);
+  mark(2);
+  if (L.resident && !getenv("QE_INK_NOGROUP") && (L.dn.type == QT_NVFP4 || L.dn.type == QT_IQ4_NL || qk::mmq_supported(L.dn.type))) {
+    const int mx = *std::max_element(cnt.begin(), cnt.end());
+    CUDA_CHECK(cudaMemcpyAsync(goff_d_, off.data(), (n_exp_ + 1) * 4, cudaMemcpyHostToDevice, s_));
+    qk::quantize_q8(h_, xq_, xd_, n_ff_, A, s_);
+    qk::mmq_grouped(L.dn.type, L.dn.dev, L.dn.stride, L.dn.rb, L.dn.K, L.dn.N, goff_d_, n_exp_, mx, xq_, xd_, yd_, L.dn.N, s_);
+  } else {
+    run(L.dn, dn_mmq, h_, n_ff_, yd_, stg_dn_);
+  }
+  mark(3);
   ik::moe_coef(w_e_, ids_, L.dn.scale, A, coef_, s_);
   ik::moe_combine(yd_, inv_d_, coef_, T, k_exp_, E_, out, s_);
+  mark(4);
+  if (mprof) {
+    CUDA_CHECK(cudaEventSynchronize(ev[4]));
+    float t[4];
+    for (int i = 0; i < 4; i++) CUDA_CHECK(cudaEventElapsedTime(&t[i], ev[i], ev[i + 1]));
+    fprintf(stderr, "[moe] layer %2d %s: gate_up %.2f  situ %.2f  down %.2f  combine %.2f ms\n", L.idx,
+            L.resident ? "dev " : "host", t[0], t[1], t[2], t[3]);
+    for (int i = 0; i < 5; i++) cudaEventDestroy(ev[i]);
+  }
 }
 
 // QE_INK_PROF=1: per-section GPU time of small-batch steps (events; graphs off)
@@ -708,7 +904,7 @@ static bool ink_prof() {
   return on;
 }
 void InklingModel::prof(int k) {
-  if (!ink_prof() || prof_T_ > kMaxTok) return;
+  if (!ink_prof() || (prof_T_ <= kMaxTok) != (getenv("QE_INK_PROF")[0] == '1')) return;
   cudaEvent_t e;
   CUDA_CHECK(cudaEventCreate(&e));
   CUDA_CHECK(cudaEventRecord(e, s_));
@@ -724,7 +920,7 @@ void InklingModel::prof_flush() {
   }
   for (auto& [k, e] : prof_ev_) cudaEventDestroy(e);
   prof_ev_.clear();
-  if (++prof_n_ % 50 == 0) {
+  if (++prof_n_ % 50 == 0 || getenv("QE_INK_PROF")[0] == '2') {
     static const char* nm[8] = {"start", "mix+ctrl+norm", "qkv proj", "conv/clip/kv", "attention", "out proj+conv", "ffn mix+norm", "moe"};
     double tot = 0;
     for (int i = 0; i < 10; i++) tot += prof_ms_[i];
@@ -777,16 +973,16 @@ void InklingModel::layer(int slot, int ip, const float* inp, float* out, std::ve
     x[2] = xn_[2];
   }
   prof(1);
+  // inputs quantized once per distinct tensor (reuse); the float projections do not touch the quantized copy
+  qx_ = nullptr;
   lin(L.q, x[0], T, q_);
-  lin(L.gate, x[0], T, g_);
-  lin(L.rel, x[0], T, r_);
+  lin(L.gate, x[0], T, g_, -1, false, true);
+  lin(L.rel, x[0], T, r_, -1, false, true);
   lin(L.sink, x[0], T, sink_);
-  lin(L.k, x[1], T, kp_);
-  lin(L.v, x[2], T, vp_);
-  if (!L.swa) {
-    lin(L.kcp, x[1], T, kd_);
-    lin(L.vcp, x[2], T, vd_);
-  }
+  lin(L.k, x[1], T, kp_, -1, false, true);
+  if (!L.swa) lin(L.kcp, x[1], T, kd_);
+  lin(L.v, x[2], T, vp_, -1, false, true);
+  if (!L.swa) lin(L.vcp, x[2], T, vd_);
   prof(2);
   const float inv_s = 1.f / sqrtf((float)n_conv_ + 1), inv_d = 1.f / sqrtf(2.f * n_conv_ + 1);
   float* hist = S.hist;
@@ -980,6 +1176,16 @@ void InklingModel::forward(const int* tokens, int n, int pos0, float* logits, in
   (void)snapshot;
   (void)mtp_prefill;
   QE_ASSERT(n > 0 && n_logits <= n && (n_logits <= kMaxTok || n_logits <= U_));
+  // elastic cache: the context grows into KV rows (rounded up), larger batches need the prefill workspace
+  if (pos0 + n > kv_hi_) {
+    kv_hi_ = std::min(ctx_, (pos0 + n + 2047) / 2048 * 2048);
+    cache_evict(true, false);
+  }
+  const bool big = n * k_exp_ > stg_slots_ || n > kMaxTok;
+  if (big) {
+    ws_busy_ = true;
+    cache_evict(false, true);
+  }
   int off = 0;
   const int cap = cap_pos_ - pos0;  // capture the state after this many tokens of the call
   while (off < n) {
@@ -994,8 +1200,9 @@ void InklingModel::forward(const int* tokens, int n, int pos0, float* logits, in
     if (!last && cancel_ && cancel_->load(std::memory_order_relaxed)) break;
   }
   cap_pos_ = cap_slot_ = -1;
-  // expert caches follow the routing: after every prompt and every 32 decode calls
-  if (n > kMaxTok || ++steps_since_rb_ >= 32) {
+  ws_busy_ = false;
+  // the expert cache follows the routing: after every prompt and every 32 decode calls
+  if (big || ++steps_since_rb_ >= 32) {
     rebalance();
     steps_since_rb_ = 0;
     if (opt_.verbose && cache_uses_)

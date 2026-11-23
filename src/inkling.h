@@ -79,15 +79,12 @@ class InklingModel : public IModel {
     Experts gu, dn;
     bool resident = false;
     int idx = 0;
-    // host layers: VRAM cache of the most used experts (slot_of[e] = cache slot or -1)
-    int cache_n = 0;
-    uint8_t *cache_gu = nullptr, *cache_dn = nullptr;
-    int* slot_of_d = nullptr;
-    std::vector<int> slot_of, slot_exp;
+    // host layers: experts cached in the elastic VRAM cache (slot_of[e] = cache slot or -1), routing frequencies
+    std::vector<int> slot_of;
     std::vector<double> freq;
     // loop controllers (core layers): message queries [4][E], per controller down [64][2E], gain / forget [E][64]
     float* msg_q = nullptr;
-    W cdown[4], cgain[4], cforget[4];
+    W cdown[4], cgf[4];  // down [rank][2E]; gain | forget stacked [2E][rank]
   };
   struct Slot {
     int phys = 0;
@@ -102,16 +99,34 @@ class InklingModel : public IModel {
   Experts load_experts(const std::string& name, const std::string& scale_name);
   void* dalloc(size_t bytes);
   void plan_experts();
-  void rebalance();  // refresh the expert caches from the routing counts
+  // Elastic expert cache: host-layer experts copied into VRAM that is idle right now -- the KV rows beyond the
+  // current context of the global layers and the prefill-only workspace.  Being a cache it can be dropped at any
+  // time: slots are evicted before the context grows into them or a prefill needs the workspace.
+  struct CSlot {
+    uint8_t *gu = nullptr, *dn = nullptr;
+    int kv_row = -1;  // lowest KV row it covers (-1: workspace slot)
+    int layer = -1, expert = -1;
+  };
+  std::vector<CSlot> cslots_;
+  const uint8_t** eptr_d_ = nullptr;  // [2][n_phys][n_exp] gate_up / down pointer of each cached expert (null: not)
+  const uint8_t** eptr_h_ = nullptr;  // pinned host mirror
+  int kv_hi_ = 0;                     // KV rows that may hold keys / values (slots below are invalid)
+  bool ws_busy_ = false;              // the prefill workspace is in use
+  bool slot_valid(const CSlot& c) const { return c.kv_row < 0 ? !ws_busy_ : c.kv_row >= kv_hi_; }
+  void cache_evict(bool kv, bool ws);
+  void upload_eptr();
+  void rebalance();  // refresh the expert cache from the routing counts
   int* cnt_d_ = nullptr;  // [n_phys][n_exp] uses of host-layer experts since the last rebalance
   int* cnt_h_ = nullptr;
   std::vector<int> cnt_h_pending_;  // prefill counts (known on the host)
   const uint8_t **ptr_gu_ = nullptr, **ptr_dn_ = nullptr;
   int steps_since_rb_ = 0;
-  int cache_slots_ = 0;
+  int cache_slots_ = 0, cache_kv_slots_ = 0;
   uint64_t cache_hits_ = 0, cache_uses_ = 0;
 
-  void lin(const W& w, const float* x, int T, float* y, int ldy = -1, bool acc = false);
+  void lin(const W& w, const float* x, int T, float* y, int ldy = -1, bool acc = false, bool reuse = false);
+  const float* qx_ = nullptr;  // input currently quantized in xq_ / xd_ (with qK_, qT_)
+  int qK_ = 0, qT_ = 0;
   void layer(int slot, int ip, const float* inp, float* out, std::vector<const float*>& blocks,
              const float* const* msgs, int T, int pos0);
   void control(const float* cur, const float* msg, int ctrl, const PLayer& L, float* out, int T);
@@ -173,11 +188,21 @@ class InklingModel : public IModel {
   size_t attn_work_bytes_ = 0;
   // MoE
   float *logit_e_ = nullptr, *w_e_ = nullptr, *coef_ = nullptr, *ygu_ = nullptr, *yd_ = nullptr, *h_ = nullptr;
+  int* goff_d_ = nullptr;
   int *ids_ = nullptr, *tok_d_ = nullptr, *eid_d_ = nullptr, *inv_d_ = nullptr;
   int *ids_h_ = nullptr, *perm_h_ = nullptr;
   uint8_t *stg_gu_ = nullptr, *stg_dn_ = nullptr;
   int stg_slots_ = 0;
+  int8_t* xqs_ = nullptr;  // small-batch activations (decode: the prefill buffers below are lent to the cache)
+  float* xds_ = nullptr;
+  float *ygus_ = nullptr, *yds_ = nullptr, *hs_ = nullptr;
+  uint8_t* big_ = nullptr;  // prefill-only buffers (ygu_, yd_, h_, xq_, xd_, xq2_, xd2_, w16_, a16_)
+  size_t big_bytes_ = 0;
   int8_t* xq_ = nullptr;
+  int8_t* xq2_ = nullptr;
+  float* xd2_ = nullptr;
+  cudaStream_t cs_ = nullptr;  // copy stream (host-layer expert streaming in prefill)
+  cudaEvent_t stg_ready_[2] = {}, stg_free_[2] = {};
   float* xd_ = nullptr;
   __half *w16_ = nullptr, *a16_ = nullptr;
   size_t w16_elems_ = 0, a16_elems_ = 0;

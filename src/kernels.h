@@ -183,10 +183,14 @@ void mhc_leave(float* y, const float* a, const float* b, int64_t n, cudaStream_t
 void moe_matvec(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, int A, const int* ids,
                 const int* eid, const float* escale, const int8_t* xq, const float* xd, int xdiv, float* y,
                 cudaStream_t s, const uint8_t* const* wptr = nullptr);  // wptr: per-assignment expert pointers
+// grouped MMQ (MoE prefill): group e multiplies W + e*estride by x rows [goff[e], goff[e+1]) into the same y rows;
+// x from quantize_q8 (per 32); max_rows bounds the rows of a group
+void mmq_grouped(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, const int* goff, int ngroups,
+                 int max_rows, const int8_t* xq, const float* xd, float* y, int ldy, cudaStream_t s);
 // dst slot a <- the nbytes of expert ids[a] (src + ids[a]*estride; src may be mapped host memory)
 void gather_experts(const void* src, size_t estride, size_t nbytes, const int* ids, int A, void* dst, cudaStream_t s);
-// the same with a VRAM cache: expert e lives in cache slot slot_of[e] (>= 0) or is copied to dst slot a; ptr[a]
+// the same with a VRAM cache: expert e is read in place from eptr[e] (non-null: cached) or copied to dst slot a; ptr[a]
 // receives the expert's address, cnt[e] (optional) counts its uses
-void gather_experts_cached(const void* src, size_t estride, const int* ids, int A, const int* slot_of, const void* cache,
-                           void* dst, const uint8_t** ptr, int* cnt, cudaStream_t s);
+void gather_experts_cached(const void* src, size_t estride, const int* ids, int A, const uint8_t* const* eptr, void* dst,
+                           const uint8_t** ptr, int* cnt, cudaStream_t s);
 }  // namespace qk

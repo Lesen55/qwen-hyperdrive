@@ -30,8 +30,8 @@ void mix(const MixSrc& st, const float* query, int nq, int E, int T, const MixDs
 
 // loop controller pieces: y[t] = [rms(a[t]), rms(b[t])] (rows of 2E); out = cur - tanh(f)*cur + tanh(g)*msg
 void concat_rms(const float* a, const float* b, float* y, int E, int T, cudaStream_t s);
-void ctrl_combine(float* out, const float* cur, const float* msg, const float* g, const float* f, int64_t n,
-                  cudaStream_t s);
+// gf rows: [gain pre-activation (E) | forget pre-activation (E)]
+void ctrl_combine(float* out, const float* cur, const float* msg, const float* gf, int E, int T, cudaStream_t s);
 
 // causal short convolution with residual over T tokens of C channels (row stride C):
 // y = (x + sum_j w[c][j] x_{t-3+j} + [dyn: sum_lag x_{t-lag} dyn[t][head(c)*4 + lag]]) * inv
