@@ -22,24 +22,45 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <future>
+#include <memory>
+#include <string_view>
 #include <thread>
 
 namespace {
 
 const char* kUA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+using FetchClock = std::chrono::steady_clock;
+constexpr size_t kMaxUrlBytes = 8192;
 
 struct CurlOutput {
   std::string text;
-  bool success = false;
-  bool truncated = false;
+  std::string last_line;
+  size_t received = 0, last_break = std::string::npos;
+  int exit_code = -1;
+
+  void append(std::string_view data, size_t body_cap) {
+    text.append(data.substr(0, body_cap - text.size()));
+    const auto pos = data.rfind('\n');
+    if (pos != std::string::npos) {
+      last_break = received + pos;
+      last_line.clear();
+    }
+    received += data.size();
+    // Keep the final write-out line even after the captured body fills.
+    constexpr size_t cap = kMaxUrlBytes + 5;
+    last_line.append(data.substr(pos == std::string::npos ? 0 : pos + 1, cap - last_line.size()));
+  }
 };
 
 #ifdef _WIN32
 // Windows: spawn the system curl.exe (ships with Windows 10 1803+) without a console
-// window, capture stdout through an anonymous pipe, stop at max_bytes like the POSIX path.
+// window and read its stdout through an anonymous pipe.
 std::wstring widen(const std::string& s) {
   if (s.empty()) return L"";
   const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -95,24 +116,18 @@ CurlOutput run_curl(const std::vector<std::string>& args, size_t max_bytes, int 
   for (;;) {
     DWORD n = 0;
     if (!ReadFile(rd, buf, sizeof buf, &n, nullptr) || n == 0) break;
-    out.text.append(buf, std::min<size_t>(n, max_bytes - out.text.size()));
-    if (out.text.size() == max_bytes) {
-      out.truncated = true;
-      TerminateProcess(pi.hProcess, 1);
-      break;
-    }
+    out.append({buf, n}, max_bytes);
   }
   CloseHandle(rd);
   const DWORD waited = WaitForSingleObject(pi.hProcess, (DWORD)(timeout_s + 5) * 1000);
   if (waited == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
-  DWORD status = 1;
-  out.success = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &status) && status == 0;
+  DWORD status = 0;
+  if (waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &status)) out.exit_code = (int)status;
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
   return out;
 }
 #else
-// run curl (no shell), capture at most max_bytes of stdout
 // Build the child's argv before forking from a multithreaded server.
 CurlOutput run_curl(const std::vector<std::string>& args, size_t max_bytes, int) {
   // everything the child needs is built before fork (no allocation between fork and exec)
@@ -136,17 +151,15 @@ CurlOutput run_curl(const std::vector<std::string>& args, size_t max_bytes, int)
   char buf[65536];
   for (;;) {
     const ssize_t n = read(pfd[0], buf, sizeof buf);
+    if (n < 0 && errno == EINTR) continue;
     if (n <= 0) break;
-    out.text.append(buf, std::min<size_t>((size_t)n, max_bytes - out.text.size()));
-    if (out.text.size() == max_bytes) {
-      out.truncated = true;
-      kill(pid, SIGKILL);
-      break;
-    }
+    out.append({buf, (size_t)n}, max_bytes);
   }
   close(pfd[0]);
   int st = 0;
-  out.success = waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+  pid_t waited;
+  do { waited = waitpid(pid, &st, 0); } while (waited < 0 && errno == EINTR);
+  if (waited == pid && WIFEXITED(st)) out.exit_code = WEXITSTATUS(st);
   return out;
 }
 #endif  // _WIN32
@@ -309,7 +322,7 @@ bool public_ipv6(const in6_addr& address) {
 }
 
 bool parse_http_target(const std::string& url, HttpTarget& target) {
-  if (url.size() > 8192) return false;
+  if (url.size() > kMaxUrlBytes) return false;
   for (unsigned char c : url)
     if (c <= ' ' || c == '\x7f' || c == '"' || c == '\\') return false;
   const size_t s = url.find("://");
@@ -352,52 +365,90 @@ bool host_allowed(const std::string& url) {
   return parse_http_target(url, target);
 }
 
-std::string resolve_public(const HttpTarget& target) {
+std::string lookup_public_addresses(const HttpTarget& target) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* addresses = nullptr;
   if (getaddrinfo(target.host.c_str(), target.port.c_str(), &hints, &addresses) != 0) return {};
-  std::string result;
-  for (const addrinfo* i = addresses; i && result.empty(); i = i->ai_next) {
+  std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> entries(addresses, freeaddrinfo);
+  std::vector<std::string> approved;
+  for (const addrinfo* i = entries.get(); i; i = i->ai_next) {
     char numeric[INET6_ADDRSTRLEN];
+    std::string address;
     if (i->ai_family == AF_INET) {
       const auto& a = reinterpret_cast<const sockaddr_in*>(i->ai_addr)->sin_addr;
-      if (public_ipv4(a) && inet_ntop(AF_INET, &a, numeric, sizeof numeric)) result = numeric;
+      if (public_ipv4(a) && inet_ntop(AF_INET, &a, numeric, sizeof numeric)) address = numeric;
     } else if (i->ai_family == AF_INET6) {
       const auto& a = reinterpret_cast<const sockaddr_in6*>(i->ai_addr)->sin6_addr;
-      if (public_ipv6(a) && inet_ntop(AF_INET6, &a, numeric, sizeof numeric)) result = "[" + std::string(numeric) + "]";
+      if (public_ipv6(a) && inet_ntop(AF_INET6, &a, numeric, sizeof numeric)) address = "[" + std::string(numeric) + "]";
     }
+    if (!address.empty() && std::find(approved.begin(), approved.end(), address) == approved.end())
+      approved.push_back(std::move(address));
   }
-  freeaddrinfo(addresses);
+  std::string result;
+  for (const auto& address : approved) {
+    if (!result.empty()) result += ',';
+    result += address;
+  }
   return result;
 }
 
+std::string resolve_public(const HttpTarget& target, FetchClock::time_point deadline) {
+  // The platform resolver is synchronous. Workers own their inputs, and the
+  // bound also counts workers whose DNS lookup outlives the request deadline.
+  static std::atomic<int> outstanding{0};
+  constexpr int max_outstanding = 16;
+  if (FetchClock::now() >= deadline) return {};
+  std::promise<std::string> result;
+  auto future = result.get_future();
+  if (outstanding.fetch_add(1) >= max_outstanding) {
+    outstanding.fetch_sub(1);
+    return {};
+  }
+  try {
+    std::thread([target, deadline, result = std::move(result)]() mutable {
+      try {
+        result.set_value(FetchClock::now() < deadline ? lookup_public_addresses(target) : std::string{});
+      } catch (...) {
+        result.set_exception(std::current_exception());
+      }
+      outstanding.fetch_sub(1);
+    }).detach();
+  } catch (const std::system_error&) {
+    outstanding.fetch_sub(1);
+    return {};
+  } catch (...) {
+    outstanding.fetch_sub(1);
+    throw;
+  }
+  if (future.wait_until(deadline) != std::future_status::ready) return {};
+  return future.get();
+}
+
 std::string curl_get(std::string url, size_t max_bytes, int timeout_s) {
-  using Clock = std::chrono::steady_clock;
-  const auto deadline = Clock::now() + std::chrono::seconds(timeout_s);
+  const auto deadline = FetchClock::now() + std::chrono::seconds(timeout_s);
   for (int redirects = 0; redirects <= 3; ++redirects) {
     HttpTarget target;
     if (!parse_http_target(url, target)) return {};
-    const std::string address = resolve_public(target);
-    if (address.empty()) return {};
-    const auto remaining = std::chrono::ceil<std::chrono::seconds>(deadline - Clock::now()).count();
-    if (remaining <= 0) return {};
+    const std::string addresses = resolve_public(target, deadline);
+    const auto remaining = std::chrono::floor<std::chrono::milliseconds>(deadline - FetchClock::now());
+    if (addresses.empty() || remaining.count() <= 0) return {};
     // Disable curlrc/proxies and pin the checked binding for this single HTTP hop.
     const std::vector<std::string> args = {
-        "-q", "-s", "--globoff", "--compressed", "--max-time", std::to_string(remaining), "--max-filesize",
+        "-q", "-s", "--globoff", "--compressed", "--max-time", std::to_string(remaining.count() / 1000.0), "--max-filesize",
         std::to_string(max_bytes * 4), "--proto", "=http,https", "--noproxy", "*", "--resolve",
-        target.host + ":" + target.port + ":" + address, "-A", kUA, "-H", "Accept-Language: ja,en;q=0.8",
+        target.host + ":" + target.port + ":" + addresses, "-A", kUA, "-H", "Accept-Language: ja,en;q=0.8",
         "--write-out", "\\n%{http_code} %{redirect_url}", "--", target.url};
-    auto out = run_curl(args, max_bytes + 8192 + 5, (int)remaining);
-    if (out.truncated) return out.text.substr(0, max_bytes);
-    if (!out.success) return {};
-    const auto split = out.text.rfind('\n');
-    if (split == std::string::npos || out.text.size() < split + 5 || out.text[split + 4] != ' ') return {};
-    const auto code = out.text.substr(split + 1, 3);
-    url = out.text.substr(split + 5);
+    const auto out = run_curl(args, max_bytes, (int)std::chrono::ceil<std::chrono::seconds>(remaining).count());
+    // curl still writes metadata on a maximum-file-size exit (63).
+    if (out.exit_code != 0 && out.exit_code != 63) return {};
+    if (out.last_break == std::string::npos || out.last_line.size() < 4 || out.last_line[3] != ' ') return {};
+    const auto code = out.last_line.substr(0, 3);
+    if (code.find_first_not_of("0123456789") != std::string::npos) return {};
+    url = out.last_line.substr(4);
     if ((code == "301" || code == "302" || code == "303" || code == "307" || code == "308") && !url.empty()) continue;
-    return out.text.substr(0, std::min(split, max_bytes));
+    return out.text.substr(0, out.last_break);
   }
   return {};
 }

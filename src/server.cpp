@@ -45,6 +45,7 @@ inline void qe_close_sock(QeSock s) { close(s); }
 #include <ctime>
 #include <condition_variable>
 #include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 
@@ -959,18 +960,19 @@ int main(int argc, char** argv) {
     if (srv.draft->cfg().n_vocab != srv.model->cfg().n_vocab) QE_FATAL("draft model vocabulary differs from the model's");
     srv.gen->set_draft_model(srv.draft.get());
   }
-  {
-    std::string p = srv.opt.model_path;
-    const size_t sl = p.find_last_of('/');
-    srv.model_name = sl == std::string::npos ? p : p.substr(sl + 1);
-  }
+  srv.model_name = std::filesystem::path(srv.opt.model_path).filename().string();
 #ifdef _WIN32
   const QeSock ls = socket(AF_INET, SOCK_STREAM, 0);
 #else
   const QeSock ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
 #endif
   int one = 1;
+#ifdef _WIN32
+  if (setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&one, sizeof one) != 0)
+    QE_FATAL("could not configure exclusive listener binding: Winsock error %d", WSAGetLastError());
+#else
   setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
+#endif
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
