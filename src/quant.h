@@ -300,6 +300,44 @@ template <> QE_HD void dequant32<23>(const uint8_t* p, int ib, float* y) {  // I
   }
 }
 
+template <> QE_HD void dequant32<20>(const uint8_t* p, int ib, float* y) {  // IQ4_NL: 8 blocks of 32 per "super-block"
+  const uint8_t* b = p + 18 * ib;
+  uint16_t d;
+  memcpy(&d, b, 2);
+  const float dl = qe_h2f(d);
+  for (int j = 0; j < 16; j++) {
+    y[j] = dl * QTAB(kvalues_iq4nl)[b[2 + j] & 0xf];
+    y[j + 16] = dl * QTAB(kvalues_iq4nl)[b[2 + j] >> 4];
+  }
+}
+// NVFP4 (ggml): 64-element blocks of 4 UE4M3 scales (one per 16) + 32 bytes of E2M1 nibbles; sub-block s holds
+// elements 16s+j (low nibble of qs[8s+j]) and 16s+8+j (high nibble), values = kFp4x2[q] * ue4m3(d) (the table is
+// doubled and the scale halved, as in ggml)
+QE_HD float qe_ue4m3(uint8_t x) {
+  if (x == 0 || x == 0x7F) return 0.f;
+  const int e = (x >> 3) & 0xF, m = x & 7;
+  float v;
+  if (e == 0) v = (float)m * (1.f / 1024.f);  // m * 2^-9 * 0.5
+  else {
+    uint32_t bits = (uint32_t)(e + 119) << 23 | (uint32_t)m << 20;  // (1 + m/8) * 2^(e-7) * 0.5
+    memcpy(&v, &bits, 4);
+  }
+  return v;
+}
+template <> QE_HD void dequant32<40>(const uint8_t* p, int ib, float* y) {  // NVFP4: 4 blocks of 64 per "super-block"
+  const int8_t kFp4x2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+  const uint8_t* b = p + 36 * (ib >> 1);
+  for (int h = 0; h < 2; h++) {
+    const int s = 2 * (ib & 1) + h;
+    const float d = qe_ue4m3(b[s]);
+    const uint8_t* q = b + 4 + 8 * s;
+    for (int j = 0; j < 8; j++) {
+      y[16 * h + j] = d * kFp4x2[q[j] & 0xf];
+      y[16 * h + 8 + j] = d * kFp4x2[q[j] >> 4];
+    }
+  }
+}
+
 // Runtime-dispatched reference dequant of a whole row (host only, used by tests / CPU fallback).
 inline void dequant_row_ref(uint32_t type, const uint8_t* row, int64_t n, float* y) {
   if (type == 0) { memcpy(y, row, n * 4); return; }
@@ -322,8 +360,9 @@ inline void dequant_row_ref(uint32_t type, const uint8_t* row, int64_t n, float*
     case 22: f = dequant32<22>; bb = 82; break;
     case 23: f = dequant32<23>; bb = 136; break;
     case 29: f = dequant32<29>; bb = 56; break;
+    case 20: f = dequant32<20>; bb = 144; break;
+    case 40: f = dequant32<40>; bb = 144; break;
     default: return;
   }
-  for (int64_t b = 0; b < n / 256; b++)
-    for (int g = 0; g < 8; g++) f(row + b * bb, g, y + b * 256 + g * 32);
+  for (int64_t g = 0; g < n / 32; g++) f(row + (g >> 3) * bb, (int)(g & 7), y + g * 32);
 }

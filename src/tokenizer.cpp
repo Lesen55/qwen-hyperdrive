@@ -101,6 +101,81 @@ size_t match_at(const std::vector<uint32_t>& c, size_t i) {
   return 1;
 }
 
+// GPT-4o pre-tokenizer (inkling2, gpt-4o, llama4):
+// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+// \p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+inline bool isUp(uint32_t c) { return c < 128 ? (c >= 'A' && c <= 'Z') : in_table(kUni_LUT, c); }
+inline bool isLo(uint32_t c) { return c < 128 ? (c >= 'a' && c <= 'z') : in_table(kUni_LL, c); }
+// U = upper-or-caseless letter / mark, Lw = lower-or-caseless letter / mark
+inline bool isU(uint32_t c) { return isM(c) || (isL(c) && !isLo(c)); }
+inline bool isLw(uint32_t c) { return isM(c) || (isL(c) && !isUp(c)); }
+
+size_t contraction(const std::vector<uint32_t>& c, size_t j) {
+  const size_t n = c.size();
+  auto lower = [](uint32_t x) { return x < 128 ? (x | 32) : x; };
+  if (j < n && c[j] == '\'' && j + 1 < n) {
+    const uint32_t a = lower(c[j + 1]);
+    if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+    if (j + 2 < n) {
+      const uint32_t b = lower(c[j + 2]);
+      if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return 3;
+    }
+  }
+  return 0;
+}
+
+// letter run U*Lw+ (alt 1) or U+Lw* (alt 2) starting at j; returns its end or 0 when neither matches
+size_t letters_at(const std::vector<uint32_t>& c, size_t j) {
+  const size_t n = c.size();
+  size_t e = j;
+  while (e < n && isU(c[e])) e++;
+  // alt 1: U* greedy, then Lw+ (backtracking into U* to the last caseless char if needed)
+  if (e < n && isLw(c[e])) {
+    while (e < n && isLw(c[e])) e++;
+    return e;
+  }
+  for (size_t k = e; k > j; k--)
+    if (isLw(c[k - 1])) return k;
+  // alt 2: U+ Lw* (Lw* is empty here: c[e] is not Lw)
+  return e > j ? e : 0;
+}
+
+size_t match_gpt4o(const std::vector<uint32_t>& c, size_t i) {
+  const size_t n = c.size();
+  // optional [^\r\n\p{L}\p{N}] prefix, then the letter run
+  for (int pre = 1; pre >= 0; pre--) {
+    const size_t j = i + pre;
+    if (pre && (isL(c[i]) || isN(c[i]) || isNL(c[i]) || j >= n)) continue;
+    if (const size_t e = letters_at(c, j)) return e + contraction(c, e) - i;
+  }
+  if (isN(c[i])) {
+    size_t j = i;
+    while (j < n && j < i + 3 && isN(c[j])) j++;
+    return j - i;
+  }
+  // ' ?[^\s\p{L}\p{N}]+[\r\n/]*'
+  {
+    size_t j = i;
+    if (c[j] == ' ') j++;
+    if (j < n && !isWS(c[j]) && !isL(c[j]) && !isN(c[j])) {
+      while (j < n && !isWS(c[j]) && !isL(c[j]) && !isN(c[j])) j++;
+      while (j < n && (isNL(c[j]) || c[j] == '/')) j++;
+      return j - i;
+    }
+  }
+  size_t e = i;
+  while (e < n && isWS(c[e])) e++;
+  if (e > i) {
+    for (size_t k = e; k > i; k--)
+      if (isNL(c[k - 1])) return k - i;
+    if (e == n) return e - i;
+    if (e - i >= 2) return e - i - 1;
+    return 1;
+  }
+  return 1;
+}
+
 }  // namespace
 
 Tokenizer::Tokenizer(const GGUFFile& f) {
@@ -121,6 +196,15 @@ Tokenizer::Tokenizer(const GGUFFile& f) {
     if (type_[i] == 3 || type_[i] == 4) specials_.emplace_back(tokens_[i], (int)i);
   std::sort(specials_.begin(), specials_.end(), [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
   eos_ = (int)f.get_int("tokenizer.ggml.eos_token_id", -1);
+  const std::string pre = f.get_str("tokenizer.ggml.pre", "");
+  gpt4o_ = pre == "inkling2" || pre == "gpt-4o" || pre == "llama4";
+  ignore_merges_ = pre == "inkling2";
+  for (auto& [t, id] : specials_) {
+    special_ids_.emplace(t, id);
+    if (std::find(special_lens_.begin(), special_lens_.end(), t.size()) == special_lens_.end()) special_lens_.push_back(t.size());
+    special_first_[(unsigned char)t[0]] = true;
+  }
+  std::sort(special_lens_.begin(), special_lens_.end(), std::greater<size_t>());
   // GPT-2 byte <-> unicode mapping
   int n = 0;
   for (int b = 0; b < 256; b++) {
@@ -144,6 +228,15 @@ void Tokenizer::bpe(const std::string& word, std::vector<int>& out) const {
   }
   // symbols = mapped chars of each byte
   std::vector<std::string> sym;
+  if (ignore_merges_) {  // a pre-token that is itself a vocabulary entry is kept whole
+    std::string m;
+    for (unsigned char b : word) m += byte_enc_[b];
+    auto it = vocab_.find(m);
+    if (it != vocab_.end()) {
+      out.push_back(it->second);
+      return;
+    }
+  }
   for (unsigned char b : word) sym.push_back(byte_enc_[b]);
   while (sym.size() > 1) {
     int best = INT_MAX;
@@ -172,36 +265,41 @@ void Tokenizer::bpe(const std::string& word, std::vector<int>& out) const {
 
 std::vector<int> Tokenizer::encode(const std::string& text, bool parse_special) const {
   std::vector<int> out;
-  size_t pos = 0;
   auto encode_plain = [&](const std::string& seg) {
     std::vector<uint32_t> cps;
     std::vector<size_t> offs;
     utf8_decode(seg, cps, offs);
     size_t i = 0;
     while (i < cps.size()) {
-      const size_t len = match_at(cps, i);
+      const size_t len = gpt4o_ ? match_gpt4o(cps, i) : match_at(cps, i);
       bpe(seg.substr(offs[i], offs[i + len] - offs[i]), out);
       i += len;
     }
   };
-  while (pos < text.size()) {
-    size_t next = std::string::npos;
-    int sid = -1;
-    size_t slen = 0;
-    if (parse_special) {
-      for (auto& [s, id] : specials_) {
-        const size_t p = text.find(s, pos);
-        if (p != std::string::npos && (p < next || (p == next && s.size() > slen))) { next = p; sid = id; slen = s.size(); }
-      }
+  // control tokens: scan for positions where one starts (first-byte filter, then exact lookups by length)
+  auto special_at = [&](size_t p, size_t& len) -> int {
+    if (!special_first_[(unsigned char)text[p]]) return -1;
+    for (size_t l : special_lens_) {
+      if (p + l > text.size()) continue;
+      auto it = special_ids_.find(text.substr(p, l));
+      if (it != special_ids_.end()) { len = l; return it->second; }
     }
-    if (sid < 0) {
-      encode_plain(text.substr(pos));
-      break;
+    return -1;
+  };
+  size_t seg = 0;
+  if (parse_special && !specials_.empty()) {
+    for (size_t p = 0; p < text.size(); p++) {
+      size_t len = 0;
+      const int sid = special_at(p, len);
+      if (sid < 0) continue;
+      if (p > seg) encode_plain(text.substr(seg, p - seg));
+      out.push_back(sid);
+      seg = p + len;
+      p = seg - 1;
     }
-    if (next > pos) encode_plain(text.substr(pos, next - pos));
-    out.push_back(sid);
-    pos = next + slen;
   }
+  if (seg < text.size()) encode_plain(text.substr(seg));
+
   return out;
 }
 

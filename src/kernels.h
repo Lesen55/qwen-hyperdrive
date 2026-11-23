@@ -177,4 +177,16 @@ void mhc_route(const float* a, const float* b, const float* w, const float* bias
                cudaStream_t s);
 void mhc_merge(float* a, float* b, const float* x, const float* pk, int d, int T, cudaStream_t s);
 void mhc_leave(float* y, const float* a, const float* b, int64_t n, cudaStream_t s);
+// ---- MoE ---------------------------------------------------------------------------------------
+// y[a*N + r] = (W_e[r,:] . x[a / xdiv]) * escale[eid[a]] for assignments a < A, expert e = ids[a] (ids null: e = a,
+// experts gathered into slots); W_e = W + e * estride.  Activations from quantize_q8 (K % 32 == 0).
+void moe_matvec(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, int A, const int* ids,
+                const int* eid, const float* escale, const int8_t* xq, const float* xd, int xdiv, float* y,
+                cudaStream_t s, const uint8_t* const* wptr = nullptr);  // wptr: per-assignment expert pointers
+// dst slot a <- the nbytes of expert ids[a] (src + ids[a]*estride; src may be mapped host memory)
+void gather_experts(const void* src, size_t estride, size_t nbytes, const int* ids, int A, void* dst, cudaStream_t s);
+// the same with a VRAM cache: expert e lives in cache slot slot_of[e] (>= 0) or is copied to dst slot a; ptr[a]
+// receives the expert's address, cnt[e] (optional) counts its uses
+void gather_experts_cached(const void* src, size_t estride, const int* ids, int A, const int* slot_of, const void* cache,
+                           void* dst, const uint8_t** ptr, int* cnt, cudaStream_t s);
 }  // namespace qk

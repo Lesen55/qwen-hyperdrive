@@ -3,8 +3,15 @@
 #include "common.h"
 #include "gguf.h"
 #include "model.h"
+#include "inkling.h"
 
-std::unique_ptr<IModel> create_model(const EngineOptions& opt) { return std::make_unique<Model>(opt); }
+std::unique_ptr<IModel> create_model(const EngineOptions& opt) {
+  {
+    GGUFFile g(opt.model_path);
+    if (is_inkling_arch(g.get_str("general.architecture", ""))) return std::make_unique<InklingModel>(opt);
+  }
+  return std::make_unique<Model>(opt);
+}
 const char* backend_name() { return "cuda"; }
 
 std::unique_ptr<IModel> create_draft_model(const std::string& path, const EngineOptions& target) {

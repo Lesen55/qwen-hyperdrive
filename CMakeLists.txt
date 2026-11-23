@@ -59,7 +59,7 @@ endfunction()
 # ---- CUDA backend
 if(QE_CUDA)
   find_package(CUDAToolkit REQUIRED)
-  add_library(qecore STATIC src/model.cpp src/backend_cuda.cpp src/kernels.cu)
+  add_library(qecore STATIC src/model.cpp src/backend_cuda.cpp src/kernels.cu src/inkling.cpp src/inkling_kernels.cu)
   target_include_directories(qecore PUBLIC src)
   target_compile_options(qecore PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${QE_CPU_FLAGS} -Wall -Wno-unused-function>

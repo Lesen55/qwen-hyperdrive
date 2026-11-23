@@ -28,5 +28,10 @@ class Tokenizer {
   std::string byte_enc_[256];            // byte -> mapped UTF-8 string
   std::unordered_map<uint32_t, uint8_t> byte_dec_;  // mapped codepoint -> byte
   int eos_ = -1;
+  bool gpt4o_ = false;          // GPT-4o pre-tokenizer (else qwen35)
+  bool ignore_merges_ = false;  // whole pre-tokens found in the vocabulary skip BPE
+  std::unordered_map<std::string, int> special_ids_;
+  std::vector<size_t> special_lens_;  // distinct control-token lengths, longest first
+  bool special_first_[256] = {};
   mutable std::unordered_map<std::string, std::vector<int>> cache_;
 };

@@ -268,6 +268,50 @@ struct QDec<QT_IQ4_XS> {
     for (int l = 0; l < 4; l++) o.sc[l] = dl;
   }
 };
+// IQ4_NL: blocks of 32 (f16 d + 16 bytes of nibbles); a "super-block" here is 8 consecutive blocks
+template <>
+struct QDec<QT_IQ4_NL> {
+  static constexpr int SCALES = 1;
+  static constexpr int BB = 144;
+  static constexpr bool OFF = false;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, W32& o) {
+    const uint8_t* blk = b + 18 * ib;
+    const float dl = h2f(blk);
+    const uint32_t* tab = (const uint32_t*)qtab_dev::kvalues_iq4nl;
+    uint32_t t[4] = {tab[0], tab[1], tab[2], tab[3]};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const uint32_t q = ld32a2(blk + 2 + 4 * i);
+      o.w[i] = lut16(q & 0x0F0F0F0F, t);
+      o.w[4 + i] = lut16((q >> 4) & 0x0F0F0F0F, t);
+    }
+#pragma unroll
+    for (int l = 0; l < 4; l++) o.sc[l] = dl;
+  }
+};
+// NVFP4: blocks of 64 (4 UE4M3 scales, one per 16, + 32 bytes of E2M1 nibbles); a "super-block" here is 4
+// blocks; chunk ib = half ib&1 of block ib>>1 (sub-blocks 2(ib&1), 2(ib&1)+1); values doubled, scales halved
+template <>
+struct QDec<QT_NVFP4> {
+  static constexpr int SCALES = 2;
+  static constexpr int BB = 144;
+  static constexpr bool OFF = false;
+  static __device__ __forceinline__ void dec(const uint8_t* b, int ib, W32& o) {
+    const uint8_t* blk = b + 36 * (ib >> 1);
+    const uint32_t t[4] = {0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu};
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+      const int s = 2 * (ib & 1) + h;
+      const uint8_t* q = blk + 4 + 8 * s;
+      const uint32_t q0 = ld32a4(q), q1 = ld32a4(q + 4);
+      o.w[4 * h + 0] = lut16(q0 & 0x0F0F0F0F, t);
+      o.w[4 * h + 1] = lut16(q1 & 0x0F0F0F0F, t);
+      o.w[4 * h + 2] = lut16((q0 >> 4) & 0x0F0F0F0F, t);
+      o.w[4 * h + 3] = lut16((q1 >> 4) & 0x0F0F0F0F, t);
+      o.sc[2 * h] = o.sc[2 * h + 1] = qe_ue4m3(blk[s]);
+    }
+  }
+};
 template <>
 struct QDec<QT_Q2_K> {
   static constexpr int SCALES = 2;  // distinct scale groups per 32 weights
@@ -1277,15 +1321,31 @@ void matvec_rows(uint32_t type, const void* W, size_t rb, int K, const int* rows
   switch (type) {
 #define T(t) case t: k_mmv_rows<t><<<cdiv(N, MMV_WARPS), MMV_WARPS * 32, 0, s>>>(w, rb, K, rows, N, xq, xd, y); break;
     T(QT_Q8_0) T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
-    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS)
+    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS) T(QT_IQ4_NL) T(QT_NVFP4)
 #undef T
     default: QE_FATAL("matvec_rows: unsupported type %u", type);
+  }
+}
+
+// one warp per row, K % 32 == 0 only (types whose rows need not hold whole 256-element super-blocks)
+template <int T>
+static void launch_mmv_direct(const void* W, size_t rb, int K, int N, const int8_t* xq, const float* xd, int B,
+                              float* y, int ldy, bool acc, cudaStream_t s) {
+  const uint8_t* w = (const uint8_t*)W;
+  const dim3 grid(cdiv(N, MMV_WARPS)), block(MMV_WARPS * 32);
+  switch (B) {
+#define CASE(n) case n: k_mmv<T, n, 1><<<grid, block, 0, s>>>(w, rb, K, N, xq, xd, y, ldy, acc); break;
+    CASE(1) CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8)
+#undef CASE
+    default: QE_FATAL("matvec: B=%d", B);
   }
 }
 
 void matvec(uint32_t type, const void* W, size_t rb, int K, int N, const int8_t* xq,
             const float* xd, const float* xf, int B, float* y, int ldy, bool acc, cudaStream_t s) {
   switch (type) {
+    case QT_IQ4_NL: launch_mmv_direct<QT_IQ4_NL>(W, rb, K, N, xq, xd, B, y, ldy, acc, s); break;
+    case QT_NVFP4: launch_mmv_direct<QT_NVFP4>(W, rb, K, N, xq, xd, B, y, ldy, acc, s); break;
     case QT_F32: launch_mmv_float<QT_F32>(W, rb, K, N, xf, B, y, ldy, acc, s); break;
     case QT_F16: launch_mmv_float<QT_F16>(W, rb, K, N, xf, B, y, ldy, acc, s); break;
     case QT_BF16: launch_mmv_float<QT_BF16>(W, rb, K, N, xf, B, y, ldy, acc, s); break;
@@ -2538,7 +2598,7 @@ void dequant_f16(uint32_t type, const void* W, size_t rb, int K, int N, __half* 
     case QT_BF16: k_dequant_f16_float<QT_BF16><<<cdiv((int64_t)N * K, 256), 256, 0, s>>>(w, rb, K, N, dst); break;
 #define T(t) case t: k_dequant_f16<t><<<cdiv(n32, 128), 128, 0, s>>>(w, rb, K, N, dst); break;
     T(QT_Q8_0) T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
-    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS)
+    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS) T(QT_IQ4_NL) T(QT_NVFP4)
 #undef T
     default: QE_FATAL("dequant_f16: unsupported type %u", type);
   }
@@ -4402,5 +4462,92 @@ __global__ void k_mhc_leave(float* y, const float* __restrict__ a, const float* 
 }
 void mhc_leave(float* y, const float* a, const float* b, int64_t n, cudaStream_t s) {
   k_mhc_leave<<<cdiv(n, 256), 256, 0, s>>>(y, a, b, n);
+}
+}  // namespace qk
+
+// =============================================================================================
+// MoE small-batch matvec: assignment a = blockIdx.y uses expert e = ids[a] (or a when ids is null:
+// the experts were gathered into slots), activation row a / xdiv, and writes y[a*N + r] * escale[eid[a]].
+// =============================================================================================
+namespace qk {
+template <int T>
+__global__ void __launch_bounds__(MMV_WARPS * 32)
+    k_moe_mmv(const uint8_t* __restrict__ W, size_t estride, size_t rb, int K, int N, const int* __restrict__ ids,
+              const int* __restrict__ eid, const float* __restrict__ escale, const int8_t* __restrict__ xq,
+              const float* __restrict__ xd, int xdiv, float* __restrict__ y, const uint8_t* const* __restrict__ wptr) {
+  using D = QDec<T>;
+  const int a = blockIdx.y;
+  const int row = blockIdx.x * MMV_WARPS + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (row >= N) return;
+  const int e = ids ? __ldg(ids + a) : a;
+  const uint8_t* wr = (wptr ? wptr[a] : W + (size_t)e * estride) + (size_t)row * rb;
+  const int nsb = K / 32;
+  const int xr = a / xdiv;
+  const int8_t* xa = xq + (size_t)xr * K;
+  const float* da = xd + (size_t)xr * nsb;
+  float sum = 0.f;
+  for (int g = lane; g < nsb; g += 32) {
+    W32 w;
+    D::dec(wr + (size_t)(g >> 3) * D::BB, g & 7, w);
+    const int4* xp = (const int4*)(xa + (size_t)g * 32);
+    sum += dot_w32<D::OFF, D::SCALES>(w, __ldg(xp), __ldg(xp + 1)) * __ldg(da + g);
+  }
+  sum = warp_sum(sum);
+  if (lane == 0) y[(size_t)a * N + row] = sum * (escale ? __ldg(escale + __ldg(eid + a)) : 1.f);
+}
+
+void moe_matvec(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, int A, const int* ids,
+                const int* eid, const float* escale, const int8_t* xq, const float* xd, int xdiv, float* y,
+                cudaStream_t s, const uint8_t* const* wptr) {
+  const dim3 grid(cdiv(N, MMV_WARPS), A), block(MMV_WARPS * 32);
+  const uint8_t* w = (const uint8_t*)W;
+  switch (type) {
+#define T(t) case t: k_moe_mmv<t><<<grid, block, 0, s>>>(w, estride, rb, K, N, ids, eid, escale, xq, xd, xdiv, y, wptr); break;
+    T(QT_Q8_0) T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS) T(QT_IQ4_NL) T(QT_NVFP4)
+#undef T
+    default: QE_FATAL("moe_matvec: unsupported type %u", type);
+  }
+}
+
+// dst slot a <- expert ids[a] (nbytes each, 16-byte multiples) from `src` (device or mapped host memory)
+__global__ void k_gather_experts(const uint4* __restrict__ src, size_t estride16, size_t n16, const int* __restrict__ ids,
+                                 uint4* __restrict__ dst) {
+  const int a = blockIdx.y;
+  const uint4* s = src + (size_t)__ldg(ids + a) * estride16;
+  uint4* d = dst + (size_t)a * n16;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t)gridDim.x * blockDim.x) d[i] = s[i];
+}
+void gather_experts(const void* src, size_t estride, size_t nbytes, const int* ids, int A, void* dst, cudaStream_t s) {
+  QE_ASSERT(estride % 16 == 0 && nbytes % 16 == 0 && ((uintptr_t)src & 15) == 0);
+  // enough 16-byte loads in flight to cover PCIe latency (zero-copy reads of write-combined host memory reach
+  // memcpy speed only with ~4096 blocks of 1024 threads)
+  const int per = std::max(64, 4096 / std::max(1, A));
+  k_gather_experts<<<dim3(per, A), 1024, 0, s>>>((const uint4*)src, estride / 16, nbytes / 16, ids, (uint4*)dst);
+}
+// Like gather_experts, but experts with a VRAM cache slot (slot_of[e] >= 0) are not copied: ptr[a] points at the
+// cache slot or at the staging copy.  cnt[e] counts the uses (cache policy).
+__global__ void k_gather_cached(const uint4* __restrict__ src, size_t estride16, size_t n16, const int* __restrict__ ids,
+                                const int* __restrict__ slot_of, const uint8_t* cache, uint4* __restrict__ dst,
+                                const uint8_t** ptr, int* cnt) {
+  const int a = blockIdx.y;
+  const int e = __ldg(ids + a);
+  const int sl = slot_of[e];
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    ptr[a] = sl >= 0 ? cache + (size_t)sl * estride16 * 16 : (const uint8_t*)(dst + (size_t)a * n16);
+    if (cnt) atomicAdd(cnt + e, 1);
+  }
+  if (sl >= 0) return;
+  const uint4* sp = src + (size_t)e * estride16;
+  uint4* d = dst + (size_t)a * n16;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t)gridDim.x * blockDim.x) d[i] = sp[i];
+}
+void gather_experts_cached(const void* src, size_t estride, const int* ids, int A, const int* slot_of, const void* cache,
+                           void* dst, const uint8_t** ptr, int* cnt, cudaStream_t s) {
+  QE_ASSERT(estride % 16 == 0 && ((uintptr_t)src & 15) == 0);
+  const int per = std::max(64, 4096 / std::max(1, A));
+  k_gather_cached<<<dim3(per, A), 1024, 0, s>>>((const uint4*)src, estride / 16, estride / 16, ids, slot_of,
+                                                 (const uint8_t*)cache, (uint4*)dst, ptr, cnt);
 }
 }  // namespace qk
