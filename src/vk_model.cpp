@@ -178,7 +178,11 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
     }
     w16_ = vk_->alloc(mx, Mem::Device, true);
     const int kmax = std::max({2 * c.n_embd, c.n_ff, c.d_inner, c.n_head * c.hd});
-    if (vk_->coopmat) x16_ = vk_->alloc((size_t)ub_ * kmax * 2, Mem::Device, true);
+    // The cooperative-matrix self-test also stages 128 rows of 512 elements.
+    if (vk_->coopmat) {
+      const size_t padded_rows = ((size_t)ub_ + 63) / 64 * 64;
+      x16_ = vk_->alloc(std::max(padded_rows * kmax, size_t{128 * 512}) * 2, Mem::Device, true);
+    }
     if (vk_->int_dot) {
       xq8_ = vk_->alloc((size_t)kMaxTok * kmax, Mem::Device, true);
       xd8_ = vk_->alloc((size_t)kMaxTok * kmax / 32 * 4, Mem::Device, true);
@@ -466,6 +470,12 @@ VkModel::VMat VkModel::load_mat(const std::string& name, bool prefer_device) {
   if (m.rb % 4) QE_FATAL("vulkan backend: %s rows are not 4-byte aligned", name.c_str());
   const size_t bytes = m.rb * m.N;
   if (zero_copy_ && prefer_device && zc_view(t.data, bytes, m.buf)) return m;
+  const size_t free = vk_->vram_free();
+  const size_t available = free > reserve_ ? free - reserve_ : 0;
+  const bool fits = bytes <= available;
+  if (!fits && vk_->integrated)
+    QE_FATAL("not enough memory for %s (%.0f MiB free after the %.0f MiB reserve): use a smaller model or context",
+             name.c_str(), available / 1048576.0, reserve_ / 1048576.0);
   if (zero_copy_) {
     m.buf = vk_->alloc(bytes, Mem::SharedWeights);
     if (m.buf.buf) {
@@ -476,10 +486,6 @@ VkModel::VMat VkModel::load_mat(const std::string& name, bool prefer_device) {
     }
   }
   if (!m.buf.buf) {
-    const bool fits = vk_->vram_free() > bytes + reserve_;
-    if (!fits && vk_->integrated)
-      QE_FATAL("not enough memory for %s (%.0f MiB free after the %.0f MiB reserve): use a smaller model or context",
-               name.c_str(), (vk_->vram_free() > reserve_ ? vk_->vram_free() - reserve_ : 0) / 1048576.0, reserve_ / 1048576.0);
     // mapped device memory (ReBAR dGPU, any iGPU): the upload is a memcpy, no staging copy
     m.buf = vk_->alloc(bytes, prefer_device && fits ? Mem::DeviceMapped : Mem::Host);
     upload(m.buf, t.data, bytes);
@@ -1354,7 +1360,12 @@ void VkModel::forward_chunk(const int* tokens, int T, int pos0) {
   pend_ = false;
   // prefill: split the pass into several submissions so no single one runs for seconds (GPU drivers
   // reset jobs that exceed their timeout: Xe / i915 / amdgpu; an iGPU runs a 27B layer in ~0.1 s)
-  const int every = zero_copy_ && !vk_->integrated ? 1 : T > kMaxTok ? submit_layers_ : 1 << 30;
+  // Co-execution must reach submit_pass() before waiting for the CPU's layer events.
+  int every = (int)layers_.size();
+  if (!pass_hyb_) {
+    if (zero_copy_ && !vk_->integrated) every = 1;
+    else if (T > kMaxTok) every = submit_layers_;
+  }
   int nl = 0;
   for (auto& L : layers_) {
     if (L.attn) layer_attn(L, T, pos0);

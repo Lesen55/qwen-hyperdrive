@@ -3,6 +3,9 @@
 #include "common.h"
 
 #ifndef _WIN32
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -13,17 +16,26 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #endif
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <thread>
 
 namespace {
 
 const char* kUA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+struct CurlOutput {
+  std::string text;
+  bool success = false;
+  bool truncated = false;
+};
 
 #ifdef _WIN32
 // Windows: spawn the system curl.exe (ships with Windows 10 1803+) without a console
@@ -36,80 +48,105 @@ std::wstring widen(const std::string& s) {
   return w;
 }
 
-std::string curl_get(const std::string& url, size_t max_bytes, int timeout_s) {
-  // Keep the quoted URL intact through Windows argument parsing and curl URL handling.
-  for (unsigned char c : url)
-    if (c <= ' ' || c == '\x7f' || c == '"' || c == '\\') return "";
-  const std::string to = std::to_string(timeout_s), mx = std::to_string(max_bytes * 4);
-  std::string cmd = "curl.exe -sL --globoff --compressed --max-time " + to + " --max-filesize " + mx +
-                    " --max-redirs 3 --proto =http,https --proto-redir =http,https -A \"" + kUA +
-                    "\" -H \"Accept-Language: ja,en;q=0.8\" -- \"" + url + "\"";
+// Launch only the copy supplied by Windows.
+CurlOutput run_curl(const std::vector<std::string>& args, size_t max_bytes, int timeout_s) {
+  wchar_t directory[MAX_PATH];
+  const auto len = GetSystemDirectoryW(directory, MAX_PATH);
+  if (!len || len >= MAX_PATH) return {};
+  const std::wstring application = std::wstring(directory, len) + L"\\curl.exe";
+  // Arguments are fixed strings, validated URLs, or addresses formatted by inet_ntop.
+  std::string cmd = "curl.exe";
+  for (const auto& arg : args) cmd += " \"" + arg + "\"";
+  // curl accepts the executable name as argv[0] and disables curlrc with the first option.
   std::wstring wcmd = widen(cmd);
 
   SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
   HANDLE rd = nullptr, wr = nullptr;
-  if (!CreatePipe(&rd, &wr, &sa, 0)) return "";
-  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  if (!CreatePipe(&rd, &wr, &sa, 0)) return {};
+  if (!SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0)) { CloseHandle(rd); CloseHandle(wr); return {}; }
   HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+  if (nul == INVALID_HANDLE_VALUE) { CloseHandle(rd); CloseHandle(wr); return {}; }
 
-  STARTUPINFOW si{};
-  si.cb = sizeof si;
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdOutput = wr;
-  si.hStdError = nul;
-  si.hStdInput = nul;
+  SIZE_T attr_size = 0;
+  InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+  std::vector<unsigned char> storage(attr_size);
+  STARTUPINFOEXW si{};
+  si.StartupInfo.cb = sizeof si;
+  si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  si.StartupInfo.hStdOutput = wr;
+  si.StartupInfo.hStdError = nul;
+  si.StartupInfo.hStdInput = nul;
+  si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+  const BOOL initialized = attr_size && InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size);
+  HANDLE inherited[] = {wr, nul};
   PROCESS_INFORMATION pi{};
-  const BOOL ok = CreateProcessW(nullptr, wcmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+  const BOOL ok = initialized &&
+      UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof inherited,
+                                nullptr, nullptr) &&
+      CreateProcessW(application.c_str(), wcmd.data(), nullptr, nullptr, TRUE,
+                     CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &si.StartupInfo, &pi);
+  if (initialized) DeleteProcThreadAttributeList(si.lpAttributeList);
   CloseHandle(wr);
-  if (nul) CloseHandle(nul);
-  if (!ok) { CloseHandle(rd); return ""; }
+  CloseHandle(nul);
+  if (!ok) { CloseHandle(rd); return {}; }
 
-  std::string out;
+  CurlOutput out;
   char buf[65536];
   for (;;) {
     DWORD n = 0;
     if (!ReadFile(rd, buf, sizeof buf, &n, nullptr) || n == 0) break;
-    out.append(buf, n);
-    if (out.size() >= max_bytes) { TerminateProcess(pi.hProcess, 1); break; }
+    out.text.append(buf, std::min<size_t>(n, max_bytes - out.text.size()));
+    if (out.text.size() == max_bytes) {
+      out.truncated = true;
+      TerminateProcess(pi.hProcess, 1);
+      break;
+    }
   }
   CloseHandle(rd);
-  if (WaitForSingleObject(pi.hProcess, (DWORD)(timeout_s + 5) * 1000) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+  const DWORD waited = WaitForSingleObject(pi.hProcess, (DWORD)(timeout_s + 5) * 1000);
+  if (waited == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+  DWORD status = 1;
+  out.success = waited == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &status) && status == 0;
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
-  if (out.size() > max_bytes) out.resize(max_bytes);
   return out;
 }
 #else
 // run curl (no shell), capture at most max_bytes of stdout
-std::string curl_get(const std::string& url, size_t max_bytes, int timeout_s) {
+// Build the child's argv before forking from a multithreaded server.
+CurlOutput run_curl(const std::vector<std::string>& args, size_t max_bytes, int) {
   // everything the child needs is built before fork (no allocation between fork and exec)
-  const std::string to = std::to_string(timeout_s), mx = std::to_string(max_bytes * 4);
+  char program[] = "curl";
+  std::vector<char*> argv{program};
+  for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+  argv.push_back(nullptr);
   int pfd[2];
-  if (pipe(pfd) != 0) return "";
+  if (pipe2(pfd, O_CLOEXEC) != 0) return {};
   const pid_t pid = fork();
-  if (pid < 0) { close(pfd[0]); close(pfd[1]); return ""; }
+  if (pid < 0) { close(pfd[0]); close(pfd[1]); return {}; }
   if (pid == 0) {
     dup2(pfd[1], 1);
     close(pfd[0]);
     close(pfd[1]);
-    execlp("curl", "curl", "-sL", "--compressed", "--max-time", to.c_str(), "--max-filesize", mx.c_str(),
-           "--max-redirs", "3", "--proto", "=http,https", "--proto-redir", "=http,https", "-A", kUA,
-           "-H", "Accept-Language: ja,en;q=0.8", "--", url.c_str(), (char*)nullptr);
+    execvp(program, argv.data());
     _exit(127);
   }
   close(pfd[1]);
-  std::string out;
+  CurlOutput out;
   char buf[65536];
   for (;;) {
     const ssize_t n = read(pfd[0], buf, sizeof buf);
     if (n <= 0) break;
-    out.append(buf, n);
-    if (out.size() >= max_bytes) { kill(pid, SIGKILL); break; }
+    out.text.append(buf, std::min<size_t>((size_t)n, max_bytes - out.text.size()));
+    if (out.text.size() == max_bytes) {
+      out.truncated = true;
+      kill(pid, SIGKILL);
+      break;
+    }
   }
   close(pfd[0]);
   int st = 0;
-  waitpid(pid, &st, 0);
-  if (out.size() > max_bytes) out.resize(max_bytes);
+  out.success = waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
   return out;
 }
 #endif  // _WIN32
@@ -248,30 +285,121 @@ std::string html_to_text(const std::string& html, size_t max_chars) {
   return res;
 }
 
-bool host_allowed(const std::string& url) {
+struct HttpTarget {
+  std::string host, port, url;
+};
+
+bool public_ipv4(const in_addr& address) {
+  const uint32_t ip = ntohl(address.s_addr);
+  const unsigned a = ip >> 24, b = (ip >> 16) & 255, c = (ip >> 8) & 255;
+  return a != 0 && a != 10 && a != 127 && a < 224 &&
+         !(a == 100 && b >= 64 && b < 128) && !(a == 169 && b == 254) &&
+         !(a == 172 && b >= 16 && b < 32) &&
+         !(a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99))) &&
+         !(a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100))) &&
+         !(a == 203 && b == 0 && c == 113);
+}
+
+bool public_ipv6(const in6_addr& address) {
+  const auto* p = reinterpret_cast<const unsigned char*>(&address);
+  // Global unicast only; exclude special-use protocol, transition, and documentation prefixes.
+  return (p[0] & 0xe0) == 0x20 &&
+         !(p[0] == 0x20 && (p[1] == 2 || (p[1] == 1 && (p[2] < 2 || (p[2] == 0x0d && p[3] == 0xb8))))) &&
+         !(p[0] == 0x3f && p[1] == 0xff && (p[2] & 0xf0) == 0);
+}
+
+bool parse_http_target(const std::string& url, HttpTarget& target) {
+  if (url.size() > 8192) return false;
+  for (unsigned char c : url)
+    if (c <= ' ' || c == '\x7f' || c == '"' || c == '\\') return false;
   const size_t s = url.find("://");
   if (s == std::string::npos) return false;
   const std::string scheme = lower(url.substr(0, s));
   if (scheme != "http" && scheme != "https") return false;
-  size_t a = s + 3, b = url.find_first_of("/?#", a);
-  std::string host = lower(url.substr(a, b == std::string::npos ? std::string::npos : b - a));
-  const size_t at = host.rfind('@');
-  if (at != std::string::npos) return false;  // credentials in URL: refuse
-  if (!host.empty() && host[0] == '[') return false;  // IPv6 literal: refuse
+  const size_t a = s + 3, b = url.find_first_of("/?#", a);
+  std::string host = lower(url.substr(a, b == std::string::npos ? b : b - a));
+  std::string port = scheme == "https" ? "443" : "80";
   const size_t colon = host.find(':');
-  if (colon != std::string::npos) host = host.substr(0, colon);
-  if (host.empty() || host == "localhost" || host.find('.') == std::string::npos) return false;
+  if (colon != std::string::npos) {
+    const auto value = host.substr(colon + 1);
+    if (value.empty() || value.size() > 5 || value.find_first_not_of("0123456789") != std::string::npos) return false;
+    const int n = std::stoi(value);
+    if (!n || n > 65535) return false;
+    port = std::to_string(n);
+    host.resize(colon);
+  }
+  const size_t dot = host.rfind('.');
+  if (host.empty() || host.size() > 253 || host.front() == '.' || dot == std::string::npos || dot + 1 == host.size() ||
+      host.find("..") != std::string::npos || host.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-") != std::string::npos)
+    return false;
   const size_t L = host.size();
   for (const char* suf : {".local", ".localhost", ".internal", ".lan", ".home"})
     if (L > strlen(suf) && host.compare(L - strlen(suf), strlen(suf), suf) == 0) return false;
-  unsigned o[4];
-  char tail;
-  if (sscanf(host.c_str(), "%u.%u.%u.%u%c", &o[0], &o[1], &o[2], &o[3], &tail) == 4) {
-    if (o[0] == 10 || o[0] == 127 || o[0] == 0 || (o[0] == 169 && o[1] == 254) || (o[0] == 172 && o[1] >= 16 && o[1] < 32) ||
-        (o[0] == 192 && o[1] == 168) || (o[0] == 100 && o[1] >= 64 && o[1] < 128) || o[0] >= 224)
-      return false;
+  in_addr ipv4{};
+  if (inet_pton(AF_INET, host.c_str(), &ipv4) == 1) {
+    if (!public_ipv4(ipv4)) return false;
+  } else if (host[dot + 1] < 'a' || host[dot + 1] > 'z') {
+    // Refuse non-canonical numeric names so curl and getaddrinfo cannot interpret them differently.
+    return false;
   }
+  target = {host, port, scheme + "://" + host + (colon == std::string::npos ? "" : ":" + port) +
+                          (b == std::string::npos ? "" : url.substr(b))};
   return true;
+}
+
+bool host_allowed(const std::string& url) {
+  HttpTarget target;
+  return parse_http_target(url, target);
+}
+
+std::string resolve_public(const HttpTarget& target) {
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* addresses = nullptr;
+  if (getaddrinfo(target.host.c_str(), target.port.c_str(), &hints, &addresses) != 0) return {};
+  std::string result;
+  for (const addrinfo* i = addresses; i && result.empty(); i = i->ai_next) {
+    char numeric[INET6_ADDRSTRLEN];
+    if (i->ai_family == AF_INET) {
+      const auto& a = reinterpret_cast<const sockaddr_in*>(i->ai_addr)->sin_addr;
+      if (public_ipv4(a) && inet_ntop(AF_INET, &a, numeric, sizeof numeric)) result = numeric;
+    } else if (i->ai_family == AF_INET6) {
+      const auto& a = reinterpret_cast<const sockaddr_in6*>(i->ai_addr)->sin6_addr;
+      if (public_ipv6(a) && inet_ntop(AF_INET6, &a, numeric, sizeof numeric)) result = "[" + std::string(numeric) + "]";
+    }
+  }
+  freeaddrinfo(addresses);
+  return result;
+}
+
+std::string curl_get(std::string url, size_t max_bytes, int timeout_s) {
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::seconds(timeout_s);
+  for (int redirects = 0; redirects <= 3; ++redirects) {
+    HttpTarget target;
+    if (!parse_http_target(url, target)) return {};
+    const std::string address = resolve_public(target);
+    if (address.empty()) return {};
+    const auto remaining = std::chrono::ceil<std::chrono::seconds>(deadline - Clock::now()).count();
+    if (remaining <= 0) return {};
+    // Disable curlrc/proxies and pin the checked binding for this single HTTP hop.
+    const std::vector<std::string> args = {
+        "-q", "-s", "--globoff", "--compressed", "--max-time", std::to_string(remaining), "--max-filesize",
+        std::to_string(max_bytes * 4), "--proto", "=http,https", "--noproxy", "*", "--resolve",
+        target.host + ":" + target.port + ":" + address, "-A", kUA, "-H", "Accept-Language: ja,en;q=0.8",
+        "--write-out", "\\n%{http_code} %{redirect_url}", "--", target.url};
+    auto out = run_curl(args, max_bytes + 8192 + 5, (int)remaining);
+    if (out.truncated) return out.text.substr(0, max_bytes);
+    if (!out.success) return {};
+    const auto split = out.text.rfind('\n');
+    if (split == std::string::npos || out.text.size() < split + 5 || out.text[split + 4] != ' ') return {};
+    const auto code = out.text.substr(split + 1, 3);
+    url = out.text.substr(split + 5);
+    if ((code == "301" || code == "302" || code == "303" || code == "307" || code == "308") && !url.empty()) continue;
+    return out.text.substr(0, std::min(split, max_bytes));
+  }
+  return {};
 }
 
 }  // namespace

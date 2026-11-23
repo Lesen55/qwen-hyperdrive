@@ -14,6 +14,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <BaseTsd.h>
 #include <signal.h>
 typedef SSIZE_T ssize_t;
@@ -71,6 +72,15 @@ static bool client_gone(QeSock fd) {
 #endif
 }
 
+static void enable_client_keepalive(QeSock fd) {
+  // Detect a dead response path without sending interim HTTP data. A FIN by
+  // itself cannot distinguish a closed client from one still reading.
+  const int enabled = 1, idle = 10, interval = 3, probes = 3;
+  if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char*)&enabled, sizeof enabled) != 0) return;
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&idle, sizeof idle);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&interval, sizeof interval);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&probes, sizeof probes);
+}
 
 namespace {
 
@@ -954,7 +964,11 @@ int main(int argc, char** argv) {
     const size_t sl = p.find_last_of('/');
     srv.model_name = sl == std::string::npos ? p : p.substr(sl + 1);
   }
+#ifdef _WIN32
   const QeSock ls = socket(AF_INET, SOCK_STREAM, 0);
+#else
+  const QeSock ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#endif
   int one = 1;
   setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
   sockaddr_in addr{};
@@ -966,9 +980,14 @@ int main(int argc, char** argv) {
   QE_LOG("[server] listening on http://%s:%d  (model %s, ctx %d, mtp %s)\n", host.c_str(), port, srv.model_name.c_str(),
          srv.opt.ctx, srv.model->has_mtp() ? "on" : "off");
   for (;;) {
+#ifdef _WIN32
     const QeSock fd = accept(ls, nullptr, nullptr);
+#else
+    const QeSock fd = accept4(ls, nullptr, nullptr, SOCK_CLOEXEC);
+#endif
     if (fd == (QeSock)-1) continue;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
+    enable_client_keepalive(fd);
     std::thread([&srv, fd] { srv.handle(fd); }).detach();
   }
 }
