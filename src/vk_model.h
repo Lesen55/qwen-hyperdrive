@@ -36,6 +36,7 @@ class VkModel : public IModel {
   void forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax = nullptr,
                bool snapshot = false, bool mtp_prefill = false) override;
   void reset() override;
+  void set_cancel(const std::atomic<bool>* c) override { cancel_ = c; }
   void prepare_context(int npos, bool small_prefill = false) override;
   int seq_create() override { cur_seq_ = ++next_seq_; return cur_seq_; }
   void seq_select(int id) override { QE_ASSERT_SEQ(id); }
@@ -49,6 +50,7 @@ class VkModel : public IModel {
   PlanStats plan_stats() const override { return plan_; }
 
  private:
+  const std::atomic<bool>* cancel_ = nullptr;
   static constexpr int kCkSlots = 4;
   static constexpr int kLogitRows = 16;  // logits rows computed per submission
   struct VMat {
@@ -94,7 +96,9 @@ class VkModel : public IModel {
   uint32_t wg_target_ = 512;
   size_t reserve_ = 0;
   bool drop_pages_ = false;
+#ifndef _WIN32
   int model_fd_ = -1;
+#endif
   // unified memory (iGPU): weight matrices are GPU views of the mmapped model file itself (no copy,
   // no second copy in RAM); the file is split into page-aligned chunks that each hold whole tensors
   // CPU / GPU co-execution of the FFN gate / up projections on unified memory (decode and verify
@@ -115,6 +119,7 @@ class VkModel : public IModel {
   void hyb_host_loop();
   void submit_pass();
   bool zero_copy_ = false;
+  size_t shared_weight_bytes_ = 0;
   struct ZcChunk { size_t begin = 0, end = 0; VBuf buf; bool tried = false; };
   std::vector<ZcChunk> zc_chunks_;
   std::vector<std::pair<const uint8_t*, int>> zc_index_;  // tensor data -> chunk

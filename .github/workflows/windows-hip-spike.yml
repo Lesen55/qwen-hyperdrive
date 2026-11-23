@@ -1,0 +1,58 @@
+name: windows-hip-spike
+
+# Phase-0 feasibility spike for a future HIP backend: install the Windows HIP
+# SDK on the runner, compile a small gfx1100 HIP program with hipcc, and ship
+# it (with the HIP runtime DLLs beside it) as an artifact to run on the real
+# RX 7900 XTX. The runner has no AMD GPU, so nothing is executed here.
+
+on:
+  workflow_dispatch:
+
+env:
+  HIPSDK_INSTALLER_VERSION: "26.Q1"
+
+jobs:
+  hip-spike:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache HIP SDK
+        id: cache-rocm
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\AMD\ROCm
+          key: hip-sdk-${{ env.HIPSDK_INSTALLER_VERSION }}-win2022
+
+      - name: Download and install HIP SDK
+        if: steps.cache-rocm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-Win11-For-HIP.exe"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\rocm-install.exe"
+          Write-Host "Installing (silent)..."
+          Start-Process "$env:RUNNER_TEMP\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -Wait
+          Write-Host "Install finished"
+
+      - name: Build the spike for gfx1100
+        shell: pwsh
+        run: |
+          $hip = (Get-ChildItem 'C:\Program Files\AMD\ROCm' -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          Write-Host "HIP_PATH=$hip"
+          $env:HIP_PATH = $hip
+          & "$hip\bin\hipcc.bat" --version
+          & "$hip\bin\hipcc.bat" -O2 --offload-arch=gfx1100 hip-spike\hello.hip.cpp -o hip-spike.exe
+          if ($LASTEXITCODE -ne 0) { throw "hipcc failed: $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item hip-spike.exe dist\
+          Copy-Item "$hip\bin\amdhip64_*.dll" dist\
+          Copy-Item "$hip\bin\amd_comgr_*.dll" dist\
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload spike
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-hyperdrive-hip-spike
+          path: dist
+          if-no-files-found: error

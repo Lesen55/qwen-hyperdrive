@@ -260,6 +260,10 @@ class Model : public IModel {
   double stream_total_ = 0;
   std::vector<void*> allocs_;
   std::vector<void*> host_allocs_;
+  struct RegisteredWeights { uint8_t* base; size_t size; };
+  std::vector<RegisteredWeights> registered_weights_;
+  size_t mapped_ffn_bytes_ = 0, file_mapped_ffn_bytes_ = 0;
+  bool map_ffn(Layer& layer, size_t registration_page);
 
   // streaming
   uint8_t* stream_buf_ = nullptr;

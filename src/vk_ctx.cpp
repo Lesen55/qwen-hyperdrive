@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-
+#include "cache.h"
 #include "common.h"
 #include "spv_all.h"
 
@@ -15,6 +15,8 @@
   } while (0)
 
 static constexpr uint32_t kPushBytes = 128;  // guaranteed minimum on every implementation
+static constexpr VkBufferUsageFlags kHostImportUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
 VkCtx::VkCtx() {
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -168,9 +170,18 @@ VkCtx::VkCtx() {
     VkPhysicalDeviceProperties2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     q.pNext = &hp;
     vkGetPhysicalDeviceProperties2(pdev_, &q);
-    import_align = hp.minImportedHostPointerAlignment ? hp.minImportedHostPointerAlignment : 4096;
-    host_import = true;
-    en.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    VkPhysicalDeviceExternalBufferInfo info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+    info.usage = kHostImportUsage;
+    info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    VkExternalBufferProperties props{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+    vkGetPhysicalDeviceExternalBufferProperties(pdev_, &info, &props);
+    const auto features = props.externalMemoryProperties.externalMemoryFeatures;
+    host_import = hp.minImportedHostPointerAlignment && (features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) &&
+                  !(features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT);
+    if (host_import) {
+      import_align = hp.minImportedHostPointerAlignment;
+      en.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
   }
   {
     VkPhysicalDeviceMaintenance4Properties m4{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES};
@@ -278,11 +289,11 @@ VkCtx::VkCtx() {
   }
   // pipeline cache on disk: ~/.cache/qwen-hyperdrive/vk-<vendor>-<device>-<driver>.bin
   std::vector<char> blob;
-  if (const char* home = getenv("HOME")) {
+  if (const auto dir = cache_directory(); !dir.empty()) {
     char nm[128];
     snprintf(nm, sizeof nm, "vk-%x-%x-%x.bin", p2.properties.vendorID, p2.properties.deviceID, p2.properties.driverVersion);
-    cache_path_ = std::string(home) + "/.cache/qwen-hyperdrive/" + nm;
-    if (FILE* f = fopen(cache_path_.c_str(), "rb")) {
+    cache_path_ = dir / nm;
+    if (FILE* f = open_cache_file(cache_path_)) {
       fseek(f, 0, SEEK_END);
       blob.resize((size_t)std::max(0L, ftell(f)));
       fseek(f, 0, SEEK_SET);
@@ -336,6 +347,7 @@ size_t VkCtx::vram_free() const {
 }
 
 VBuf VkCtx::alloc(size_t bytes, Mem kind, bool strict) {
+  const bool optional = kind == Mem::SharedWeights;
   VBuf b;
   b.size = bytes;
   bytes = (bytes + 255) / 256 * 256;
@@ -344,7 +356,9 @@ VBuf VkCtx::alloc(size_t bytes, Mem kind, bool strict) {
   bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &b.buf));
+  const VkResult created = vkCreateBuffer(dev_, &bci, nullptr, &b.buf);
+  if (optional && created != VK_SUCCESS && created != VK_ERROR_DEVICE_LOST) return {};
+  VK_CHECK(created);
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(dev_, b.buf, &req);
   VkMemoryAllocateFlagsInfo fi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
@@ -356,7 +370,9 @@ VBuf VkCtx::alloc(size_t bytes, Mem kind, bool strict) {
   auto try_alloc = [&](int t) {
     if (t < 0) return false;
     ai.memoryTypeIndex = (uint32_t)t;
-    return vkAllocateMemory(dev_, &ai, nullptr, &b.mem) == VK_SUCCESS;
+    const auto result = vkAllocateMemory(dev_, &ai, nullptr, &b.mem);
+    if (result == VK_ERROR_DEVICE_LOST) VK_CHECK(result);
+    return result == VK_SUCCESS;
   };
   bool ok = false;
   if (kind == Mem::DeviceMapped) {
@@ -375,24 +391,44 @@ VBuf VkCtx::alloc(size_t bytes, Mem kind, bool strict) {
     ok = try_alloc(mem_type(req.memoryTypeBits, hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0)) ||
          try_alloc(mem_type(req.memoryTypeBits, hv, 0));
   }
-  if (!ok && kind == Mem::Host) {
+  if (optional && integrated)
+    ok = try_alloc(mem_type(req.memoryTypeBits, hv | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0));
+  if (!ok && (kind == Mem::Host || optional)) {
     ok = try_alloc(mem_type(req.memoryTypeBits, hv, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) ||
          try_alloc(mem_type(req.memoryTypeBits, hv, 0));
   }
+  if (!ok && optional) {
+    vkDestroyBuffer(dev_, b.buf, nullptr);
+    return {};
+  }
   if (!ok) QE_FATAL("Vulkan allocation of %.1f MiB failed", req.size / 1048576.0);
-  VK_CHECK(vkBindBufferMemory(dev_, b.buf, b.mem, 0));
+  const auto bound = vkBindBufferMemory(dev_, b.buf, b.mem, 0);
+  if (optional && bound != VK_SUCCESS && bound != VK_ERROR_DEVICE_LOST) {
+    vkDestroyBuffer(dev_, b.buf, nullptr);
+    vkFreeMemory(dev_, b.mem, nullptr);
+    return {};
+  }
+  VK_CHECK(bound);
   VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
   dai.buffer = b.buf;
   b.addr = vkGetBufferDeviceAddress(dev_, &dai);
   const uint32_t flags = mprops_.memoryTypes[ai.memoryTypeIndex].propertyFlags;
-  if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) VK_CHECK(vkMapMemory(dev_, b.mem, 0, VK_WHOLE_SIZE, 0, &b.map));
+  if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+    const auto result = vkMapMemory(dev_, b.mem, 0, VK_WHOLE_SIZE, 0, &b.map);
+    if (optional && result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+      vkDestroyBuffer(dev_, b.buf, nullptr);
+      vkFreeMemory(dev_, b.mem, nullptr);
+      return {};
+    }
+    VK_CHECK(result);
+  }
   if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { b.device_local = true; vram_used_ += req.size; }
   return b;
 }
 
 void VkCtx::free(VBuf& b) {
   if (!b.buf) return;
-  if (b.device_local) vram_used_ -= std::min(vram_used_, (b.size + 255) / 256 * 256);
+  if (b.device_local && !b.imported) vram_used_ -= std::min(vram_used_, (b.size + 255) / 256 * 256);
   vkDestroyBuffer(dev_, b.buf, nullptr);
   vkFreeMemory(dev_, b.mem, nullptr);
   b = VBuf{};
@@ -411,14 +447,7 @@ void VkCtx::warm_pipelines() {
     vkGetPipelineCacheData(dev_, cache_, &n, nullptr);
     std::vector<char> blob(n);
     if (n && vkGetPipelineCacheData(dev_, cache_, &n, blob.data()) == VK_SUCCESS) {
-      const std::string dir = cache_path_.substr(0, cache_path_.rfind('/'));
-      (void)!system(("mkdir -p '" + dir + "'").c_str());
-      const std::string tmp = cache_path_ + ".tmp";
-      if (FILE* f = fopen(tmp.c_str(), "wb")) {
-        const bool ok = fwrite(blob.data(), 1, n, f) == n;
-        fclose(f);
-        if (ok) rename(tmp.c_str(), cache_path_.c_str());
-      }
+      write_cache_file(cache_path_, blob.data(), n);
     }
   }
   QE_DBG("[vk] %zu pipelines ready in %.0f ms\n", sizeof(kSpv) / sizeof(kSpv[0]), (qe_now() - t0) * 1e3);
@@ -433,8 +462,8 @@ bool VkCtx::has_pipeline(const char* name) const {
 
 VBuf VkCtx::import_host(const void* p, size_t n) {
   VBuf b;
-  if (!host_import || ((uintptr_t)p % import_align) || (n % import_align)) return b;
-  static auto getprops = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev_, "vkGetMemoryHostPointerPropertiesEXT");
+  if (!host_import || !n || n > max_buffer || ((uintptr_t)p % import_align) || (n % import_align)) return b;
+  const auto getprops = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev_, "vkGetMemoryHostPointerPropertiesEXT");
   VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
   const VkResult pr = getprops ? getprops(dev_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p, &hp)
                                 : VK_ERROR_EXTENSION_NOT_PRESENT;
@@ -447,13 +476,14 @@ VBuf VkCtx::import_host(const void* p, size_t n) {
   VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   bci.pNext = &eb;
   bci.size = n;
-  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-  if (vkCreateBuffer(dev_, &bci, nullptr, &b.buf) != VK_SUCCESS) return VBuf{};
+  bci.usage = kHostImportUsage;
+  const auto created = vkCreateBuffer(dev_, &bci, nullptr, &b.buf);
+  if (created == VK_ERROR_DEVICE_LOST) VK_CHECK(created);
+  if (created != VK_SUCCESS) return VBuf{};
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(dev_, b.buf, &req);
-  int t = -1;
-  for (uint32_t i = 0; i < mprops_.memoryTypeCount && t < 0; i++)
-    if ((hp.memoryTypeBits & req.memoryTypeBits) & (1u << i)) t = (int)i;
+  const int t = mem_type(hp.memoryTypeBits & req.memoryTypeBits,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
   VkImportMemoryHostPointerInfoEXT im{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
   im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
   im.pHostPointer = const_cast<void*>(p);
@@ -465,8 +495,9 @@ VBuf VkCtx::import_host(const void* p, size_t n) {
   ai.allocationSize = n;
   ai.memoryTypeIndex = (uint32_t)std::max(t, 0);
   VkResult ar = VK_ERROR_UNKNOWN, br = VK_ERROR_UNKNOWN;
-  if (t >= 0) ar = vkAllocateMemory(dev_, &ai, nullptr, &b.mem);
+  if (t >= 0 && req.size <= n) ar = vkAllocateMemory(dev_, &ai, nullptr, &b.mem);
   if (ar == VK_SUCCESS) br = vkBindBufferMemory(dev_, b.buf, b.mem, 0);
+  if (ar == VK_ERROR_DEVICE_LOST || br == VK_ERROR_DEVICE_LOST) VK_CHECK(VK_ERROR_DEVICE_LOST);
   if (t < 0 || ar != VK_SUCCESS || br != VK_SUCCESS) {
     QE_DBG("[vk] host import of %.0f MiB failed: type %d (ptr types 0x%x, buffer types 0x%x), allocate %d, bind %d\n",
            n / 1048576.0, t, hp.memoryTypeBits, req.memoryTypeBits, (int)ar, (int)br);
@@ -480,7 +511,8 @@ VBuf VkCtx::import_host(const void* p, size_t n) {
   b.addr = vkGetBufferDeviceAddress(dev_, &dai);
   b.size = n;
   b.map = const_cast<void*>(p);
-  b.device_local = integrated;  // the same memory on a UMA device
+  b.device_local = integrated;  // on UMA this memory is local to the GPU
+  b.imported = true;  // the Vulkan heap allocator does not own these pages
   QE_DBG("[vk] imported %.0f MiB of host memory (memory type %d, flags 0x%x)\n", n / 1048576.0, t,
          mprops_.memoryTypes[t].propertyFlags);
   return b;

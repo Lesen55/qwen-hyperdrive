@@ -1,8 +1,21 @@
 #include "cpu_ffn.h"
 
 #include <immintrin.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <intrin.h>
+
+#include <bit>
+#else
 #include <pthread.h>
 #include <sched.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -89,22 +102,40 @@ namespace isa_avx2 {
 #include "cpu_kernels.inc"
 }
 #undef QE_ISA_AVX2
+#ifdef __clang__
+// clang (notably with the MSVC ABI) ignores #pragma GCC target; use the
+// equivalent clang attribute pragma to stamp the target features on every
+// function defined in the region instead.
+#pragma clang attribute push(__attribute__((target("avxvnni"))), apply_to = function)
+#else
 #pragma GCC push_options
 #pragma GCC target("avxvnni")
+#endif
 #define QE_ISA_VNNI
 namespace isa_vnni {
 #include "cpu_kernels.inc"
 }
 #undef QE_ISA_VNNI
+#ifdef __clang__
+#pragma clang attribute pop
+#else
 #pragma GCC pop_options
 #pragma GCC push_options
 #pragma GCC target("avx512f,avx512bw,avx512vl,avx512vnni")
+#endif
+#ifdef __clang__
+#pragma clang attribute push(__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni"))), apply_to = function)
+#endif
 #define QE_ISA_AVX512
 namespace isa_avx512 {
 #include "cpu_kernels.inc"
 }
 #undef QE_ISA_AVX512
+#ifdef __clang__
+#pragma clang attribute pop
+#else
 #pragma GCC pop_options
+#endif
 using namespace isa_avx2;  // R4 conversion (load time only)
 
 struct R4Tables {
@@ -176,11 +207,73 @@ void r4_convert(uint32_t type, const uint8_t* src, size_t src_rb, int K, int N, 
 }
 // ---- instruction-set selection (once, at first use): AVX-512 VNNI > AVX-VNNI > AVX2; QE_CPU_ISA
 // = avx2 | vnni | avx512 overrides (only to something the CPU has)
+#ifdef _WIN32
+// __builtin_cpu_supports() lowers to libgcc's __cpu_model / __cpu_indicator_init,
+// which do not exist in the MSVC CRT, so the link fails. Do the CPUID leaf 7
+// checks directly (with the OS XCR0 state checks the builtin also performs).
+static bool qe_cpu_has(const char* name) {
+  struct Feats {
+    bool avx2, fma, f16c, bmi2, avxvnni, avx512f, avx512bw, avx512vl, avx512vnni, avx512bf16, avxvnniint8, amx_int8;
+  };
+  static const Feats ft = [] {
+    Feats f{};
+    int regs[4] = {};
+    __cpuidex(regs, 0, 0);
+    const int max_leaf = regs[0];
+    int l1[4] = {}, l7[4] = {}, l7s1[4] = {};
+    if (max_leaf >= 1) __cpuidex(l1, 1, 0);
+    if (max_leaf >= 7) {
+      __cpuidex(l7, 7, 0);
+      if (l7[0] >= 1) __cpuidex(l7s1, 7, 1);
+    }
+    const bool osxsave = (l1[2] >> 27) & 1;
+    const unsigned long long xcr0 = osxsave ? (unsigned long long)_xgetbv(0) : 0;
+    const bool os_avx = ((xcr0 & 0x6) == 0x6) && ((l1[2] >> 28) & 1);
+    const bool os_512 = os_avx && ((xcr0 & 0xE6) == 0xE6);
+    f.fma = ((l1[2] >> 12) & 1) && os_avx;
+    f.f16c = ((l1[2] >> 29) & 1) && os_avx;
+    f.avx2 = ((l7[1] >> 5) & 1) && os_avx;
+    f.bmi2 = (l7[1] >> 8) & 1;
+    f.avxvnni = ((l7s1[0] >> 4) & 1) && os_avx;
+    f.avx512f = ((l7[1] >> 16) & 1) && os_512;
+    f.avx512bw = ((l7[1] >> 30) & 1) && os_512;
+    f.avx512vl = ((l7[1] >> 31) & 1) && os_512;
+    f.avx512vnni = ((l7[2] >> 11) & 1) && os_512;
+    f.avx512bf16 = ((l7s1[0] >> 5) & 1) && os_512;
+    f.avxvnniint8 = ((l7s1[3] >> 4) & 1) && os_avx;
+    f.amx_int8 = (l7[3] >> 25) & 1;
+    return f;
+  }();
+  if (!strcmp(name, "avx2")) return ft.avx2;
+  if (!strcmp(name, "fma")) return ft.fma;
+  if (!strcmp(name, "f16c")) return ft.f16c;
+  if (!strcmp(name, "bmi2")) return ft.bmi2;
+  if (!strcmp(name, "avxvnni")) return ft.avxvnni;
+  if (!strcmp(name, "avx512f")) return ft.avx512f;
+  if (!strcmp(name, "avx512bw")) return ft.avx512bw;
+  if (!strcmp(name, "avx512vl")) return ft.avx512vl;
+  if (!strcmp(name, "avx512vnni")) return ft.avx512vnni;
+  if (!strcmp(name, "avx512bf16")) return ft.avx512bf16;
+  if (!strcmp(name, "avxvnniint8")) return ft.avxvnniint8;
+  if (!strcmp(name, "amx-int8")) return ft.amx_int8;
+  return false;
+}
+#define QE_CPU_INIT() ((void)0)
+#define QE_CPU_HAS(name) qe_cpu_has(name)
+#else
+#define QE_CPU_INIT() __builtin_cpu_init()
+#define QE_CPU_HAS(name) __builtin_cpu_supports(name)
+#endif
+bool baseline_supported() {
+  QE_CPU_INIT();
+  return QE_CPU_HAS("avx2") && QE_CPU_HAS("fma") && QE_CPU_HAS("f16c") && QE_CPU_HAS("bmi2");
+}
+
 static Isa detect_isa() {
-  __builtin_cpu_init();
-  const bool a512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-                    __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni");
-  const bool vnni = __builtin_cpu_supports("avxvnni");
+  QE_CPU_INIT();
+  const bool a512 = QE_CPU_HAS("avx512f") && QE_CPU_HAS("avx512bw") &&
+                    QE_CPU_HAS("avx512vl") && QE_CPU_HAS("avx512vnni");
+  const bool vnni = QE_CPU_HAS("avxvnni");
   Isa best = a512 ? Isa::AVX512 : vnni ? Isa::VNNI : Isa::AVX2;
   if (const char* e = getenv("QE_CPU_ISA")) {
     const std::string v = e;
@@ -202,12 +295,12 @@ const char* isa_name(Isa i) {
   }
 }
 std::string cpu_features() {
-  __builtin_cpu_init();
+  QE_CPU_INIT();
   std::string s;
   for (const char* f : {"avx2", "fma", "f16c", "avxvnni", "avx512f", "avx512bw", "avx512vl", "avx512vnni", "avx512bf16",
                         "avxvnniint8", "amx-int8"}) {
     bool has = false;
-#define F(name) if (!strcmp(f, name)) has = __builtin_cpu_supports(name);
+#define F(name) if (!strcmp(f, name)) has = QE_CPU_HAS(name);
     F("avx2") F("fma") F("f16c") F("avxvnni") F("avx512f") F("avx512bw") F("avx512vl") F("avx512vnni") F("avx512bf16")
     F("avxvnniint8") F("amx-int8")
 #undef F
@@ -265,6 +358,42 @@ void matvec(uint32_t type, const uint8_t* W, size_t rb, int K, int r0, int r1, c
 // One logical CPU per physical core (SMT siblings share the core's load ports and caches), fastest
 // cores first: Intel hybrid parts list their P-cores in /sys/devices/cpu_core/cpus, other systems
 // may report cpu_capacity; ties keep the CPU numbering.
+#ifdef _WIN32
+struct WindowsCore {
+  int cpu;
+  unsigned efficiency;
+};
+
+static const std::vector<WindowsCore>& windows_cores() {
+  static const auto cores = [] {
+    std::vector<WindowsCore> result;
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    std::vector<uint64_t> storage((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    auto* data = reinterpret_cast<unsigned char*>(storage.data());
+    if (!bytes || !GetLogicalProcessorInformationEx(RelationProcessorCore,
+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(data), &bytes)) return result;
+    DWORD_PTR process_mask = ~DWORD_PTR{0};
+    if (GetActiveProcessorGroupCount() == 1) {
+      DWORD_PTR process = 0, system = 0;
+      if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) process_mask = process;
+    }
+    for (DWORD offset = 0; offset < bytes;) {
+      const auto& entry = *reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(data + offset);
+      const auto& core = entry.Processor;
+      const auto& group = core.GroupMask[0];  // a physical core belongs to one processor group
+      const KAFFINITY mask = group.Mask & process_mask;
+      if (mask) result.push_back({int(group.Group) * 64 + std::countr_zero(mask), core.EfficiencyClass});
+      offset += entry.Size;
+    }
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+      return a.efficiency == b.efficiency ? a.cpu < b.cpu : a.efficiency > b.efficiency;
+    });
+    return result;
+  }();
+  return cores;
+}
+#else
 static std::vector<int> read_cpu_list(const char* path) {
   std::vector<int> v;
   FILE* f = fopen(path, "r");
@@ -284,8 +413,14 @@ static std::vector<int> read_cpu_list(const char* path) {
   }
   return v;
 }
+#endif
 const std::vector<int>& core_order() {
   static const std::vector<int> order = [] {
+#ifdef _WIN32
+    std::vector<int> o;
+    for (const auto& core : windows_cores()) o.push_back(core.cpu);
+    return o;
+#else
     std::vector<int> online = read_cpu_list("/sys/devices/system/cpu/online");
     const std::vector<int> pcores = read_cpu_list("/sys/devices/cpu_core/cpus");
     std::vector<std::pair<std::pair<int, int>, int>> cand;  // ((-rank, cpu), cpu)
@@ -313,6 +448,7 @@ const std::vector<int>& core_order() {
     std::vector<int> o;
     for (auto& c : cand) o.push_back(c.second);
     return o;
+#endif
   }();
   return order;
 }
@@ -321,6 +457,14 @@ const std::vector<int>& core_order() {
 // cores finish their row share last and the whole job waits for them (Core Ultra 5 228V: 4 P-cores
 // 57.6 GB/s, all 8 cores 19.3 GB/s).
 int fast_cores() {
+#ifdef _WIN32
+  const auto& cores = windows_cores();
+  if (cores.empty()) return std::max(1u, std::thread::hardware_concurrency());
+  static const int n = (int)std::count_if(cores.begin(), cores.end(), [&](const auto& core) {
+    return core.efficiency == cores.front().efficiency;
+  });
+  return n;
+#else
   static const int n = [] {
     const std::vector<int> pcores = read_cpu_list("/sys/devices/cpu_core/cpus");
     const std::vector<int>& order = core_order();
@@ -342,6 +486,7 @@ int fast_cores() {
     return std::max(1, k ? k : (int)order.size());
   }();
   return n;
+#endif
 }
 
 ThreadPool::ThreadPool(int n) : n_(n) {
@@ -375,10 +520,18 @@ void ThreadPool::worker(int idx) {
   {
     const std::vector<int>& order = core_order();
     if (!order.empty()) {
+      const int cpu = order[idx % order.size()];
+#ifdef _WIN32
+      GROUP_AFFINITY affinity{};
+      affinity.Group = (WORD)(cpu / 64);
+      affinity.Mask = KAFFINITY{1} << (cpu % 64);
+      SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr);
+#else
       cpu_set_t cs;
       CPU_ZERO(&cs);
-      CPU_SET(order[idx % order.size()], &cs);
+      CPU_SET(cpu, &cs);
       pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+#endif
     }
   }
   uint64_t seen = 0;

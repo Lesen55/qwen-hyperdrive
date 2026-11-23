@@ -4,13 +4,14 @@
 #pragma once
 #include <vulkan/vulkan.h>
 
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
 
 // Host: system RAM the GPU reads (PCIe); Readback: cached; DeviceMapped: device-local and CPU-writable
 // (resizable BAR on discrete GPUs, all memory on integrated ones) -> uploads are a plain memcpy
-enum class Mem { Device, Host, Readback, DeviceMapped };
+enum class Mem { Device, Host, Readback, DeviceMapped, SharedWeights };
 
 // per-pipeline options: specialization constants 0 / 1 (-1 = shader default) and a required subgroup
 // size (0 = driver's choice; ignored without VK_EXT_subgroup_size_control)
@@ -34,6 +35,7 @@ struct VBuf {
   size_t size = 0;
   void* map = nullptr;  // host-visible buffers stay mapped
   bool device_local = false;
+  bool imported = false;
   VkDeviceAddress at(size_t off) const { return addr + off; }
 };
 
@@ -110,7 +112,7 @@ class VkCtx {
   VkFence fence_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
   VkPipelineCache cache_ = VK_NULL_HANDLE;
-  std::string cache_path_;  // on-disk pipeline cache (per device + driver version)
+  std::filesystem::path cache_path_;  // on-disk pipeline cache (per device + driver version)
   std::map<std::pair<std::string, PipeOpt>, VkPipeline> pipes_;
   VkPhysicalDeviceMemoryProperties mprops_{};
   bool budget_ext_ = false;

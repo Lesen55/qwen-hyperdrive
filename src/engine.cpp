@@ -134,12 +134,24 @@ void Generator::drop_slot(int slot) {
   slot_seq_[slot] = -1;
 }
 
+void Generator::abandon() {
+  if (live_ >= 0) {
+    m_.set_capture(-1, -1);
+    m_.seq_drop(live_);
+    for (auto& [pos, slot] : convs_[live_].cks) slot_seq_[slot] = -1;
+    convs_.erase(live_);
+    live_ = -1;
+  }
+  history_.clear();
+  pos_ = 0;
+}
+
 // Prompt cache lookup.  The recurrent (GDN) state cannot be rewound, so a request can resume from
 //  (a) the live state of a conversation whose committed tokens are a prefix of the prompt, or
 //  (b) a checkpoint (state after the first p tokens) whose prefix matches.
 // Checkpoints are taken at the start of each generation prompt (so the next turn hits even when the
 // client drops the model's reasoning from the history) and when switching to another conversation.
-int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reserve) {
+int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reserve, const std::atomic<bool>* cancel) {
   const double t0 = qe_now();
   const int n = (int)prompt.size();
   for (auto it = convs_.begin(); it != convs_.end();) {  // conversations whose KV was evicted
@@ -231,9 +243,10 @@ int Generator::start(const std::vector<int>& prompt, bool allow_reuse, int reser
   ng_built_ = 0;
   last_ng_ = false;
   const int m = n - p0;
-  if (sampler_.greedy()) m_.forward(prompt.data() + p0, m, p0, nullptr, 1, &last_, false, mtp_);
-  else {
-    m_.forward(prompt.data() + p0, m, p0, logits_.data(), 1, nullptr, false, mtp_);
+  const bool greedy = sampler_.greedy();
+  m_.forward(prompt.data() + p0, m, p0, greedy ? nullptr : logits_.data(), 1, greedy ? &last_ : nullptr, false, mtp_);
+  if (cancel && cancel->load(std::memory_order_relaxed)) return kCancelled;
+  if (!greedy) {
     if (topk_) { Dist p; row_dist(0, p); last_ = sampler_.draw(p); }
     else last_ = sampler_.sample(logits_.data(), m_.cfg().n_vocab, history_);
   }

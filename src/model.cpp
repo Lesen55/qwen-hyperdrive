@@ -1,6 +1,10 @@
-#include <set>
-#include <thread>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "win_compat.h"
+#else
+#include <unistd.h>
+#endif
+#include "cache.h"
 #include "model.h"
 #include "requant.h"
 
@@ -64,7 +68,7 @@ Model::Model(const EngineOptions& opt) : opt_(opt) {
   load_config();  // checks the architecture
   // don't burn a CPU core spinning in cudaStreamSynchronize: the cores belong to the CPU FFN pool.
   // Must be set before the primary context is created (i.e. before cudaSetDevice on CUDA 12+).
-  if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) {
+  if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync | cudaDeviceMapHost) != cudaSuccess) {
     QE_LOG("[warn] could not set blocking-sync device flag\n");
     cudaGetLastError();
   }
@@ -86,32 +90,11 @@ Model::Model(const EngineOptions& opt) : opt_(opt) {
   plan_and_load();
 }
 
-// Host-side machine parameters the planner uses: physical cores, PCIe host->device bandwidth and DRAM
-// read bandwidth, measured at start-up unless given explicitly (they decide the CPU/GPU split).
-static int physical_cores() {
-  std::set<std::pair<int, int>> cores;
-  for (int cpu = 0; cpu < 1024; cpu++) {
-    const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
-    FILE* f1 = fopen((base + "core_id").c_str(), "r");
-    if (!f1) break;
-    int core = -1, pkg = 0;
-    if (fscanf(f1, "%d", &core) != 1) core = cpu;
-    fclose(f1);
-    if (FILE* f2 = fopen((base + "physical_package_id").c_str(), "r")) {
-      if (fscanf(f2, "%d", &pkg) != 1) pkg = 0;
-      fclose(f2);
-    }
-    cores.insert({pkg, core});
-  }
-  return cores.empty() ? (int)std::thread::hardware_concurrency() : (int)cores.size();
-}
-
 void Model::calibrate_host() {
-  if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") || !__builtin_cpu_supports("f16c") ||
-      !__builtin_cpu_supports("bmi2"))
+  if (!cpu::baseline_supported())
     QE_FATAL("CPU without AVX2/FMA/F16C/BMI2 (x86-64-v3) is not supported");
   // big cores only on hybrid CPUs (P-cores; the E-cores would hold every parallel matvec back)
-  if (opt_.cpu_threads <= 0) opt_.cpu_threads = std::clamp(std::min(physical_cores(), cpu::fast_cores()), 1, 32);
+  if (opt_.cpu_threads <= 0) opt_.cpu_threads = std::clamp(cpu::fast_cores(), 1, 32);
   if (opt_.pcie_gbps <= 0) {
     const size_t n = 256ull << 20;
     void* h = nullptr;
@@ -136,21 +119,21 @@ void Model::calibrate_host() {
     measured_pcie_ = gbps;
   }
   if (opt_.dram_gbps <= 0) {
-    const size_t n = 512ull << 20, nt = std::max(1, opt_.cpu_threads);
+    const size_t n = 512ull << 20;
+    const int nt = std::max(1, opt_.cpu_threads);
     std::vector<uint64_t> buf(n / 8, 1);
     std::vector<uint64_t> sums(nt);
+    cpu::ThreadPool workers(nt);
     double best = 1e9;
     for (int rep = 0; rep < 3; rep++) {
       const double t0 = qe_now();
-      std::vector<std::thread> th;
-      for (size_t t = 0; t < nt; t++)
-        th.emplace_back([&, t] {
-          const size_t a = buf.size() * t / nt, b = buf.size() * (t + 1) / nt;
-          uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-          for (size_t i = a; i + 3 < b; i += 4) { s0 += buf[i]; s1 += buf[i + 1]; s2 += buf[i + 2]; s3 += buf[i + 3]; }
-          sums[t] = s0 + s1 + s2 + s3;
-        });
-      for (auto& x : th) x.join();
+      workers.start([&](int t) {
+        const size_t a = buf.size() * t / nt, b = buf.size() * (t + 1) / nt;
+        uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        for (size_t i = a; i + 3 < b; i += 4) { s0 += buf[i]; s1 += buf[i + 1]; s2 += buf[i + 2]; s3 += buf[i + 3]; }
+        sums[t] = s0 + s1 + s2 + s3;
+      });
+      workers.wait();
       best = std::min(best, qe_now() - t0);
     }
     opt_.dram_gbps = n / best / 1e9;
@@ -163,9 +146,75 @@ void Model::calibrate_host() {
 Model::~Model() {
   cudaStreamSynchronize(stream_);
   for (void* p : allocs_) cudaFree(p);
+  for (const auto& range : registered_weights_) cudaHostUnregister(range.base);
   for (void* p : host_allocs_) cudaFreeHost(p);
   if (cublas_) cublasDestroy(cublas_);
   if (stream_) cudaStreamDestroy(stream_);
+}
+
+bool Model::map_ffn(Layer& layer, size_t page) {
+  Mat* weights[] = {&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down};
+  size_t bytes = 0;
+  uintptr_t first = UINTPTR_MAX, last = 0;
+  bool aligned = true;
+  for (const Mat* m : weights) {
+    const auto addr = reinterpret_cast<uintptr_t>(m->host);
+    first = std::min(first, addr);
+    last = std::max(last, addr + m->bytes);
+    aligned &= addr % 16 == 0;
+    bytes += m->bytes;
+  }
+  if (page && aligned && last - first <= bytes + 3 * page) {
+    const auto start = first / page * page;
+    const auto end = (last + page - 1) / page * page;
+    const bool overlaps = std::any_of(registered_weights_.begin(), registered_weights_.end(), [&](const auto& range) {
+      const auto addr = reinterpret_cast<uintptr_t>(range.base);
+      return start < addr + range.size && addr < end;
+    });
+    if (!overlaps) {
+      auto* host = reinterpret_cast<uint8_t*>(start);
+      const auto status = cudaHostRegister(host, end - start, cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+      if (status == cudaSuccess) {
+        void* device = nullptr;
+        if (cudaHostGetDevicePointer(&device, host, 0) == cudaSuccess) {
+          registered_weights_.push_back({host, end - start});
+          for (Mat* m : weights)
+            m->dev = static_cast<uint8_t*>(device) + (reinterpret_cast<uintptr_t>(m->host) - start);
+          file_mapped_ffn_bytes_ += bytes;
+          return true;
+        }
+        cudaHostUnregister(host);
+      } else {
+        QE_DBG("[plan] CUDA direct FFN registration failed: %s\n", cudaGetErrorString(status));
+      }
+      cudaGetLastError();
+    }
+  }
+
+  // Fall back to one CPU copy into shared pinned memory. Kernels still read it directly.
+  size_t offsets[3]{}, size = 0;
+  for (int i = 0; i < 3; ++i) {
+    offsets[i] = size;
+    size += (weights[i]->bytes + 255) / 256 * 256;
+  }
+  void* host = nullptr;
+  if (cudaHostAlloc(&host, size, cudaHostAllocMapped) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  void* device = nullptr;
+  if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess) {
+    cudaFreeHost(host);
+    cudaGetLastError();
+    return false;
+  }
+  host_allocs_.push_back(host);
+  for (int i = 0; i < 3; ++i) {
+    memcpy(static_cast<uint8_t*>(host) + offsets[i], weights[i]->host, weights[i]->bytes);
+    weights[i]->dev = static_cast<uint8_t*>(device) + offsets[i];
+  }
+  mapped_ffn_bytes_ += bytes;
+  return true;
 }
 
 void Model::load_config() { cfg_ = load_qwen35_config(*gguf_); }
@@ -184,13 +233,16 @@ void Model::requant_mtp() {
   // cache keyed by the model file identity
   struct stat st{};
   stat(opt_.model_path.c_str(), &st);
-  const char* xdg = getenv("XDG_CACHE_HOME");
-  const std::string dir = xdg && *xdg ? std::string(xdg) + "/qwen-hyperdrive" : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/.cache/qwen-hyperdrive";
-  const std::string path = dir + (ffn_only ? "/mtp-ffn-iq4xs-v1-" : "/mtp-iq4xs-v1-") + std::to_string((long long)st.st_size) + "-" + std::to_string((long long)st.st_mtime) + ".bin";
+  const auto dir = cache_directory();
+  std::filesystem::path path;
+  if (!dir.empty() && stat(opt_.model_path.c_str(), &st) == 0) {
+    const char* prefix = ffn_only ? "mtp-ffn-iq4xs-v1-" : "mtp-iq4xs-v1-";
+    path = dir / (prefix + std::to_string((long long)st.st_size) + "-" + std::to_string((long long)st.st_mtime) + ".bin");
+  }
   requant_store_.emplace_back(total);
   uint8_t* buf = requant_store_.back().data();
   bool cached = false;
-  if (FILE* f = fopen(path.c_str(), "rb")) {
+  if (FILE* f = open_cache_file(path)) {
     cached = fread(buf, 1, total, f) == total && fgetc(f) == EOF;
     fclose(f);
   }
@@ -205,15 +257,7 @@ void Model::requant_mtp() {
     m->host = buf + off;
     off += m->bytes;
   }
-  if (!cached) {
-    mkdir(dir.c_str(), 0755);
-    const std::string tmp = path + ".tmp";
-    if (FILE* f = fopen(tmp.c_str(), "wb")) {
-      const bool ok = fwrite(buf, 1, total, f) == total;
-      fclose(f);
-      if (ok) rename(tmp.c_str(), path.c_str());
-    }
-  }
+  if (!cached) write_cache_file(path, buf, total);
   QE_LOG("[plan] MTP block Q6_K -> IQ4_XS: %.0f -> %.0f MiB (%s, %.1f s)\n", before / (double)MiB, total / (double)MiB,
          cached ? "cached" : "requantized", qe_now() - t0);
 }
@@ -477,11 +521,41 @@ void Model::plan_and_load() {
     CUDA_CHECK(cudaMemcpy(m->dev, m->host, m->bytes, cudaMemcpyHostToDevice));
     res_bytes += m->bytes;
   }
+  const char* zero_copy = getenv("QE_CUDA_ZEROCOPY");
+  const int mode = zero_copy ? atoi(zero_copy) : 0;
+  bool map_overflow = (mode == 1 || mode == 2) && any_stream && opt_.cpu_frac <= 0;
+  size_t registration_page = 0;
+  if (map_overflow) {
+    int mapped = 0, readonly = 0;
+    if (cudaDeviceGetAttribute(&mapped, cudaDevAttrCanMapHostMemory, 0) != cudaSuccess || !mapped) {
+      QE_LOG("[plan] CUDA host mapping unavailable; using the FFN upload ring\n");
+      cudaGetLastError();
+      map_overflow = false;
+    } else if (mode == 1 && cudaDeviceGetAttribute(&readonly, cudaDevAttrHostRegisterReadOnlySupported, 0) == cudaSuccess && readonly) {
+#ifdef _WIN32
+      SYSTEM_INFO info{};
+      GetSystemInfo(&info);
+      registration_page = info.dwPageSize;
+#else
+      registration_page = (size_t)getpagesize();
+#endif
+    } else {
+      cudaGetLastError();
+    }
+  }
   // Streamed layers: split FFN rows between CPU ([0,r)) and GPU ([r,n_ff)); see layer_ffn.
   // Pinned host block layout: [gate_g | up_g | down_g] [gate_c | up_c | down_c] (256-aligned).
   for (int il = 0; il < c.n_layer; il++) {
     Layer& L = layers_[il];
     if (!L.ffn_streamed) continue;
+    if (map_overflow) {
+      if (map_ffn(L, registration_page)) {
+        L.ffn_streamed = false;  // full matrices are directly addressable; no streaming ring or CPU split
+        continue;
+      }
+      QE_LOG("[plan] CUDA shared FFN allocation failed; using the upload ring for remaining layers\n");
+      map_overflow = false;
+    }
     const bool cpu_ok = opt_.cpu_frac != 0 && cpu::type_supported(L.ffn_gate.type) &&
                         cpu::type_supported(L.ffn_up.type) && cpu::type_supported(L.ffn_down.type);
     int r = 0;
@@ -586,7 +660,7 @@ void Model::plan_and_load() {
       }
     }
   }
-  if (any_stream) {
+  if (str_bytes || cpu_bytes) {
     stream_buf_bytes_ = (max_ffn_layer + 4096 + 255) / 256 * 256;
     stream_buf_ = (uint8_t*)dalloc(2 * stream_buf_bytes_);
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
@@ -600,12 +674,15 @@ void Model::plan_and_load() {
       if (layers_[il].ffn_streamed) streamed_layers_.push_back(il);
   }
   plan_res_mb_ = res_bytes / (double)MiB;
-  plan_stream_mb_ = str_bytes / (double)MiB;
+  plan_stream_mb_ = (str_bytes + mapped_ffn_bytes_ + file_mapped_ffn_bytes_) / (double)MiB;
   plan_cpu_mb_ = cpu_bytes / (double)MiB;
   plan_res_ffn_ = n_res_ffn;
   QE_LOG("[plan] resident weights %.0f MiB (%d/%d FFN layers), host FFN: %.0f MiB streamed over PCIe + %.0f MiB computed on CPU (%s)\n",
          res_bytes / (double)MiB, n_res_ffn, c.n_layer, str_bytes / (double)MiB, cpu_bytes / (double)MiB,
          opt_.cpu_frac < 0 ? "auto-balanced per layer" : ("frac " + std::to_string(opt_.cpu_frac)).c_str());
+  if (mapped_ffn_bytes_ || file_mapped_ffn_bytes_)
+    QE_LOG("[plan] CUDA zero-copy FFN: %.0f MiB from GGUF, %.0f MiB in shared pinned memory\n",
+           file_mapped_ffn_bytes_ / (double)MiB, mapped_ffn_bytes_ / (double)MiB);
   if (r4_bytes_total) QE_LOG("[plan] CPU part repacked to R4 nibbles: %.0f MiB\n", r4_bytes_total / (double)MiB);
 
   // CPU side of the hybrid FFN

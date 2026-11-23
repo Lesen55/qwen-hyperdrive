@@ -1,0 +1,64 @@
+name: windows-vulkan
+
+on:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The windows-latest image ships Clang 20, but its Visual Studio 18 STL
+      # hard-rejects anything below Clang 22 (error STL1000). Install the
+      # official LLVM 22.1.0 win64 build (the install-llvm-action does not
+      # carry Windows assets for 22.x, so fetch it straight from llvm-project).
+      - name: Install LLVM 22.1.0
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.0/LLVM-22.1.0-win64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm-22.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\llvm-22.exe" -ArgumentList "/S" -Wait
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # SDK 1.3.296's bundled shaderc/glslang cannot compile
+      # GL_EXT_integer_dot_product (mvc.comp I8 variants); 1.4.x ships a
+      # glslang that supports it, matching the upstream Nix toolchain.
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.321.0
+          install_runtime: true
+          cache: true
+          stripdown: true
+
+      - name: Configure and build (Vulkan only, clang)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vsPath) { throw 'Visual Studio C++ tools were not found.' }
+          Import-Module "$vsPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vsPath -DevCmdArguments '-arch=x64' -SkipAutomaticLocation
+          # DevShell supplies the Windows SDK LIB paths and may prepend its bundled Clang.
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          clang++ --version
+          cmake -S . -B build -G Ninja `
+            -DQE_CUDA=OFF -DQE_VULKAN=ON `
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --parallel
+
+      - name: Package
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Backend vulkan -BuildDirectory build -OutputDirectory dist
+
+      - name: Upload executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-hyperdrive-windows-vulkan-x64
+          path: dist/qwen-hyperdrive-windows-vulkan-x64.zip
+          compression-level: 0
+          if-no-files-found: error

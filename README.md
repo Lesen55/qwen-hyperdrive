@@ -116,7 +116,7 @@ Arc 130V（ThinkPad T14 Gen 6、Core Ultra 5 228V、LPDDR5X 32 GB、Mesa ANV）�
 - ユニファイドメモリ（Lunar Lake）向け:
   - FFN の gate/up の一部の行を CPU（P コア 4 本、AVX-VNNI）が同じメモリから直接計算し、GPU と同時に進める（1 回の投入の中で、ホストフラグと Vulkan イベントで同期）。分担はパスごとの実測で自動選択。
   - 効果は最良で +7%（11.8 → 12.6 tok/s）。CPU と GPU が同じメモリ帯域を取り合うため大きくは伸びない。
-  - モデルファイルのマップ領域をそのまま GPU に見せるゼロコピーは、ANV が読み取り専用のファイルページを取り込めず、失敗時にデバイスごと失われるため、既定では使わない（`QE_VK_ZEROCOPY=1` で試せる）。
+  - Vulkan の `QE_VK_ZEROCOPY=1` は、対応ドライバーで GGUF のマップ領域を直接 GPU に取り込む。取り込めない重みは GPU が直接読める共有メモリに一度だけ CPU でコピーする。`QE_VK_ZEROCOPY=2` は共有メモリだけを使い、GGUF の直接取り込みを試さない。読み取り専用ファイルの取り込みで問題が出るドライバーでは `2` を使う。
 - CPU スレッドの既定は、ハイブリッド CPU では P コアだけ（Core Ultra 5 228V: P コア 4 本で 57.6 GB/s、E コアを含めた 8 本では 19.3 GB/s）。
 - RX 7900 XTX の実機ではまだ測っていない。
 
@@ -178,6 +178,15 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 開発: `nix develop` → `cmake -S . -B build -G Ninja && ninja -C build`。
 CLI: `qwen35-engine ppl|gen -m model.gguf --ids tokens.txt`（`nix run .#cli`）。
 
+### Windows バイナリ
+
+`winport` への push と `main` 向け PR で、[Windows builds](.github/workflows/windows-distribution.yml) が ZIP を生成する。`winport` 上のコミットに `winport-v*` タグを付けて push すると、両ビルドが成功した時点で ZIP と SHA-256 を GitHub Releases のプレリリースに公開する。
+
+- **CUDA x64** — Ampere、Ada、Hopper、Blackwell（SM 80 / 86 / 89 / 90 / 100 / 120）。CUDA 12.8 のランタイム DLL を同梱する。対応する NVIDIA ドライバーを使用する。
+- **Vulkan x64** — Vulkan 1.2 と必要なサブグループ機能を備えた AMD・Intel・NVIDIA GPU 向け。GPU に合ったカーネルを起動時に自動選択する。
+
+Visual C++ 再頒布可能パッケージ（x64）とモデルの GGUF を用意し、展開したフォルダーで `qwen35-server.exe -m model.gguf` または `qwen35-server-vk.exe -m model.gguf` を実行する。
+
 Vulkan（AMD / Intel など）:
 
 ```sh
@@ -236,7 +245,9 @@ LLM_ENGINE_BACKEND=vulkan ./hd/bin/llm-engine -m model.gguf --port 8080
 ## 制限
 
 - 対象アーキテクチャは `qwen35`（Qwen3.5/3.8 系 dense ハイブリッド、注意ヘッド次元 256・DeltaNet 状態 128）のみ。
-- 動作環境は Linux（x86-64-v3 以上）のみ。
+- 動作環境は Linux と Windows（x86-64-v3 以上）。Windows のビルド手順は [CUDA](.github/workflows/windows-cuda.yml) と [Vulkan](.github/workflows/windows-vulkan.yml) のワークフローを参照。
+- Windows の Vulkan は既定でモデル重みを GPU バッファにコピーする。内蔵 GPU ではコピー済みページをプロセスのワーキングセットから外す。ディスクリート GPU でも `QE_VK_DROP_PAGES=1` で同じ動作を有効にできる。
+- CUDA の `QE_CUDA_ZEROCOPY=1` は、VRAM に収まらない Qwen・SenseNova の FFN を CUDA カーネルから直接読めるようにする。対応環境では読み取り専用 GGUF を登録し、それ以外ではページロックした共有メモリを使う。`2` は直接登録を試さず共有メモリを使う。共有メモリの確保に失敗した層と、`--cpu-frac` に正の値を指定した場合は通常の転送を使う。ディスクリート GPU では PCIe 越しの読み出しになるため、速度は GPU とモデルによって変わる。
 - Vulkan 版は CPU への FFN 分担（ストリーミング + CPU 計算）を持たない。ただしユニファイドメモリでの同時実行はある。KV は q8 / f16 のみ。
 - RX 7900 XTX など AMD GPU は、仕組み（判別・自動調整）だけで実機未確認。
 - 同時処理は 1 リクエスト（サーバーは直列化、WebUI は順番待ち中に「待機中」と表示）。

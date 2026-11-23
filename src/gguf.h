@@ -55,6 +55,9 @@ class GGUFFile {
  private:
   std::string path_;
   int fd_ = -1;
+#ifdef _WIN32
+  void* win_map_ = nullptr;  // QeFileMapping* (src/win_compat.h), opaque to keep windows.h out of this header
+#endif
   uint8_t* base_ = nullptr;
   size_t size_ = 0;
   std::map<std::string, GGUFValue> kv_;
