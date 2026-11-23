@@ -288,6 +288,21 @@ void InklingModel::load() {
     kv_bytes += 2 * rows * kv_rowb_;
     S.hist = (float*)dalloc(hist_floats * 4);
   }
+  {
+    // speculative verify: per slot and conv, [3 + kMaxTok][C] saved inputs and the rollback table
+    std::vector<ik::ConvSave> tab;
+    save_.resize(n_slot);
+    const int C[4] = {kvsz, kvsz, E_, E_};
+    const size_t hoff[4] = {0, 3 * (size_t)kvsz, 6 * (size_t)kvsz, 6 * (size_t)kvsz + 3 * (size_t)E_};
+    for (int s = 0; s < n_slot; s++)
+      for (int p = 0; p < 4; p++) {
+        save_[s][p] = (float*)dalloc((size_t)(3 + kMaxTok) * C[p] * 4);
+        tab.push_back({save_[s][p], slots_[s].hist + hoff[p], C[p]});
+      }
+    n_csave_ = (int)tab.size();
+    csave_d_ = (ik::ConvSave*)dalloc(tab.size() * sizeof(ik::ConvSave));
+    CUDA_CHECK(cudaMemcpy(csave_d_, tab.data(), tab.size() * sizeof(ik::ConvSave), cudaMemcpyHostToDevice));
+  }
 
   // ---- workspace
   const size_t UE = (size_t)U_ * E_;
@@ -484,8 +499,11 @@ void InklingModel::plan_experts() {
     CUDA_CHECK(cudaMemset(cnt_d_, 0, (size_t)n_phys_ * n_exp_ * 4));
     CUDA_CHECK(cudaHostAlloc((void**)&cnt_h_, (size_t)n_phys_ * n_exp_ * 4, cudaHostAllocDefault));
     host_allocs_.push_back(cnt_h_);
-    ptr_gu_ = (const uint8_t**)dalloc(stg_slots_ * sizeof(void*));
-    ptr_dn_ = (const uint8_t**)dalloc(stg_slots_ * sizeof(void*));
+    ptr_gu_ = (const uint8_t**)dalloc((size_t)kMaxTok * k_exp_ * sizeof(void*));
+    ptr_dn_ = (const uint8_t**)dalloc((size_t)kMaxTok * k_exp_ * sizeof(void*));
+    slot_d_ = (int*)dalloc((size_t)2 * kMaxTok * k_exp_ * sizeof(int));
+    grp_d_ = dalloc(qk::moe_group_bytes(kMaxTok * k_exp_));
+    ngrp_d_ = (int*)dalloc(16);
   }
   const GGUFFile& g = *gguf_;
   for (int il = 0; il < n_phys_; il++) {
@@ -735,7 +753,8 @@ void InklingModel::moe(const PLayer& L, const float* x, int T, float* out) {
   qx_ = nullptr;  // the MoE paths overwrite xq_
   lin(L.gate_inp, x, T, logit_e_);
   ik::moe_route(logit_e_, L.exp_b, n_exp_, k_exp_, route_scale_, T, ids_, w_e_, s_);
-  if (T * k_exp_ <= stg_slots_ || (L.resident && T <= kMaxTok)) moe_small(L, x, T, out);
+  prof(10);
+  if (T <= kMaxTok) moe_small(L, x, T, out);
   else moe_large(L, x, T, out);
 }
 
@@ -747,18 +766,34 @@ void InklingModel::moe_small(const PLayer& L, const float* x, int T, float* out)
   const uint8_t *const *pg = nullptr, *const *pd = nullptr;
   if (!L.resident) {
     // cached experts are read in place, the others are copied from host memory into staging slots
-    qk::gather_experts_cached(L.gu.host, L.gu.stride, ids_, A, eptr_d_ + (size_t)L.idx * n_exp_, stg_gu_, ptr_gu_,
-                              cnt_d_ + (size_t)L.idx * n_exp_, s_);
-    qk::gather_experts_cached(L.dn.host, L.dn.stride, ids_, A, eptr_d_ + (size_t)(n_phys_ + L.idx) * n_exp_, stg_dn_,
-                              ptr_dn_, nullptr, s_);
+    // distinct experts resolved once: cached in place, misses into the staging slots (beyond: read from host)
+    qk::gather_experts_small(L.gu.host, L.gu.stride, ids_, A, eptr_d_ + (size_t)L.idx * n_exp_, stg_gu_, stg_slots_,
+                             ptr_gu_, slot_d_, cnt_d_ + (size_t)L.idx * n_exp_, s_);
+    qk::gather_experts_small(L.dn.host, L.dn.stride, ids_, A, eptr_d_ + (size_t)(n_phys_ + L.idx) * n_exp_, stg_dn_,
+                             stg_slots_, ptr_dn_, slot_d_ + A, nullptr, s_);
     pg = ptr_gu_;
+    prof(11);
     pd = ptr_dn_;
   }
   qk::quantize_q8(x, xqs_, xds_, E_, T, s_);
-  qk::moe_matvec(L.gu.type, gu, L.gu.stride, L.gu.rb, L.gu.K, L.gu.N, A, ids, ids_, L.gu.scale, xqs_, xds_, k_exp_, ygus_, s_, pg);
+  static const bool grouped = !getenv("QE_INK_MOE_UNGROUPED");
+  if (grouped && T > 1) {
+    // assignments sharing an expert read its weights once
+    qk::moe_group(ids_, A, grp_d_, ngrp_d_, s_);
+    qk::moe_matvec_grouped(L.gu.type, gu, L.gu.stride, L.gu.rb, L.gu.K, L.gu.N, A, grp_d_, ngrp_d_, L.gu.scale, xqs_, xds_,
+                           k_exp_, ygus_, s_, pg);
+  } else {
+    qk::moe_matvec(L.gu.type, gu, L.gu.stride, L.gu.rb, L.gu.K, L.gu.N, A, ids, ids_, L.gu.scale, xqs_, xds_, k_exp_, ygus_, s_, pg);
+  }
+  prof(12);
   ik::situ(ygus_, A, n_ff_, situ_b_, situ_lb_, nullptr, nullptr, hs_, s_);
   qk::quantize_q8(hs_, xqs_, xds_, n_ff_, A, s_);
-  qk::moe_matvec(L.dn.type, dn, L.dn.stride, L.dn.rb, L.dn.K, L.dn.N, A, ids, ids_, L.dn.scale, xqs_, xds_, 1, yds_, s_, pd);
+  prof(13);
+  if (grouped && T > 1)
+    qk::moe_matvec_grouped(L.dn.type, dn, L.dn.stride, L.dn.rb, L.dn.K, L.dn.N, A, grp_d_, ngrp_d_, L.dn.scale, xqs_, xds_, 1,
+                           yds_, s_, pd);
+  else
+    qk::moe_matvec(L.dn.type, dn, L.dn.stride, L.dn.rb, L.dn.K, L.dn.N, A, ids, ids_, L.dn.scale, xqs_, xds_, 1, yds_, s_, pd);
   ik::moe_combine(yds_, nullptr, w_e_, T, k_exp_, E_, out, s_);
 }
 
@@ -910,6 +945,8 @@ static bool ink_prof() {
 }
 void InklingModel::prof(int k) {
   if (!ink_prof() || (prof_T_ <= kMaxTok) != (getenv("QE_INK_PROF")[0] == '1')) return;
+  static const int only_t = getenv("QE_INK_PROF_T") ? atoi(getenv("QE_INK_PROF_T")) : 0;
+  if (only_t && prof_T_ != only_t) return;
   cudaEvent_t e;
   CUDA_CHECK(cudaEventCreate(&e));
   CUDA_CHECK(cudaEventRecord(e, s_));
@@ -925,13 +962,15 @@ void InklingModel::prof_flush() {
   }
   for (auto& [k, e] : prof_ev_) cudaEventDestroy(e);
   prof_ev_.clear();
-  if (++prof_n_ % 50 == 0 || getenv("QE_INK_PROF")[0] == '2') {
-    static const char* nm[8] = {"start", "mix+ctrl+norm", "qkv proj", "conv/clip/kv", "attention", "out proj+conv", "ffn mix+norm", "moe"};
+  if (++prof_n_ % (getenv("QE_INK_PROF_T") ? 10 : 50) == 0 || getenv("QE_INK_PROF")[0] == '2') {
+    static const char* nm[14] = {"start", "mix+ctrl+norm", "qkv proj", "conv/clip/kv", "attention", "out proj+conv",
+                                 "ffn mix+norm", "moe down+combine", "ffn conv+add", "head", "moe router", "moe gather",
+                                 "moe gate_up", "moe situ+quant"};
     double tot = 0;
-    for (int i = 0; i < 10; i++) tot += prof_ms_[i];
-    fprintf(stderr, "[prof] per step (%d steps): ", prof_n_);
-    for (int i = 1; i < 10; i++)
-      if (prof_ms_[i] > 0) fprintf(stderr, "%s %.2f  ", i < 8 ? nm[i] : (i == 8 ? "ffn conv+add" : "head"), prof_ms_[i] / prof_n_);
+    for (int i = 0; i < 14; i++) tot += prof_ms_[i];
+    fprintf(stderr, "[prof] per step (%d steps, T=%d): ", prof_n_, prof_T_);
+    for (int i = 1; i < 14; i++)
+      if (prof_ms_[i] > 0) fprintf(stderr, "%s %.2f  ", nm[i], prof_ms_[i] / prof_n_);
     fprintf(stderr, "| total %.2f ms\n", tot / prof_n_);
   }
 }
@@ -991,9 +1030,11 @@ void InklingModel::layer(int slot, int ip, const float* inp, float* out, std::ve
   prof(2);
   const float inv_s = 1.f / sqrtf((float)n_conv_ + 1), inv_d = 1.f / sqrtf(2.f * n_conv_ + 1);
   float* hist = S.hist;
-  ik::conv(kp_, T, kvsz, L.k_conv, L.swa ? nullptr : kd_, nkv_ * n_conv_, hd_, hist, k_, L.swa ? inv_s : inv_d, s_);
+  float* const* sv = snap_ ? save_[slot].data() : nullptr;  // speculative verify: keep the conv inputs (rollback)
+  ik::conv(kp_, T, kvsz, L.k_conv, L.swa ? nullptr : kd_, nkv_ * n_conv_, hd_, hist, k_, L.swa ? inv_s : inv_d, s_,
+           sv ? sv[0] : nullptr);
   ik::conv(vp_, T, kvsz, L.v_conv, L.swa ? nullptr : vd_, nkv_ * n_conv_, hd_, hist + 3 * kvsz, v_,
-           L.swa ? inv_s : inv_d, s_);
+           L.swa ? inv_s : inv_d, s_, sv ? sv[1] : nullptr);
   ik::clip_heads(q_, qsz, L.q_clip, nh_, hd_, T, qk_clip_, !L.swa, pos_d_, log_alpha_, log_floor_, s_);
   ik::clip_heads(k_, kvsz, nullptr, nkv_, hd_, T, qk_clip_, false, pos_d_, 0.f, 1.f, s_);
   ik::head_rms(v_, hd_, nkv_, kvsz, T, eps_, s_);
@@ -1007,7 +1048,7 @@ void InklingModel::layer(int slot, int ip, const float* inp, float* out, std::ve
   prof(4);
   ik::mul_sigmoid(att_, g_, (int64_t)T * qsz, s_);
   lin(L.o, att_, T, o_);
-  ik::conv(o_, T, E_, L.ao_conv, nullptr, 0, 1, hist + 6 * kvsz, o2_, inv_s, s_);
+  ik::conv(o_, T, E_, L.ao_conv, nullptr, 0, 1, hist + 6 * kvsz, o2_, inv_s, s_, sv ? sv[2] : nullptr);
   // the first layer of a block starts a new residual stream; its input joins the mixed blocks
   if (ip % block_ == 0) {
     blocks.push_back(inp);
@@ -1030,7 +1071,7 @@ void InklingModel::layer(int slot, int ip, const float* inp, float* out, std::ve
   prof(6);
   moe(L, xn_[0], T, o_);
   prof(7);
-  ik::conv(o_, T, E_, L.fo_conv, nullptr, 0, 1, hist + 6 * kvsz + 3 * E_, o2_, inv_s, s_);
+  ik::conv(o_, T, E_, L.fo_conv, nullptr, 0, 1, hist + 6 * kvsz + 3 * E_, o2_, inv_s, s_, sv ? sv[3] : nullptr);
   ik::add(out, out, o2_, (int64_t)T * E_, s_);
   prof(8);
 }
@@ -1176,9 +1217,15 @@ void InklingModel::body(int T, int pos0, int n_out, bool want_logits, bool want_
     CUDA_CHECK(cudaMemcpyAsync(out_h_, logits_d_, (size_t)n_out * n_vocab_ * 4, cudaMemcpyDeviceToHost, s_));
 }
 
+void InklingModel::rollback(int n_keep) {
+  if (!snap_) return;
+  ik::conv_rollback(csave_d_, n_csave_, n_keep, s_);
+  pos_ = snap_pos0_ + n_keep;
+  snap_ = false;
+}
+
 void InklingModel::forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax, bool snapshot,
                            bool mtp_prefill) {
-  (void)snapshot;
   (void)mtp_prefill;
   QE_ASSERT(n > 0 && n_logits <= n && (n_logits <= kMaxTok || n_logits <= U_));
   // elastic cache: the context grows into KV rows (rounded up), larger batches need the prefill workspace
@@ -1186,7 +1233,9 @@ void InklingModel::forward(const int* tokens, int n, int pos0, float* logits, in
     kv_hi_ = std::min(ctx_, (pos0 + n + 2047) / 2048 * 2048);
     cache_evict(true, false);
   }
-  const bool big = n * k_exp_ > stg_slots_ || n > kMaxTok;
+  const bool big = n > kMaxTok;
+  snap_ = snapshot && n <= kMaxTok;
+  snap_pos0_ = pos0;
   if (big) {
     ws_busy_ = true;
     cache_evict(false, true);

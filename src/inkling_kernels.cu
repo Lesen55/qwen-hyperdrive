@@ -184,9 +184,13 @@ __global__ void k_conv(const float* __restrict__ x, int T, int C, const float* _
   }
   y[idx] = acc * inv;
 }
-__global__ void k_conv_hist(const float* __restrict__ x, int T, int C, float* hist) {
+__global__ void k_conv_hist(const float* __restrict__ x, int T, int C, float* hist, float* save) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
+  if (save) {  // speculative verify: the whole input history [old 3 | T new] (rollback picks 3 rows of it)
+    for (int i = 0; i < 3; i++) save[(size_t)i * C + c] = hist[(size_t)i * C + c];
+    for (int t = 0; t < T; t++) save[(size_t)(3 + t) * C + c] = x[(size_t)t * C + c];
+  }
   // new[i] = input at time T-3+i: x if >= 0, else old hist[T+i] (read before it can be overwritten: T+i > i)
   for (int i = 0; i < 3; i++) {
     const int tt = T - 3 + i;
@@ -772,10 +776,19 @@ void ctrl_combine(float* out, const float* cur, const float* msg, const float* g
   if (n > 0) k_ctrl_combine<<<cdiv(n, 256), 256, 0, s>>>(out, cur, msg, gf, E, n);
 }
 void conv(const float* x, int T, int C, const float* w, const float* dyn, int dyn_ts, int ch_per_head, float* hist,
-          float* y, float inv, cudaStream_t s) {
+          float* y, float inv, cudaStream_t s, float* save) {
   if (T <= 0) return;
   k_conv<<<cdiv((int64_t)T * C, 256), 256, 0, s>>>(x, T, C, w, dyn, dyn_ts, ch_per_head, hist, y, inv);
-  k_conv_hist<<<cdiv(C, 256), 256, 0, s>>>(x, T, C, hist);
+  k_conv_hist<<<cdiv(C, 256), 256, 0, s>>>(x, T, C, hist, save);
+}
+// rollback: hist = save rows [k, k + 3) for every (save, hist, C) entry
+__global__ void k_conv_rollback(const ConvSave* __restrict__ tab, int n, int k) {
+  const ConvSave e = tab[blockIdx.y];
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < 3 * e.C; i += gridDim.x * blockDim.x)
+    e.hist[i] = e.save[(size_t)k * e.C + i];
+}
+void conv_rollback(const ConvSave* tab, int n, int k, cudaStream_t s) {
+  if (n > 0) k_conv_rollback<<<dim3(8, n), 256, 0, s>>>(tab, n, k);
 }
 size_t kv_row_bytes(int rowlen, int bits) { return (size_t)rowlen * bits / 8 + (bits < 16 ? (size_t)rowlen / 32 * 2 : 0); }
 void kv_store(const float* k, int ks, const float* v, int vs, uint8_t* kc, uint8_t* vc, int rowlen, int bits,

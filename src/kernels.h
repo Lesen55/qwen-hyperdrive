@@ -193,4 +193,16 @@ void gather_experts(const void* src, size_t estride, size_t nbytes, const int* i
 // receives the expert's address, cnt[e] (optional) counts its uses
 void gather_experts_cached(const void* src, size_t estride, const int* ids, int A, const uint8_t* const* eptr, void* dst,
                            const uint8_t** ptr, int* cnt, cudaStream_t s);
+// small batches (A <= 1024 assignments, duplicates resolved once): cached -> in place, the first `cap` distinct misses
+// -> staging slots, the rest -> read from (mapped) host memory; slot[] is scratch [A]
+void gather_experts_small(const void* host, size_t estride, const int* ids, int A, const uint8_t* const* eptr, void* stg,
+                          int cap, const uint8_t** ptr, int* slot, int* cnt, cudaStream_t s);
+// grouped small-batch MoE matvec: moe_group() lists the distinct experts of ids[A] (grp: moe_group_bytes(A) bytes,
+// *ngrp on the device); each expert's weights are read once for all the assignments using it.  y, escale, xdiv and
+// wptr (per-assignment pointers, the group's first assignment is used) as in moe_matvec.
+size_t moe_group_bytes(int A);
+void moe_group(const int* ids, int A, void* grp, int* ngrp, cudaStream_t s);
+void moe_matvec_grouped(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, int A, const void* grp,
+                        const int* ngrp, const float* escale, const int8_t* xq, const float* xd, int xdiv, float* y,
+                        cudaStream_t s, const uint8_t* const* wptr = nullptr);
 }  // namespace qk

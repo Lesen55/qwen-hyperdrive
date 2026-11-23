@@ -11,13 +11,17 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <array>
+#include <cstdlib>
 #include <memory>
+#include <algorithm>
 #include <utility>
 #include <string>
 #include <vector>
 
 #include "gguf.h"
 #include "imodel.h"
+#include "inkling_kernels.h"
 
 bool is_inkling_arch(const std::string& arch);
 
@@ -35,6 +39,12 @@ class InklingModel : public IModel {
                bool snapshot = false, bool mtp_prefill = false) override;
   void reset() override;
   void set_cancel(const std::atomic<bool>* c) override { cancel_ = c; }
+  // speculative decoding (n-gram / draft-model drafts): verify passes of up to draft_max + 1 tokens, then rollback
+  int draft_max() const override {
+    static const bool off = getenv("QE_INK_SPEC") && atoi(getenv("QE_INK_SPEC")) == 0;
+    return off ? 0 : std::min(opt_.draft_max, kMaxTok - 1);
+  }
+  void rollback(int n_keep) override;
   void prepare_context(int npos, bool small_prefill = false) override;
   int seq_create() override;
   void seq_select(int id) override { (void)id; }
@@ -139,7 +149,7 @@ class InklingModel : public IModel {
   void prof(int k);
   void prof_flush();
   std::vector<std::pair<int, cudaEvent_t>> prof_ev_;
-  double prof_ms_[10] = {};
+  double prof_ms_[16] = {};
   int prof_n_ = 0, prof_T_ = 0;
   int graph_warm_[2] = {};
   float* out_h_ = nullptr;
@@ -153,6 +163,15 @@ class InklingModel : public IModel {
   std::vector<Ck> cks_;
   size_t ck_bytes_ = 0;
   int cap_pos_ = -1, cap_slot_ = -1, pos_ = 0;
+  // speculative verify: conv inputs saved per slot and conv (K, V, attention out, FFN out) for rollback()
+  std::vector<std::array<float*, 4>> save_;
+  ik::ConvSave* csave_d_ = nullptr;
+  int n_csave_ = 0;
+  bool snap_ = false;
+  int snap_pos0_ = 0;
+  int* slot_d_ = nullptr;
+  void* grp_d_ = nullptr;  // distinct experts of a small batch (moe_group)
+  int* ngrp_d_ = nullptr;
   void chunk(const int* tokens, int T, int pos0, int n_out, float* logits_host, int* argmax_host);
   float* fresh(const std::vector<const float*>& live);
 

@@ -36,8 +36,16 @@ void ctrl_combine(float* out, const float* cur, const float* msg, const float* g
 // causal short convolution with residual over T tokens of C channels (row stride C):
 // y = (x + sum_j w[c][j] x_{t-3+j} + [dyn: sum_lag x_{t-lag} dyn[t][head(c)*4 + lag]]) * inv
 // hist [3][C] holds the previous 3 inputs (oldest first) and is updated afterwards
+// save (optional, speculative verify): receives [3 + T][C] = the old history and the T inputs
 void conv(const float* x, int T, int C, const float* w, const float* dyn, int dyn_ts, int ch_per_head, float* hist,
-          float* y, float inv, cudaStream_t s);
+          float* y, float inv, cudaStream_t s, float* save = nullptr);
+// keep the first k tokens of the last saved conv calls: hist = save rows [k, k + 3)
+struct ConvSave {
+  float* save;
+  float* hist;
+  int C;
+};
+void conv_rollback(const ConvSave* tab, int n, int k, cudaStream_t s);
 
 // KV cache: a row of rowlen values per position (ring > 0: position p lives in row p % ring), f16 (bits 16) or
 // int8 / int4 with an f16 scale per 32 values (stored after the row's values)

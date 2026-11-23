@@ -4653,4 +4653,135 @@ void gather_experts_cached(const void* src, size_t estride, const int* ids, int 
   k_gather_cached<<<dim3(per, A), 1024, 0, s>>>((const uint4*)src, estride / 16, estride / 16, ids, eptr, (uint4*)dst,
                                                  ptr, cnt);
 }
+// Small-batch expert resolution (one block, A <= 1024 assignments): an expert used by several assignments is
+// resolved once; cached experts are read in place, the first `cap` distinct misses are copied into staging slots,
+// further misses are read straight from (mapped) host memory.  slot[a] = staging slot to fill or -1.
+__global__ void k_resolve_experts(const int* __restrict__ ids, int A, const uint8_t* const* eptr, const uint8_t* host,
+                                  size_t estride, uint8_t* stg, int cap, const uint8_t** ptr, int* slot, int* cnt) {
+  __shared__ int miss_rank[1024];
+  const int a = threadIdx.x;
+  int e = -1, first = -1;
+  bool miss = false;
+  if (a < A) {
+    e = ids[a];
+    for (int b = 0; b < a; b++)
+      if (ids[b] == e) { first = b; break; }
+    miss = first < 0 && eptr[e] == nullptr;
+    if (cnt) atomicAdd(cnt + e, 1);
+  }
+  miss_rank[threadIdx.x] = miss ? 1 : 0;
+  __syncthreads();
+  // exclusive prefix count of the misses before a (A is small)
+  int rank = 0;
+  for (int b = 0; b < a && b < A; b++) rank += miss_rank[b];
+  __syncthreads();
+  if (a < A && first < 0) {
+    const uint8_t* p = eptr[e];
+    int sl = -1;
+    if (!p) {
+      if (rank < cap) { sl = rank; p = stg + (size_t)rank * estride; }
+      else p = host + (size_t)e * estride;
+    }
+    ptr[a] = p;
+    slot[a] = sl;
+  }
+  __syncthreads();
+  if (a < A && first >= 0) {  // duplicates share the first assignment's copy
+    ptr[a] = ptr[first];
+    slot[a] = -1;
+  }
+}
+__global__ void k_fill_slots(const int* __restrict__ ids, const int* __restrict__ slot, const uint4* __restrict__ host,
+                             size_t estride16, uint4* __restrict__ stg) {
+  const int a = blockIdx.y;
+  const int sl = slot[a];
+  if (sl < 0) return;
+  const uint4* sp = host + (size_t)ids[a] * estride16;
+  uint4* d = stg + (size_t)sl * estride16;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < estride16; i += (size_t)gridDim.x * blockDim.x) d[i] = sp[i];
+}
+void gather_experts_small(const void* host, size_t estride, const int* ids, int A, const uint8_t* const* eptr, void* stg,
+                          int cap, const uint8_t** ptr, int* slot, int* cnt, cudaStream_t s) {
+  QE_ASSERT(A <= 1024 && estride % 16 == 0);
+  k_resolve_experts<<<1, std::max(32, (A + 31) / 32 * 32), 0, s>>>(ids, A, eptr, (const uint8_t*)host, estride,
+                                                                    (uint8_t*)stg, cap, ptr, slot, cnt);
+  const int per = std::max(64, 4096 / std::max(1, std::min(A, cap)));
+  k_fill_slots<<<dim3(per, A), 1024, 0, s>>>(ids, slot, (const uint4*)host, estride / 16, (uint4*)stg);
+}
+// ---- grouped small-batch MoE matvec: assignments that use the same expert share one read of its weights
+// group (single block): distinct experts of ids[A] in first-use order; grp[u] = {expert, count, assignments[8]}
+struct MoeGroup {
+  int e, n, a[8];
+};
+__global__ void k_moe_group(const int* __restrict__ ids, int A, MoeGroup* grp, int* ngrp) {
+  if (threadIdx.x != 0) return;
+  int U = 0;
+  for (int a = 0; a < A; a++) {
+    const int e = ids[a];
+    int u = 0;
+    while (u < U && (grp[u].e != e || grp[u].n == 8)) u++;
+    if (u == U) {
+      grp[U].e = e;
+      grp[U].n = 0;
+      U++;
+    }
+    grp[u].a[grp[u].n++] = a;
+  }
+  *ngrp = U;
+}
+void moe_group(const int* ids, int A, void* grp, int* ngrp, cudaStream_t s) {
+  k_moe_group<<<1, 32, 0, s>>>(ids, A, (MoeGroup*)grp, ngrp);
+}
+size_t moe_group_bytes(int A) { return (size_t)A * sizeof(MoeGroup); }
+
+template <int T>
+__global__ void __launch_bounds__(MMV_WARPS * 32)
+    k_moe_mmv_g(const uint8_t* __restrict__ W, size_t estride, size_t rb, int K, int N, const MoeGroup* __restrict__ grp,
+                const int* __restrict__ ngrp, const float* __restrict__ escale, const int8_t* __restrict__ xq,
+                const float* __restrict__ xd, int xdiv, float* __restrict__ y, const uint8_t* const* __restrict__ wptr) {
+  using D = QDec<T>;
+  const int u = blockIdx.y;
+  if (u >= *ngrp) return;
+  const int row = blockIdx.x * MMV_WARPS + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (row >= N) return;
+  const MoeGroup gr = grp[u];
+  const uint8_t* wr = (wptr ? wptr[gr.a[0]] : W + (size_t)gr.e * estride) + (size_t)row * rb;
+  const int nsb = K / 32;
+  float sum[8];
+#pragma unroll
+  for (int j = 0; j < 8; j++) sum[j] = 0.f;
+  for (int g = lane; g < nsb; g += 32) {
+    W32 w;
+    D::dec(wr + (size_t)(g >> 3) * D::BB, g & 7, w);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      if (j >= gr.n) break;
+      const int xr = gr.a[j] / xdiv;
+      const int4* xp = (const int4*)(xq + (size_t)xr * K + (size_t)g * 32);
+      sum[j] += dot_w32<D::OFF, D::SCALES>(w, __ldg(xp), __ldg(xp + 1)) * __ldg(xd + (size_t)xr * nsb + g);
+    }
+  }
+  const float sc = escale ? __ldg(escale + gr.e) : 1.f;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    if (j >= gr.n) break;
+    const float v = warp_sum(sum[j]);
+    if (lane == 0) y[(size_t)gr.a[j] * N + row] = v * sc;
+  }
+}
+void moe_matvec_grouped(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, int A, const void* grp,
+                        const int* ngrp, const float* escale, const int8_t* xq, const float* xd, int xdiv, float* y,
+                        cudaStream_t s, const uint8_t* const* wptr) {
+  const dim3 grid(cdiv(N, MMV_WARPS), A), block(MMV_WARPS * 32);
+  const uint8_t* w = (const uint8_t*)W;
+  const MoeGroup* g = (const MoeGroup*)grp;
+  switch (type) {
+#define T(t) case t: k_moe_mmv_g<t><<<grid, block, 0, s>>>(w, estride, rb, K, N, g, ngrp, escale, xq, xd, xdiv, y, wptr); break;
+    T(QT_Q8_0) T(QT_Q2_K) T(QT_Q3_K) T(QT_Q4_K) T(QT_Q5_K) T(QT_Q6_K) T(QT_IQ2_XXS) T(QT_IQ2_XS) T(QT_IQ2_S) T(QT_IQ3_XXS)
+    T(QT_IQ3_S) T(QT_IQ1_S) T(QT_IQ1_M) T(QT_IQ4_XS) T(QT_IQ4_NL) T(QT_NVFP4)
+#undef T
+    default: QE_FATAL("moe_matvec_grouped: unsupported type %u", type);
+  }
+}
 }  // namespace qk
