@@ -270,6 +270,10 @@ void InklingModel::load() {
   // ---- cache slots: KV + convolution state per layer application
   const int n_slot = cfg_.n_layer;
   slots_.resize(n_slot);
+  // KV format: --kv f16 / q8 / q4 (q3 -> q4)
+  kv_bits_ = opt_.kv_type == 0 ? 16 : opt_.kv_type == 1 ? 8 : 4;
+  if (const char* e = getenv("QE_INK_KV")) kv_bits_ = atoi(e);
+  kv_rowb_ = ik::kv_row_bytes(nkv_ * hd_, kv_bits_);
   const int kvsz = nkv_ * hd_;
   const size_t hist_floats = 3 * (size_t)(2 * kvsz + 2 * E_);
   size_t kv_bytes = 0;
@@ -279,9 +283,9 @@ void InklingModel::load() {
     const bool swa = L_[S.phys].swa;
     S.ring = swa ? swa_ + U_ : 0;
     const size_t rows = swa ? (size_t)S.ring : (size_t)ctx_;
-    S.kc = (__half*)dalloc(rows * kvsz * 2);
-    S.vc = (__half*)dalloc(rows * kvsz * 2);
-    kv_bytes += 2 * rows * kvsz * 2;
+    S.kc = (uint8_t*)dalloc(rows * kv_rowb_);
+    S.vc = (uint8_t*)dalloc(rows * kv_rowb_);
+    kv_bytes += 2 * rows * kv_rowb_;
     S.hist = (float*)dalloc(hist_floats * 4);
   }
 
@@ -380,7 +384,7 @@ void InklingModel::load() {
   // checkpoints: every slot's conv state + the last swa_ positions of each local slot's KV ring
   {
     size_t b = 0;
-    for (auto& S : slots_) b += hist_floats * 4 + (S.ring ? 2 * (size_t)swa_ * kvsz * 2 : 0);
+    for (auto& S : slots_) b += hist_floats * 4 + (S.ring ? 2 * (size_t)swa_ * kv_rowb_ : 0);
     ck_bytes_ = b;
     const int n = std::clamp(opt_.ck_slots, 0, 4);
     for (int i = 0; i < n; i++) {
@@ -391,8 +395,9 @@ void InklingModel::load() {
     }
   }
   plan_experts();
-  QE_LOG("[inkling] %d layers (%d applied: core [%d,%d) x %d), %d experts top-%d, vocab %d, ctx %d, ubatch %d\n", n_phys_,
-         cfg_.n_layer, core_start_, core_end_, n_pass_, n_exp_, k_exp_, n_vocab_, ctx_, U_);
+  QE_LOG("[inkling] %d layers (%d applied: core [%d,%d) x %d), %d experts top-%d, vocab %d, ctx %d, ubatch %d, KV %s\n", n_phys_,
+         cfg_.n_layer, core_start_, core_end_, n_pass_, n_exp_, k_exp_, n_vocab_, ctx_, U_,
+         kv_bits_ == 16 ? "f16" : kv_bits_ == 8 ? "q8" : "q4");
   QE_LOG("[inkling] VRAM: dense %.0f MiB, KV %.0f MiB, workspace %.0f MiB, experts resident in %d/%d layers, expert cache %d "
          "slots (total %.0f MiB)\n",
          dense_mb, kv_bytes / 1048576.0, ws_mb, ndev_layers_, n_phys_, cache_slots_, vram_used_ / 1048576.0);
@@ -460,9 +465,9 @@ void InklingModel::plan_experts() {
       // global layers' K and V rows beyond the context in use, from the end
       for (auto& S : slots_)
         if (!S.ring) {
-          const size_t bytes = (size_t)ctx_ * nkv_ * hd_ * 2;
-          carve((uint8_t*)S.kc, bytes, nkv_ * hd_ * 2, true);
-          carve((uint8_t*)S.vc, bytes, nkv_ * hd_ * 2, true);
+          const size_t bytes = (size_t)ctx_ * kv_rowb_;
+          carve(S.kc, bytes, (int)kv_rowb_, true);
+          carve(S.vc, bytes, (int)kv_rowb_, true);
         }
       cache_slots_ = (int)cslots_.size();
       QE_LOG("[inkling] elastic expert cache: %zu dedicated + %zu workspace + %d KV-tail slots of %.1f MiB (host layers hold %zu "
@@ -609,12 +614,12 @@ void InklingModel::ck_save(int slot, int pos) {
     const int k = ring_ranges(pos, swa_, S.ring, r0, n);
     size_t o = 0;
     for (int i = 0; i < k; i++) {
-      const size_t bytes = (size_t)n[i] * kvsz * 2;
-      CUDA_CHECK(cudaMemcpyAsync(h + o, S.kc + (size_t)r0[i] * kvsz, bytes, cudaMemcpyDeviceToHost, s_));
-      CUDA_CHECK(cudaMemcpyAsync(h + (size_t)swa_ * kvsz * 2 + o, S.vc + (size_t)r0[i] * kvsz, bytes, cudaMemcpyDeviceToHost, s_));
+      const size_t bytes = (size_t)n[i] * kv_rowb_;
+      CUDA_CHECK(cudaMemcpyAsync(h + o, S.kc + (size_t)r0[i] * kv_rowb_, bytes, cudaMemcpyDeviceToHost, s_));
+      CUDA_CHECK(cudaMemcpyAsync(h + (size_t)swa_ * kv_rowb_ + o, S.vc + (size_t)r0[i] * kv_rowb_, bytes, cudaMemcpyDeviceToHost, s_));
       o += bytes;
     }
-    h += 2 * (size_t)swa_ * kvsz * 2;
+    h += 2 * (size_t)swa_ * kv_rowb_;
   }
   cks_[slot].pos = pos;
   CUDA_CHECK(cudaStreamSynchronize(s_));
@@ -634,12 +639,12 @@ void InklingModel::ck_restore(int slot) {
     const int k = ring_ranges(pos, swa_, S.ring, r0, n);
     size_t o = 0;
     for (int i = 0; i < k; i++) {
-      const size_t bytes = (size_t)n[i] * kvsz * 2;
-      CUDA_CHECK(cudaMemcpyAsync(S.kc + (size_t)r0[i] * kvsz, h + o, bytes, cudaMemcpyHostToDevice, s_));
-      CUDA_CHECK(cudaMemcpyAsync(S.vc + (size_t)r0[i] * kvsz, h + (size_t)swa_ * kvsz * 2 + o, bytes, cudaMemcpyHostToDevice, s_));
+      const size_t bytes = (size_t)n[i] * kv_rowb_;
+      CUDA_CHECK(cudaMemcpyAsync(S.kc + (size_t)r0[i] * kv_rowb_, h + o, bytes, cudaMemcpyHostToDevice, s_));
+      CUDA_CHECK(cudaMemcpyAsync(S.vc + (size_t)r0[i] * kv_rowb_, h + (size_t)swa_ * kv_rowb_ + o, bytes, cudaMemcpyHostToDevice, s_));
       o += bytes;
     }
-    h += 2 * (size_t)swa_ * kvsz * 2;
+    h += 2 * (size_t)swa_ * kv_rowb_;
   }
   pos_ = pos;
   CUDA_CHECK(cudaStreamSynchronize(s_));
@@ -993,11 +998,11 @@ void InklingModel::layer(int slot, int ip, const float* inp, float* out, std::ve
   ik::clip_heads(k_, kvsz, nullptr, nkv_, hd_, T, qk_clip_, false, pos_d_, 0.f, 1.f, s_);
   ik::head_rms(v_, hd_, nkv_, kvsz, T, eps_, s_);
   ik::clip_heads(r_, nh_ * n_rel_, L.rel_clip, nh_, n_rel_, T, rel_clip_, !L.swa, pos_d_, log_alpha_, log_floor_, s_);
-  ik::kv_store(k_, kvsz, v_, kvsz, S.kc, S.vc, kvsz, pos_d_, T, S.ring, s_);
+  ik::kv_store(k_, kvsz, v_, kvsz, S.kc, S.vc, kvsz, kv_bits_, pos_d_, T, S.ring, s_);
   prof(3);
   // key bound per query tile: small batches use the worst case (the same launch for every position: CUDA graphs)
   const int max_keys = T <= kMaxTok ? (L.swa ? swa_ + T : ctx_) : (L.swa ? std::min(pos0 + T, swa_ + T) : pos0 + T);
-  ik::attn(S.kc, S.vc, S.ring, q_, qsz, r_, sink_, L.rel_table, L.swa ? swa_ : rel_extent_, L.swa ? swa_ : 0, att_, pos_d_,
+  ik::attn(S.kc, S.vc, kv_bits_, S.ring, q_, qsz, r_, sink_, L.rel_table, L.swa ? swa_ : rel_extent_, L.swa ? swa_ : 0, att_, pos_d_,
            max_keys, T, nh_, nkv_, hd_, attn_work_, attn_work_bytes_, s_);
   prof(4);
   ik::mul_sigmoid(att_, g_, (int64_t)T * qsz, s_);

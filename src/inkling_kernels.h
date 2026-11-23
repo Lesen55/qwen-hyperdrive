@@ -39,18 +39,20 @@ void ctrl_combine(float* out, const float* cur, const float* msg, const float* g
 void conv(const float* x, int T, int C, const float* w, const float* dyn, int dyn_ts, int ch_per_head, float* hist,
           float* y, float inv, cudaStream_t s);
 
-// KV cache (f16, rows of nkv*hd per position; ring > 0: position p lives in row p % ring)
-void kv_store(const float* k, int ks, const float* v, int vs, __half* kc, __half* vc, int rowlen, const int* posd,
-              int T, int ring, cudaStream_t s);
+// KV cache: a row of rowlen values per position (ring > 0: position p lives in row p % ring), f16 (bits 16) or
+// int8 / int4 with an f16 scale per 32 values (stored after the row's values)
+size_t kv_row_bytes(int rowlen, int bits);
+void kv_store(const float* k, int ks, const float* v, int vs, uint8_t* kc, uint8_t* vc, int rowlen, int bits,
+              const int* posd, int T, int ring, cudaStream_t s);
 // attention of T queries at positions pos0.. against cached keys [lo, pos], lo = window ? pos - window + 1 : 0,
 // logit = q.k/sqrt(hd) + (dist < extent ? r . table[dist] : 0), plus a per-query sink logit (value 0).
 // q [T][qs] (heads of hd), r [T][nh*16], sink [T][nh], table [extent][16]; out [T][nh*hd]
 // positions come from device memory (*posd = position of the first query; CUDA-graph friendly); max_keys bounds the
 // keys of a query tile (it sizes the key splits)
 size_t attn_work_bytes(int T, int nh, int nkv, int max_keys);
-void attn(const __half* kc, const __half* vc, int ring, const float* q, int qs, const float* r, const float* sink,
-          const float* table, int extent, int window, float* out, const int* posd, int max_keys, int T, int nh, int nkv,
-          int hd, void* work, size_t work_bytes, cudaStream_t s);
+void attn(const uint8_t* kc, const uint8_t* vc, int bits, int ring, const float* q, int qs, const float* r,
+          const float* sink, const float* table, int extent, int window, float* out, const int* posd, int max_keys, int T,
+          int nh, int nkv, int hd, void* work, size_t work_bytes, cudaStream_t s);
 
 // o *= sigmoid(g) (n elements); y = a + b
 void mul_sigmoid(float* o, const float* g, int64_t n, cudaStream_t s);

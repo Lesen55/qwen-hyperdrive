@@ -195,15 +195,66 @@ __global__ void k_conv_hist(const float* __restrict__ x, int T, int C, float* hi
 }
 
 // ---------------------------------------------------------------------------------------------
-__global__ void k_kv_store(const float* __restrict__ k, int ks, const float* __restrict__ v, int vs, __half* kc,
-                           __half* vc, int rowlen, const int* __restrict__ posd, int T, int ring) {
+// KV rows: f16 (bits 16), or int8 / int4 (offset 8) values with one f16 scale per 32 after the values
+__global__ void k_kv_store(const float* __restrict__ k, int ks, const float* __restrict__ v, int vs, uint8_t* kc,
+                           uint8_t* vc, int rowlen, int rowb, int bits, const int* __restrict__ posd, int T, int ring) {
+  const int ng = rowlen / 32;
   const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= (int64_t)T * rowlen) return;
-  const int t = (int)(idx / rowlen), i = (int)(idx % rowlen);
+  if (idx >= (int64_t)T * ng * 2) return;
+  const int which = (int)(idx % 2);
+  const int t = (int)(idx / 2 / ng), gi = (int)(idx / 2 % ng);
   const int p = *posd + t;
   const size_t row = ring ? (size_t)(p % ring) : (size_t)p;
-  kc[row * rowlen + i] = __float2half(k[(size_t)t * ks + i]);
-  vc[row * rowlen + i] = __float2half(v[(size_t)t * vs + i]);
+  const float* src = (which ? v + (size_t)t * vs : k + (size_t)t * ks) + gi * 32;
+  uint8_t* dst = (which ? vc : kc) + row * rowb;
+  float x[32];
+#pragma unroll
+  for (int i = 0; i < 32; i++) x[i] = src[i];
+  if (bits == 16) {
+    __half* h = (__half*)dst + gi * 32;
+#pragma unroll
+    for (int i = 0; i < 32; i++) h[i] = __float2half(x[i]);
+    return;
+  }
+  float m = 0.f;
+#pragma unroll
+  for (int i = 0; i < 32; i++) m = fmaxf(m, fabsf(x[i]));
+  const float qmax = bits == 8 ? 127.f : 7.f;
+  const float d = m / qmax, id = d > 0.f ? 1.f / d : 0.f;
+  *(__half*)(dst + (size_t)rowlen * bits / 8 + gi * 2) = __float2half(d);
+  if (bits == 8) {
+    int8_t* q = (int8_t*)dst + gi * 32;
+#pragma unroll
+    for (int i = 0; i < 32; i++) q[i] = (int8_t)__float2int_rn(x[i] * id);
+  } else {
+    uint8_t* q = dst + gi * 16;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+      const int lo = min(15, max(0, __float2int_rn(x[2 * i] * id) + 8));
+      const int hi = min(15, max(0, __float2int_rn(x[2 * i + 1] * id) + 8));
+      q[i] = (uint8_t)(lo | (hi << 4));
+    }
+  }
+}
+// 8 consecutive values (col % 8 == 0) of a KV row as f16
+__device__ __forceinline__ uint4 kv_ld8(const uint8_t* rowp, int bits, int rowlen, int col) {
+  if (bits == 16) return *(const uint4*)(rowp + (size_t)col * 2);
+  const float d = __half2float(*(const __half*)(rowp + (size_t)rowlen * bits / 8 + (col / 32) * 2));
+  __half2 h[4];
+  if (bits == 8) {
+    const uint2 q = *(const uint2*)(rowp + col);
+    const int8_t* b = (const int8_t*)&q;
+#pragma unroll
+    for (int i = 0; i < 4; i++) h[i] = __floats2half2_rn(b[2 * i] * d, b[2 * i + 1] * d);
+  } else {
+    const uint32_t q = *(const uint32_t*)(rowp + col / 2);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const uint32_t by = (q >> (8 * i)) & 0xff;
+      h[i] = __floats2half2_rn((float)((int)(by & 15) - 8) * d, (float)((int)(by >> 4) - 8) * d);
+    }
+  }
+  return *(const uint4*)h;
 }
 
 // relative-position attention with sinks (SIMT flash attention).  Block = (kv head, tile of QT query tokens,
@@ -213,9 +264,9 @@ constexpr int AT_HD = 128;   // head dim
 constexpr int AT_KS = 65;    // K smem row stride in 32-bit words (conflict-free column reads)
 constexpr int AT_NT = 256;
 struct AttnArgs {
-  const __half* kc;
-  const __half* vc;
-  int ring;
+  const uint8_t* kc;
+  const uint8_t* vc;
+  int ring, bits, rowb;
   const float* q;
   int qs;
   const float* r;
@@ -288,8 +339,8 @@ __global__ void __launch_bounds__(AT_NT) k_attn(AttnArgs a) {
       if (key < nk) {
         const int p = kb + key;
         const size_t row = a.ring ? (size_t)(p % a.ring) : (size_t)p;
-        kv = *(const uint4*)(a.kc + row * rowlen + (size_t)kvh * AT_HD + c * 8);
-        vv = *(const uint4*)(a.vc + row * rowlen + (size_t)kvh * AT_HD + c * 8);
+        kv = kv_ld8(a.kc + row * a.rowb, a.bits, rowlen, kvh * AT_HD + c * 8);
+        vv = kv_ld8(a.vc + row * a.rowb, a.bits, rowlen, kvh * AT_HD + c * 8);
       }
       uint32_t* kd = Ks + key * AT_KS + c * 4;
       kd[0] = kv.x; kd[1] = kv.y; kd[2] = kv.z; kd[3] = kv.w;
@@ -473,8 +524,8 @@ __global__ void __launch_bounds__(G * 64) k_attn_tc(AttnArgs a) {
       if (key < nk) {
         const int p = k0 + key;
         const size_t row = a.ring ? (size_t)(p % a.ring) : (size_t)p;
-        kv = *(const uint4*)(a.kc + row * rowlen + (size_t)kvh * AT_HD + c * 8);
-        vv = *(const uint4*)(a.vc + row * rowlen + (size_t)kvh * AT_HD + c * 8);
+        kv = kv_ld8(a.kc + row * a.rowb, a.bits, rowlen, kvh * AT_HD + c * 8);
+        vv = kv_ld8(a.vc + row * a.rowb, a.bits, rowlen, kvh * AT_HD + c * 8);
       }
       *(uint4*)&Ks[key * TC_KS + c * 8] = kv;
       const __half* vh = (const __half*)&vv;
@@ -726,21 +777,25 @@ void conv(const float* x, int T, int C, const float* w, const float* dyn, int dy
   k_conv<<<cdiv((int64_t)T * C, 256), 256, 0, s>>>(x, T, C, w, dyn, dyn_ts, ch_per_head, hist, y, inv);
   k_conv_hist<<<cdiv(C, 256), 256, 0, s>>>(x, T, C, hist);
 }
-void kv_store(const float* k, int ks, const float* v, int vs, __half* kc, __half* vc, int rowlen, const int* posd,
-              int T, int ring, cudaStream_t s) {
-  if (T > 0) k_kv_store<<<cdiv((int64_t)T * rowlen, 256), 256, 0, s>>>(k, ks, v, vs, kc, vc, rowlen, posd, T, ring);
+size_t kv_row_bytes(int rowlen, int bits) { return (size_t)rowlen * bits / 8 + (bits < 16 ? (size_t)rowlen / 32 * 2 : 0); }
+void kv_store(const float* k, int ks, const float* v, int vs, uint8_t* kc, uint8_t* vc, int rowlen, int bits,
+              const int* posd, int T, int ring, cudaStream_t s) {
+  const int rowb = (int)kv_row_bytes(rowlen, bits);
+  if (T > 0)
+    k_kv_store<<<cdiv((int64_t)T * rowlen / 32 * 2, 128), 128, 0, s>>>(k, ks, v, vs, kc, vc, rowlen, rowb, bits, posd, T, ring);
 }
 size_t attn_work_bytes(int T, int nh, int nkv, int max_keys) {
   int NQ, QT, splits;
   attn_plan(T, nh, nkv, max_keys, NQ, QT, splits);
   return splits > 1 ? (size_t)splits * T * nh * (2 + AT_HD) * sizeof(float) : 0;
 }
-void attn(const __half* kc, const __half* vc, int ring, const float* q, int qs, const float* r, const float* sink,
-          const float* table, int extent, int window, float* out, const int* posd, int max_keys, int T, int nh, int nkv,
-          int hd, void* work, size_t work_bytes, cudaStream_t s) {
+void attn(const uint8_t* kc, const uint8_t* vc, int bits, int ring, const float* q, int qs, const float* r,
+          const float* sink, const float* table, int extent, int window, float* out, const int* posd, int max_keys, int T,
+          int nh, int nkv, int hd, void* work, size_t work_bytes, cudaStream_t s) {
   QE_ASSERT(hd == AT_HD && nh % nkv == 0);
   if (T <= 0) return;
-  AttnArgs a{kc, vc, ring, q, qs, r, sink, table, extent, window, out, (float*)work, posd, T, nh, nkv, nh / nkv, 1};
+  AttnArgs a{kc, vc, ring, bits, (int)kv_row_bytes(nkv * AT_HD, bits), q, qs, r, sink, table, extent, window, out,
+             (float*)work, posd, T, nh, nkv, nh / nkv, 1};
   static const bool tc_off = getenv("QE_INK_ATT_SIMT") != nullptr;
   if (T >= 16 && nh / nkv == 3 && !tc_off) {
     constexpr int G = 3;

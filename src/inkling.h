@@ -88,7 +88,7 @@ class InklingModel : public IModel {
   };
   struct Slot {
     int phys = 0;
-    __half *kc = nullptr, *vc = nullptr;
+    uint8_t *kc = nullptr, *vc = nullptr;  // KV rows of kv_rowb_ bytes
     int ring = 0;           // 0: linear (global layer), else ring size (local layer)
     float* hist = nullptr;  // conv state: K [3][kv], V [3][kv], attn out [3][E], ffn out [3][E]
   };
@@ -210,5 +210,7 @@ class InklingModel : public IModel {
   int* argmax_d_ = nullptr;
   float* embd_h_ = nullptr;
   int ctx_ = 0;
+  int kv_bits_ = 16;
+  size_t kv_rowb_ = 0;
   int ndev_layers_ = 0;
 };
