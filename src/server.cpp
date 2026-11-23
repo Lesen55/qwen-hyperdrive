@@ -894,7 +894,11 @@ int main(int argc, char** argv) {
     } else QE_FATAL("unknown argument %s (see --help)", a.c_str());
   }
   if (srv.opt.model_path.empty()) QE_FATAL("-m model.gguf is required");
-  if (!srv.draft_model.empty()) srv.draft = create_draft_model(srv.draft_model, srv.opt);  // before the target
+  if (!srv.draft_model.empty()) {
+    // a DSpark block drafter (dflash) runs inside the target; other drafts are separate models
+    if (GGUFFile(srv.draft_model).get_str("general.architecture", "") == "dflash") srv.opt.dspark_path = srv.draft_model;
+    else srv.draft = create_draft_model(srv.draft_model, srv.opt);  // before the target
+  }
   srv.model = create_model(srv.opt);
   srv.tok = std::make_unique<Tokenizer>(srv.model->gguf());
   srv.gen = std::make_unique<Generator>(*srv.model, SamplingParams{}, srv.opt.use_mtp);

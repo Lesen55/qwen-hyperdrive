@@ -60,7 +60,8 @@ void kv_store(const float* k, int ks, const float* v, int vs, uint8_t* kc, uint8
 size_t attn_work_bytes(int T, int nh, int nkv, int max_keys);
 void attn(const uint8_t* kc, const uint8_t* vc, int bits, int ring, const float* q, int qs, const float* r,
           const float* sink, const float* table, int extent, int window, float* out, const int* posd, int max_keys, int T,
-          int nh, int nkv, int hd, void* work, size_t work_bytes, cudaStream_t s);
+          int nh, int nkv, int hd, void* work, size_t work_bytes, cudaStream_t s, bool block = false);
+// (r / sink / table may be null; block: a non-causal block of T queries, see AttnArgs)
 
 // o *= sigmoid(g) (n elements); y = a + b
 void mul_sigmoid(float* o, const float* g, int64_t n, cudaStream_t s);
@@ -81,4 +82,10 @@ void moe_coef(const float* w, const int* ids, const float* escale, int A, float*
 // out[a] = x[rows[a]] (rows of K)
 void gather_rows(const float* x, const int* rows, int A, int K, float* out, cudaStream_t s);
 
+// DSpark drafter: feature mixing (out[t] = rms(sum_j w[j] feat[t][j]) * norm), Markov-head GRU, candidate logits
+void mix_feat(const float* feat, int nf, int E, const float* w, const float* norm, float eps, float* out, int T,
+              cudaStream_t s);
+void gru(const float* j, float* state, float* latent, int R, cudaStream_t s);
+// out[i] = softcap(base[i] + bias[i]) for the n candidates idx[]; *tok = the candidate of the first maximum
+void cand_logits(const float* base, const float* bias, const int* idx, int n, float cap, float* out, int* tok, cudaStream_t s);
 }  // namespace ik

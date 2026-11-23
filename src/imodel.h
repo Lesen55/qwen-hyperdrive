@@ -32,6 +32,7 @@ struct EngineOptions {
   double dram_gbps = -1;        // host DRAM bandwidth shared by CPU kernels and DMA (-1: measured)
   bool cpu_r4 = true;           // allow lossless R4 repacking of the CPU part
   bool verbose = false;
+  std::string dspark_path;     // DSpark block drafter attached to the target (Inkling 2)
 };
 
 struct Config {

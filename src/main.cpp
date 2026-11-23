@@ -81,7 +81,10 @@ int main(int argc, char** argv) {
     else QE_FATAL("unknown argument %s", a.c_str());
   }
   std::unique_ptr<IModel> dmp;
-  if (!draft_model.empty()) dmp = create_draft_model(draft_model, opt);  // first: it takes its share of VRAM
+  if (!draft_model.empty()) {
+    if (GGUFFile(draft_model).get_str("general.architecture", "") == "dflash") opt.dspark_path = draft_model;  // in the target
+    else dmp = create_draft_model(draft_model, opt);  // first: it takes its share of VRAM
+  }
   std::unique_ptr<IModel> mp = create_model(opt);
   IModel& model = *mp;
   const int V = model.cfg().n_vocab;

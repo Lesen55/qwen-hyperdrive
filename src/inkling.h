@@ -33,7 +33,11 @@ class InklingModel : public IModel {
   const Config& cfg() const override { return cfg_; }
   const GGUFFile& gguf() const override { return *gguf_; }
   const EngineOptions& options() const override { return opt_; }
-  bool has_mtp() const override { return false; }
+  // DSpark drafter (block draft from the target's hidden states), driven through the generator's MTP interface
+  bool has_mtp() const override { return ds_ != nullptr; }
+  int mtp_draft(int hrow0, const int* tokens, int n, int pos0, float* conf = nullptr, float* logits_host = nullptr,
+                bool head = true) override;
+  int mtp_chain(int token, int pos, float* conf = nullptr, float* logits_host = nullptr) override;
   const char* backend() const override { return "cuda"; }
   void forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax = nullptr,
                bool snapshot = false, bool mtp_prefill = false) override;
@@ -104,11 +108,56 @@ class InklingModel : public IModel {
   };
 
   void load();
-  W upload_w(const std::string& name, bool required = true);
-  float* upload_f32(const std::string& name, bool required = true);
+  W upload_w(const std::string& name, bool required = true, const GGUFFile* src = nullptr);
+  float* upload_f32(const std::string& name, bool required = true, const GGUFFile* src = nullptr);
   Experts load_experts(const std::string& name, const std::string& scale_name);
   void* dalloc(size_t bytes);
   void plan_experts();
+  // ---- DSpark drafter (GGUF architecture dflash, Inkling 2 variant)
+  struct DsLayer {
+    bool swa = false;
+    W q, k, v, o, kctx, vctx, gate, up, down;
+    float *attn_norm = nullptr, *ffn_norm = nullptr, *ctx_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr,
+          *kctx_norm = nullptr;
+    float fuse[4] = {};  // softmax of this layer's target-feature mix
+    uint8_t *kc = nullptr, *vc = nullptr;
+    int ring = 0;
+  };
+  struct DSpark {
+    std::unique_ptr<GGUFFile> g;
+    int n_layer = 0, block = 8, rank = 256, nh = 0, nkv = 0, hd = 128, n_ff = 0, swa = 0;
+    float theta = 1e6f, eps = 1e-6f, cap = 0.f;
+    std::vector<int> targets;  // target layer visits whose inputs are the features (n_layer applications = final norm)
+    std::vector<DsLayer> L;
+    float frnn_fuse[4] = {};
+    W joint, hidden_out;
+    float *joint_b = nullptr, *hidden_out_b = nullptr, *mask = nullptr, *out_norm = nullptr, *frnn_norm = nullptr;
+    const GGUFTensor* w1 = nullptr;  // markov_w1 [V][rank] bf16 (host)
+    // buffers
+    float* feat = nullptr;  // [U][nf][E] target features of the last forward
+    float *x = nullptr, *h = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *att = nullptr, *g1 = nullptr, *u1 = nullptr;
+    float* cur = nullptr;   // [block][E] drafter output
+    float* base = nullptr;  // [block][V] base logits
+    float* frnn = nullptr;  // [ring][E] f_rnn per position
+    int frnn_ring = 0;
+    float *cand_v = nullptr, *cand_l = nullptr, *joint_in = nullptr, *jout = nullptr, *state = nullptr, *latent = nullptr,
+          *corr = nullptr, *bias = nullptr;
+    int* cand_i = nullptr;
+    int *pos_d = nullptr, *posv_d = nullptr, *tok_d = nullptr;
+    int* pos_h = nullptr;
+    void* topk_work = nullptr;
+    int K = 64;
+    int anchor_pos = -1, slot = 0;
+    float* w1_h = nullptr;  // pinned row of markov_w1 (f32)
+    float* cand_h = nullptr;
+    int* cand_i_h = nullptr;
+  };
+  std::unique_ptr<DSpark> ds_;
+  void ds_load(const std::string& path);
+  void ds_capture(int k, const float* rows, int T);    // feature k of the T rows of a forward
+  void ds_inject(int row0, int n, int pos0);            // context K/V (and f_rnn) of feature rows at pos0..
+  void ds_block(int anchor, int pos);                   // drafter on [anchor, mask x (block-1)] at pos..
+  int ds_head(int prev, int slot, float* logits_host);  // Markov head step: draft token of block slot
   // Elastic expert cache: host-layer experts copied into VRAM that is idle right now -- the KV rows beyond the
   // current context of the global layers and the prefill-only workspace.  Being a cache it can be dropped at any
   // time: slots are evicted before the context grows into them or a prefill needs the workspace.

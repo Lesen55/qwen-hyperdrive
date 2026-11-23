@@ -281,6 +281,7 @@ struct AttnArgs {
   float* part;  // splits > 1: [split][T][nh] (m, l) then [split][T][nh][hd] acc
   const int* posd;
   int T, nh, nkv, G, splits;
+  int block;  // non-causal block (draft): every query sees keys <= pos0 + T - 1, window from pos0
 };
 
 template <int NQ>
@@ -312,7 +313,7 @@ __global__ void __launch_bounds__(AT_NT) k_attn(AttnArgs a) {
   for (int i = threadIdx.x; i < NQ * 16; i += AT_NT) {
     const int row = i / 16, j = i % 16;
     const int tt = row / G, g = row % G;
-    Rs[row][j] = row < nrow ? a.r[(size_t)(t0 + tt) * a.nh * 16 + (size_t)(kvh * G + g) * 16 + j] : 0.f;
+    Rs[row][j] = row < nrow && a.r ? a.r[(size_t)(t0 + tt) * a.nh * 16 + (size_t)(kvh * G + g) * 16 + j] : 0.f;
   }
   for (int i = threadIdx.x; i < NQ; i += AT_NT) {
     Ms[i] = -INFINITY;
@@ -320,7 +321,7 @@ __global__ void __launch_bounds__(AT_NT) k_attn(AttnArgs a) {
     Qp[i] = pos0 + t0 + min(i / G, nt - 1);
   }
   // key range of this tile / split
-  const int qlo = pos0 + t0, qhi = pos0 + t0 + nt - 1;
+  const int qlo = a.block ? pos0 : pos0 + t0, qhi = a.block ? pos0 + a.T - 1 : pos0 + t0 + nt - 1;
   int klo = a.window ? max(0, qlo - a.window + 1) : 0;
   int khi = qhi;
   if (a.splits > 1) {  // equal key ranges (multiples of the chunk) of this tile's keys
@@ -358,7 +359,9 @@ __global__ void __launch_bounds__(AT_NT) k_attn(AttnArgs a) {
       if (row < nrow && key < nk) {
         const int kp = kb + key, qp = Qp[row];
         const int dist = qp - kp;
-        if (dist >= 0 && (!a.window || dist < a.window)) {
+        const bool vis = a.block ? (kp <= qhi && (!a.window || pos0 - kp < a.window))
+                                 : (dist >= 0 && (!a.window || dist < a.window));
+        if (vis) {
           float s = 0.f;
           const uint32_t* kr = Ks + key * AT_KS;
 #pragma unroll 16
@@ -366,7 +369,7 @@ __global__ void __launch_bounds__(AT_NT) k_attn(AttnArgs a) {
             const float2 kf = __half22float2(*(const __half2*)&kr[d]);
             s += Qs[row][2 * d] * kf.x + Qs[row][2 * d + 1] * kf.y;
           }
-          if (dist < a.extent) {
+          if (dist >= 0 && dist < a.extent) {
             const float* tb = a.table + (size_t)dist * 16;
 #pragma unroll
             for (int j = 0; j < 16; j++) s += Rs[row][j] * __ldg(tb + j);
@@ -416,7 +419,7 @@ __global__ void __launch_bounds__(AT_NT) k_attn(AttnArgs a) {
     if (row >= nrow) continue;
     const int t = t0 + row / G, h = kvh * G + row % G;
     if (a.splits == 1) {
-      const float m = Ms[row], sk = a.sink[(size_t)t * a.nh + h];
+      const float m = Ms[row], sk = a.sink ? a.sink[(size_t)t * a.nh + h] : -INFINITY;
       const float M = fmaxf(m, sk);
       const float c = __expf(m - M);
       a.out[(size_t)t * a.nh * AT_HD + (size_t)h * AT_HD + d] = acc[i] * c / (Ls[row] * c + __expf(sk - M));
@@ -435,9 +438,10 @@ __global__ void k_attn_combine(const float* __restrict__ part, const float* __re
                                int nh, int splits) {
   const int th = blockIdx.x;  // t*nh + h
   const int d = threadIdx.x;  // < 128
-  float M = sink[th];
+  const float sk = sink ? sink[th] : -INFINITY;
+  float M = sk;
   for (int s = 0; s < splits; s++) M = fmaxf(M, part[((size_t)s * T * nh + th) * 2]);
-  float L = __expf(sink[th] - M), acc = 0.f;
+  float L = sk == -INFINITY ? 0.f : __expf(sk - M), acc = 0.f;
   const float* accs = part + (size_t)splits * T * nh * 2;
   for (int s = 0; s < splits; s++) {
     const size_t i = (size_t)s * T * nh + th;
@@ -749,6 +753,58 @@ __global__ void k_gather_rows(const float* __restrict__ x, const int* __restrict
   out[idx] = x[(size_t)rows[a] * K + i];
 }
 
+// DSpark: out[t] = rms(sum_j w[j] * feat[t][j]) * norm (feat rows of nf features of E)
+__global__ void k_mix_feat(const float* __restrict__ feat, int nf, int E, float w0, float w1, float w2, float w3,
+                           const float* __restrict__ norm, float eps, float* __restrict__ out) {
+  const int t = blockIdx.x;
+  const float* f = feat + (size_t)t * nf * E;
+  const float w[4] = {w0, w1, w2, w3};
+  float v[1] = {0.f};
+  for (int i = threadIdx.x; i < E; i += blockDim.x) {
+    float x = 0.f;
+    for (int j = 0; j < nf; j++) x += w[j] * f[(size_t)j * E + i];
+    out[(size_t)t * E + i] = x;
+    v[0] += x * x;
+  }
+  block_sum<1>(v);
+  const float sc = rsqrtf(v[0] / E + eps);
+  for (int i = threadIdx.x; i < E; i += blockDim.x) out[(size_t)t * E + i] *= sc * norm[i];
+}
+// GRU-like state update of the Markov head: j = [gate | candidate | latent] pre-activations (3R)
+__global__ void k_gru(const float* __restrict__ j, float* state, float* latent, int R) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= R) return;
+  const float g = sigmoidf(j[i]), c = tanhf(j[R + i]);
+  state[i] = c + g * (state[i] - c);
+  latent[i] = tanhf(j[2 * R + i]);
+}
+// candidate logits softcap(base + bias) and their first maximum
+__global__ void k_cand(const float* __restrict__ base, const float* __restrict__ bias, const int* __restrict__ idx, int n,
+                       float cap, float* __restrict__ out, int* __restrict__ tok) {
+  __shared__ float bv[256];
+  __shared__ int bi[256];
+  const int i = threadIdx.x;
+  float v = -INFINITY;
+  int id = 1 << 30;
+  if (i < n) {
+    const float x = base[i] + bias[i];
+    v = cap > 0.f ? cap * tanhf(x / cap) : x;
+    out[i] = v;
+    id = idx[i];
+  }
+  bv[i] = v;
+  bi[i] = id;
+  __syncthreads();
+  for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+    if (i < o && (bv[i + o] > bv[i] || (bv[i + o] == bv[i] && bi[i + o] < bi[i]))) {
+      bv[i] = bv[i + o];
+      bi[i] = bi[i + o];
+    }
+    __syncthreads();
+  }
+  if (i == 0) *tok = bi[0];
+}
+
 }  // namespace
 
 // =============================================================================================
@@ -804,13 +860,13 @@ size_t attn_work_bytes(int T, int nh, int nkv, int max_keys) {
 }
 void attn(const uint8_t* kc, const uint8_t* vc, int bits, int ring, const float* q, int qs, const float* r,
           const float* sink, const float* table, int extent, int window, float* out, const int* posd, int max_keys, int T,
-          int nh, int nkv, int hd, void* work, size_t work_bytes, cudaStream_t s) {
+          int nh, int nkv, int hd, void* work, size_t work_bytes, cudaStream_t s, bool block) {
   QE_ASSERT(hd == AT_HD && nh % nkv == 0);
   if (T <= 0) return;
   AttnArgs a{kc, vc, ring, bits, (int)kv_row_bytes(nkv * AT_HD, bits), q, qs, r, sink, table, extent, window, out,
-             (float*)work, posd, T, nh, nkv, nh / nkv, 1};
+             (float*)work, posd, T, nh, nkv, nh / nkv, 1, block ? 1 : 0};
   static const bool tc_off = getenv("QE_INK_ATT_SIMT") != nullptr;
-  if (T >= 16 && nh / nkv == 3 && !tc_off) {
+  if (T >= 16 && nh / nkv == 3 && !tc_off && !block) {
     constexpr int G = 3;
     const size_t sh = (size_t)(TC_KC * TC_KS + AT_HD * TC_VS + 2 * TC_ND * TC_TS + 2 * G * 16 * TC_ND) * sizeof(__half);
     static bool init = false;
@@ -833,6 +889,18 @@ void attn(const uint8_t* kc, const uint8_t* vc, int bits, int ring, const float*
     default: QE_FATAL("attn: unsupported query rows %d (G=%d)", NQ, nh / nkv);
   }
   if (a.splits > 1) k_attn_combine<<<T * nh, AT_HD, 0, s>>>((const float*)work, sink, out, T, nh, a.splits);
+}
+void mix_feat(const float* feat, int nf, int E, const float* w, const float* norm, float eps, float* out, int T,
+              cudaStream_t s) {
+  QE_ASSERT(nf <= 4);
+  if (T > 0) k_mix_feat<<<T, 256, 0, s>>>(feat, nf, E, w[0], nf > 1 ? w[1] : 0.f, nf > 2 ? w[2] : 0.f, nf > 3 ? w[3] : 0.f, norm, eps, out);
+}
+void gru(const float* j, float* state, float* latent, int R, cudaStream_t s) {
+  k_gru<<<cdiv(R, 256), 256, 0, s>>>(j, state, latent, R);
+}
+void cand_logits(const float* base, const float* bias, const int* idx, int n, float cap, float* out, int* tok, cudaStream_t s) {
+  QE_ASSERT(n <= 256);
+  k_cand<<<1, 256, 0, s>>>(base, bias, idx, n, cap, out, tok);
 }
 void mul_sigmoid(float* o, const float* g, int64_t n, cudaStream_t s) {
   if (n > 0) k_mul_sigmoid<<<cdiv(n, 256), 256, 0, s>>>(o, g, n);

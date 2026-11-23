@@ -36,8 +36,8 @@ void* InklingModel::dalloc(size_t bytes) {
   return p;
 }
 
-float* InklingModel::upload_f32(const std::string& name, bool required) {
-  const GGUFTensor* t = gguf_->tensor(name);
+float* InklingModel::upload_f32(const std::string& name, bool required, const GGUFFile* src) {
+  const GGUFTensor* t = (src ? src : gguf_.get())->tensor(name);
   if (!t) {
     if (required) QE_FATAL("missing tensor %s", name.c_str());
     return nullptr;
@@ -56,9 +56,9 @@ float* InklingModel::upload_f32(const std::string& name, bool required) {
   return d;
 }
 
-InklingModel::W InklingModel::upload_w(const std::string& name, bool required) {
+InklingModel::W InklingModel::upload_w(const std::string& name, bool required, const GGUFFile* src) {
   W w;
-  const GGUFTensor* t = gguf_->tensor(name);
+  const GGUFTensor* t = (src ? src : gguf_.get())->tensor(name);
   if (!t) {
     if (required) QE_FATAL("missing tensor %s", name.c_str());
     return w;
@@ -68,7 +68,7 @@ InklingModel::W InklingModel::upload_w(const std::string& name, bool required) {
   if (t->type == QT_F32 || t->type == QT_F16 || t->type == QT_BF16) {
     w.type = QT_F32;
     w.rb = (size_t)w.K * 4;
-    w.dev = upload_f32(name);
+    w.dev = upload_f32(name, true, src);
   } else {
     w.type = t->type;
     w.rb = qtype_row_bytes(t->type, w.K);
@@ -409,6 +409,7 @@ void InklingModel::load() {
       cks_.push_back(c);
     }
   }
+  if (!opt_.dspark_path.empty()) ds_load(opt_.dspark_path);
   plan_experts();
   QE_LOG("[inkling] %d layers (%d applied: core [%d,%d) x %d), %d experts top-%d, vocab %d, ctx %d, ubatch %d, KV %s\n", n_phys_,
          cfg_.n_layer, core_start_, core_end_, n_pass_, n_exp_, k_exp_, n_vocab_, ctx_, U_,
@@ -1140,8 +1141,16 @@ void InklingModel::body(int T, int pos0, int n_out, bool want_logits, bool want_
     return live;
   };
   const std::vector<const float*> none;
+  // DSpark features: the residual stream entering the target visits (layer applications in execution order)
+  auto feature = [&](int visit, const float* x) {
+    if (!ds_) return;
+    for (size_t j = 0; j < ds_->targets.size(); j++)
+      if (ds_->targets[j] == visit) ds_capture((int)j, x, T);
+  };
+  int visit = 0;
   for (int il = 0; il < core_start_; il++) {
     float* out = fresh(live_set({cur}, none));
+    feature(visit++, cur);
     layer(il, il, cur, out, blocks, nullptr, T, pos0);
     cur = out;
   }
@@ -1173,32 +1182,41 @@ void InklingModel::body(int T, int pos0, int n_out, bool want_logits, bool want_
       if (bank_out) keep.push_back(bank_out);
       keep.insert(keep.end(), prelude_blocks.begin(), prelude_blocks.end());
       float* out = fresh(live_set({cur}, keep));
+      feature(visit++, cur);
       layer(slot, ip, cur, out, blocks, msgs, T, pos0);
       cur = out;
     }
   }
   for (int il = core_end_; il < n_phys_; il++) {
     float* out = fresh(live_set({cur}, none));
+    feature(visit++, cur);
     layer(il, il, cur, out, blocks, nullptr, T, pos0);
     cur = out;
   }
-  if (n_out <= 0) return;
+  // the drafter also reads the final normed output of every row
+  const int rows_out = ds_ ? T : n_out;
+  if (n_out <= 0 && !ds_) return;
   prof(0);
   // head: depth mix of the blocks, norm, logits of the last n_out rows
   ik::MixSrc st{};
   for (const float* b : blocks) st.p[st.n++] = b;
   st.p[st.n++] = cur;
   ik::MixSrc sl = st;
-  for (int i = 0; i < sl.n; i++) sl.p[i] += (size_t)(T - n_out) * E_;  // mix only the rows needed
+  for (int i = 0; i < sl.n; i++) sl.p[i] += (size_t)(T - rows_out) * E_;  // mix only the rows needed
   {
     ik::MixDst d{{mixed_[0], nullptr, nullptr, nullptr}};
-    ik::mix(sl, output_rq_, 1, E_, n_out, d, s_);
-    ik::rms_rows(mixed_[0], output_norm_, xn_[0], E_, n_out, eps_, s_);
+    ik::mix(sl, output_rq_, 1, E_, rows_out, d, s_);
+    ik::rms_rows(mixed_[0], output_norm_, xn_[0], E_, rows_out, eps_, s_);
   }
+  if (ds_) {
+    feature(cfg_.n_layer, xn_[0]);
+    if (n_out <= 0) return;
+  }
+  const float* head_in = xn_[0] + (size_t)(rows_out - n_out) * E_;
   if (n_out > kMaxTok) {  // every row (perplexity): groups of kMaxTok rows straight to the caller
     for (int r0 = 0; r0 < n_out; r0 += kMaxTok) {
       const int nr = std::min(kMaxTok, n_out - r0);
-      lin(output_, xn_[0] + (size_t)r0 * E_, nr, logits_d_);
+      lin(output_, head_in + (size_t)r0 * E_, nr, logits_d_);
       if (softcap_ > 0) ik::softcap(logits_d_, (int64_t)nr * n_vocab_, softcap_, s_);
       CUDA_CHECK(cudaMemcpyAsync(big_out_ + (size_t)r0 * n_vocab_, logits_d_, (size_t)nr * n_vocab_ * 4,
                                  cudaMemcpyDeviceToHost, s_));
@@ -1206,7 +1224,7 @@ void InklingModel::body(int T, int pos0, int n_out, bool want_logits, bool want_
     CUDA_CHECK(cudaStreamSynchronize(s_));
     return;
   }
-  lin(output_, xn_[0], n_out, logits_d_);
+  lin(output_, head_in, n_out, logits_d_);
   if (softcap_ > 0) ik::softcap(logits_d_, (int64_t)n_out * n_vocab_, softcap_, s_);
   prof(9);
   if (want_argmax) {
@@ -1226,7 +1244,6 @@ void InklingModel::rollback(int n_keep) {
 
 void InklingModel::forward(const int* tokens, int n, int pos0, float* logits, int n_logits, int* argmax, bool snapshot,
                            bool mtp_prefill) {
-  (void)mtp_prefill;
   QE_ASSERT(n > 0 && n_logits <= n && (n_logits <= kMaxTok || n_logits <= U_));
   // elastic cache: the context grows into KV rows (rounded up), larger batches need the prefill workspace
   if (pos0 + n > kv_hi_) {
@@ -1248,6 +1265,7 @@ void InklingModel::forward(const int* tokens, int n, int pos0, float* logits, in
     if (cap > off && cap < off + T) T = cap - off;                  // a chunk ends at the capture point
     const bool last = off + T == n;
     chunk(tokens + off, T, pos0 + off, last ? n_logits : 0, last ? logits : nullptr, last ? argmax : nullptr);
+    if (ds_ && mtp_prefill) ds_inject(0, T, pos0 + off);  // prompt: every row is committed
     off += T;
     pos_ = pos0 + off;
     if (cap == off && cap_slot_ >= 0) ck_save(cap_slot_, pos_);
