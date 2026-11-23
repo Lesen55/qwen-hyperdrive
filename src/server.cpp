@@ -195,7 +195,10 @@ struct Server {
     while (!out.empty() && (out.back() == stop_ids[0] || out.back() == stop_ids[1])) out.pop_back();
     for (size_t i = 0; i < out.size(); i++)
       if (out[i] == stop_ids[0] || out[i] == stop_ids[1]) { out.resize(i); break; }
-    return tok->decode(out);
+    ThinkSplitter sp(false);
+    std::string r, c;
+    sp.feed(tok->decode(out), r, c, true);
+    return c.empty() ? r : c;
   }
   std::string skip_ffn_str;
   std::mutex search_mu;
@@ -436,7 +439,8 @@ struct Server {
       thinking = kw.get_bool("enable_thinking", b.get_bool("enable_thinking", def_think));
       // reasoning_effort as sent by OpenAI-style clients (none/minimal/low/medium/high/xhigh)
       const std::string re = b.get_str("reasoning_effort");
-      if (re == "none") thinking = false;
+      if (chat_format() == ChatFormat::Inkling && !re.empty() && re != "none") effort = re;  // its own effort levels
+      else if (re == "none") thinking = false;
       else if (re == "minimal" || re == "low") effort = "low";
       else if (re == "medium") effort = "medium";
       else if (re == "high" || re == "xhigh") effort = "xhigh";
@@ -708,7 +712,7 @@ struct Server {
         // close the reasoning: feed the closing text as a prompt continuation (state is reused)
         forced = true;
         const std::vector<int> fx =
-            tok->encode("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n");
+            tok->encode(chat_close_reasoning());
         const GenStats sx = gen->stats();
         pre.steps += sx.steps; pre.drafted += sx.drafted; pre.accepted += sx.accepted; pre.generated += sx.generated;
         pre.t_prefill += sx.t_prefill; pre.t_decode += sx.t_decode;
@@ -922,13 +926,22 @@ int main(int argc, char** argv) {
     } else QE_FATAL("unknown argument %s (see --help)", a.c_str());
   }
   if (srv.opt.model_path.empty()) QE_FATAL("-m model.gguf is required");
-  if (!srv.draft_model.empty()) srv.draft = create_draft_model(srv.draft_model, srv.opt);  // before the target
+  if (!srv.draft_model.empty()) {
+    // a DSpark block drafter (dflash) runs inside the target; other drafts are separate models
+    if (GGUFFile(srv.draft_model).get_str("general.architecture", "") == "dflash") srv.opt.dspark_path = srv.draft_model;
+    else srv.draft = create_draft_model(srv.draft_model, srv.opt);  // before the target
+  }
   srv.model = create_model(srv.opt);
   srv.tok = std::make_unique<Tokenizer>(srv.model->gguf());
   srv.gen = std::make_unique<Generator>(*srv.model, SamplingParams{}, srv.opt.use_mtp);
   srv.stop_ids[0] = srv.tok->eos();
   srv.stop_ids[1] = srv.tok->find("<|endoftext|>");
   srv.gen->set_boundary_token(srv.tok->find("<|im_start|>"));
+  if (srv.tok->find("<|message_model|>") >= 0 && srv.tok->find("<|content_model_end_sampling|>") >= 0) {
+    chat_set_format(ChatFormat::Inkling);
+    srv.gen->set_boundary_token(srv.tok->find("<|end_message|>"));  // checkpoint at the end of the last message
+    QE_LOG("[server] chat format: Inkling 2\n");
+  }
   srv.gen->set_spec_relax(srv.spec_relax);
   srv.gen->set_mtp_max(srv.mtp_max);
   srv.gen->set_ngram(srv.ngram);

@@ -44,6 +44,8 @@
             pname = "llama-cpp-reference";
             webui = null;
             postPatch = "";
+            # newer llama.cpp queries the GPU through NVML
+            buildInputs = (old.buildInputs or [ ]) ++ lib.optional (cuda ? cuda_nvml_dev) cuda.cuda_nvml_dev;
             cmakeFlags = (old.cmakeFlags or [ ]) ++ [
               (lib.cmakeBool "GGML_AVX" true)
               (lib.cmakeBool "GGML_AVX2" true)

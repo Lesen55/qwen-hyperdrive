@@ -9,7 +9,16 @@
 struct ChatMessage {
   std::string role, content, reasoning;
   Json tool_calls;  // assistant: OpenAI tool_calls array (or null)
+  std::string name, tool_call_id;  // tool results: function name / id of the call answered
 };
+
+// Prompt format of the loaded model: Qwen ChatML (<think>, XML tool calls) or Inkling 2
+// (<|message_*|> / <|content_*|> markers, JSON tool calls, a "Thinking effort level" system line)
+enum class ChatFormat { Qwen, Inkling };
+void chat_set_format(ChatFormat f);
+ChatFormat chat_format();
+// text that closes a reasoning section early and opens the visible answer
+std::string chat_close_reasoning();
 
 std::vector<ChatMessage> chat_messages_from_json(const Json& messages);
 // tools: OpenAI "tools" array (or null); reasoning_effort: "xhigh" (default), "medium", "low"
@@ -32,7 +41,10 @@ struct ThinkSplitter {
   bool in_think;
   bool content_started = false;
   std::string pending;  // text that may be the start of a tag
-  explicit ThinkSplitter(bool starts_in_think) : in_think(starts_in_think) {}
+  // Inkling: the part being read (0 none / header, 1 thinking, 2 text, 3 tool call) and the header so far
+  int part = 0;
+  std::string header;
+  explicit ThinkSplitter(bool starts_in_think) : in_think(chat_format() == ChatFormat::Qwen && starts_in_think) {}
   // feed new text; appends to reasoning/content outputs
   void feed(const std::string& text, std::string& reasoning, std::string& content, bool final = false);
 };
