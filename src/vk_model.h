@@ -119,6 +119,7 @@ class VkModel : public IModel {
   void hyb_host_loop();
   void submit_pass();
   bool zero_copy_ = false;
+  size_t shared_weight_bytes_ = 0;
   struct ZcChunk { size_t begin = 0, end = 0; VBuf buf; bool tried = false; };
   std::vector<ZcChunk> zc_chunks_;
   std::vector<std::pair<const uint8_t*, int>> zc_index_;  // tensor data -> chunk

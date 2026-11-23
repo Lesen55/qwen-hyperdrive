@@ -1,4 +1,9 @@
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "win_compat.h"
+#else
+#include <unistd.h>
+#endif
 #include "cache.h"
 #include "model.h"
 #include "requant.h"
@@ -63,7 +68,7 @@ Model::Model(const EngineOptions& opt) : opt_(opt) {
   load_config();  // checks the architecture
   // don't burn a CPU core spinning in cudaStreamSynchronize: the cores belong to the CPU FFN pool.
   // Must be set before the primary context is created (i.e. before cudaSetDevice on CUDA 12+).
-  if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess) {
+  if (cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync | cudaDeviceMapHost) != cudaSuccess) {
     QE_LOG("[warn] could not set blocking-sync device flag\n");
     cudaGetLastError();
   }
@@ -141,9 +146,75 @@ void Model::calibrate_host() {
 Model::~Model() {
   cudaStreamSynchronize(stream_);
   for (void* p : allocs_) cudaFree(p);
+  for (const auto& range : registered_weights_) cudaHostUnregister(range.base);
   for (void* p : host_allocs_) cudaFreeHost(p);
   if (cublas_) cublasDestroy(cublas_);
   if (stream_) cudaStreamDestroy(stream_);
+}
+
+bool Model::map_ffn(Layer& layer, size_t page) {
+  Mat* weights[] = {&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down};
+  size_t bytes = 0;
+  uintptr_t first = UINTPTR_MAX, last = 0;
+  bool aligned = true;
+  for (const Mat* m : weights) {
+    const auto addr = reinterpret_cast<uintptr_t>(m->host);
+    first = std::min(first, addr);
+    last = std::max(last, addr + m->bytes);
+    aligned &= addr % 16 == 0;
+    bytes += m->bytes;
+  }
+  if (page && aligned && last - first <= bytes + 3 * page) {
+    const auto start = first / page * page;
+    const auto end = (last + page - 1) / page * page;
+    const bool overlaps = std::any_of(registered_weights_.begin(), registered_weights_.end(), [&](const auto& range) {
+      const auto addr = reinterpret_cast<uintptr_t>(range.base);
+      return start < addr + range.size && addr < end;
+    });
+    if (!overlaps) {
+      auto* host = reinterpret_cast<uint8_t*>(start);
+      const auto status = cudaHostRegister(host, end - start, cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+      if (status == cudaSuccess) {
+        void* device = nullptr;
+        if (cudaHostGetDevicePointer(&device, host, 0) == cudaSuccess) {
+          registered_weights_.push_back({host, end - start});
+          for (Mat* m : weights)
+            m->dev = static_cast<uint8_t*>(device) + (reinterpret_cast<uintptr_t>(m->host) - start);
+          file_mapped_ffn_bytes_ += bytes;
+          return true;
+        }
+        cudaHostUnregister(host);
+      } else {
+        QE_DBG("[plan] CUDA direct FFN registration failed: %s\n", cudaGetErrorString(status));
+      }
+      cudaGetLastError();
+    }
+  }
+
+  // Fall back to one CPU copy into shared pinned memory. Kernels still read it directly.
+  size_t offsets[3]{}, size = 0;
+  for (int i = 0; i < 3; ++i) {
+    offsets[i] = size;
+    size += (weights[i]->bytes + 255) / 256 * 256;
+  }
+  void* host = nullptr;
+  if (cudaHostAlloc(&host, size, cudaHostAllocMapped) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  void* device = nullptr;
+  if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess) {
+    cudaFreeHost(host);
+    cudaGetLastError();
+    return false;
+  }
+  host_allocs_.push_back(host);
+  for (int i = 0; i < 3; ++i) {
+    memcpy(static_cast<uint8_t*>(host) + offsets[i], weights[i]->host, weights[i]->bytes);
+    weights[i]->dev = static_cast<uint8_t*>(device) + offsets[i];
+  }
+  mapped_ffn_bytes_ += bytes;
+  return true;
 }
 
 void Model::load_config() { cfg_ = load_qwen35_config(*gguf_); }
@@ -450,11 +521,41 @@ void Model::plan_and_load() {
     CUDA_CHECK(cudaMemcpy(m->dev, m->host, m->bytes, cudaMemcpyHostToDevice));
     res_bytes += m->bytes;
   }
+  const char* zero_copy = getenv("QE_CUDA_ZEROCOPY");
+  const int mode = zero_copy ? atoi(zero_copy) : 0;
+  bool map_overflow = (mode == 1 || mode == 2) && any_stream && opt_.cpu_frac <= 0;
+  size_t registration_page = 0;
+  if (map_overflow) {
+    int mapped = 0, readonly = 0;
+    if (cudaDeviceGetAttribute(&mapped, cudaDevAttrCanMapHostMemory, 0) != cudaSuccess || !mapped) {
+      QE_LOG("[plan] CUDA host mapping unavailable; using the FFN upload ring\n");
+      cudaGetLastError();
+      map_overflow = false;
+    } else if (mode == 1 && cudaDeviceGetAttribute(&readonly, cudaDevAttrHostRegisterReadOnlySupported, 0) == cudaSuccess && readonly) {
+#ifdef _WIN32
+      SYSTEM_INFO info{};
+      GetSystemInfo(&info);
+      registration_page = info.dwPageSize;
+#else
+      registration_page = (size_t)getpagesize();
+#endif
+    } else {
+      cudaGetLastError();
+    }
+  }
   // Streamed layers: split FFN rows between CPU ([0,r)) and GPU ([r,n_ff)); see layer_ffn.
   // Pinned host block layout: [gate_g | up_g | down_g] [gate_c | up_c | down_c] (256-aligned).
   for (int il = 0; il < c.n_layer; il++) {
     Layer& L = layers_[il];
     if (!L.ffn_streamed) continue;
+    if (map_overflow) {
+      if (map_ffn(L, registration_page)) {
+        L.ffn_streamed = false;  // full matrices are directly addressable; no streaming ring or CPU split
+        continue;
+      }
+      QE_LOG("[plan] CUDA shared FFN allocation failed; using the upload ring for remaining layers\n");
+      map_overflow = false;
+    }
     const bool cpu_ok = opt_.cpu_frac != 0 && cpu::type_supported(L.ffn_gate.type) &&
                         cpu::type_supported(L.ffn_up.type) && cpu::type_supported(L.ffn_down.type);
     int r = 0;
@@ -559,7 +660,7 @@ void Model::plan_and_load() {
       }
     }
   }
-  if (any_stream) {
+  if (str_bytes || cpu_bytes) {
     stream_buf_bytes_ = (max_ffn_layer + 4096 + 255) / 256 * 256;
     stream_buf_ = (uint8_t*)dalloc(2 * stream_buf_bytes_);
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
@@ -573,12 +674,15 @@ void Model::plan_and_load() {
       if (layers_[il].ffn_streamed) streamed_layers_.push_back(il);
   }
   plan_res_mb_ = res_bytes / (double)MiB;
-  plan_stream_mb_ = str_bytes / (double)MiB;
+  plan_stream_mb_ = (str_bytes + mapped_ffn_bytes_ + file_mapped_ffn_bytes_) / (double)MiB;
   plan_cpu_mb_ = cpu_bytes / (double)MiB;
   plan_res_ffn_ = n_res_ffn;
   QE_LOG("[plan] resident weights %.0f MiB (%d/%d FFN layers), host FFN: %.0f MiB streamed over PCIe + %.0f MiB computed on CPU (%s)\n",
          res_bytes / (double)MiB, n_res_ffn, c.n_layer, str_bytes / (double)MiB, cpu_bytes / (double)MiB,
          opt_.cpu_frac < 0 ? "auto-balanced per layer" : ("frac " + std::to_string(opt_.cpu_frac)).c_str());
+  if (mapped_ffn_bytes_ || file_mapped_ffn_bytes_)
+    QE_LOG("[plan] CUDA zero-copy FFN: %.0f MiB from GGUF, %.0f MiB in shared pinned memory\n",
+           file_mapped_ffn_bytes_ / (double)MiB, mapped_ffn_bytes_ / (double)MiB);
   if (r4_bytes_total) QE_LOG("[plan] CPU part repacked to R4 nibbles: %.0f MiB\n", r4_bytes_total / (double)MiB);
 
   // CPU side of the hybrid FFN

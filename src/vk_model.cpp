@@ -130,16 +130,15 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   }
   kv_q8_ = kvt != 0;
   kv_row_bytes_ = kv_q8_ ? (size_t)c.hd + c.hd / 8 : (size_t)c.hd * 2;
-  // unified memory: use the weights in place from the mapped model file (QE_VK_ZEROCOPY=1, experimental)
-  // opt-in only: Mesa ANV cannot pin read-only file pages and loses the device when the import fails
-#ifdef _WIN32
-  // Windows drivers do not have a validated path for importing the read-only file mapping.
-  zero_copy_ = false;
-#else
-  zero_copy_ = vk_->host_import && getenv("QE_VK_ZEROCOPY") && atoi(getenv("QE_VK_ZEROCOPY")) != 0;
-  if (zero_copy_) zc_plan();
-#endif
-  drop_pages_ = !zero_copy_ && (vk_->integrated || getenv("QE_VK_DROP_PAGES"));
+  // Keep VRAM placement as the default. Explicit zero-copy uses GGUF pages when the driver
+  // can import them, otherwise the GPU reads from a coherent, CPU-mapped Vulkan buffer.
+  const char* zero_copy = getenv("QE_VK_ZEROCOPY");
+  const int mode = zero_copy ? atoi(zero_copy) : 0;
+  zero_copy_ = mode == 1 || mode == 2;
+  // System-memory reads on a discrete GPU can make large submissions hit the driver timeout.
+  if (zero_copy_ && !vk_->integrated) ub_ = std::min(ub_, 64);
+  if (mode == 1 && vk_->host_import) zc_plan();
+  drop_pages_ = zc_chunks_.empty() && (vk_->integrated || getenv("QE_VK_DROP_PAGES"));
 #ifndef _WIN32
   if (drop_pages_) model_fd_ = open(opt.model_path.c_str(), O_RDONLY);
 #endif
@@ -318,9 +317,9 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
   plan_.res_ffn = res_ffn;
   QE_LOG("[plan] VRAM used %.0f MiB (%d/%d FFN layers resident)%s\n", vk_->vram_used() / (double)MiB, res_ffn,
          c.n_layer, host_ffn ? "" : ", all weights in VRAM");
-  if (zero_copy_ && zc_bytes_)
-    QE_LOG("[plan] unified memory: %.0f MiB of weights used in place from the mapped model file (no copy)\n",
-           zc_bytes_ / (double)MiB);
+  if (zero_copy_)
+    QE_LOG("[plan] Vulkan zero-copy weights: %.0f MiB from GGUF, %.0f MiB in shared Vulkan memory\n",
+           zc_bytes_ / (double)MiB, shared_weight_bytes_ / (double)MiB);
   if (host_ffn)
     QE_LOG("[plan] %.0f MiB of FFN weights read from system RAM over PCIe each token (decode will be slower)\n",
            host_ffn / (double)MiB);
@@ -359,19 +358,30 @@ VkModel::VkModel(const EngineOptions& opt) : opt_(opt) {
 }
 
 VkModel::~VkModel() {
+  if (vk_->pending()) vk_->finish();
+  for (auto& chunk : zc_chunks_) vk_->free(chunk.buf);  // release imports before the file mapping
   vk_.reset();  // device teardown frees every allocation
 }
 
 void VkModel::zc_plan() {
   std::vector<const GGUFTensor*> ts;
-  for (const auto& t : gguf_->tensors()) ts.push_back(&t);
+  for (const auto& t : gguf_->tensors())
+    if (t.ne.size() == 2 && t.nbytes && (uintptr_t)t.data % 16 == 0) ts.push_back(&t);
   std::sort(ts.begin(), ts.end(), [](const GGUFTensor* a, const GGUFTensor* b) { return a->data < b->data; });
   const size_t al = vk_->import_align, base = (size_t)gguf_->base();
-  const size_t limit = std::min<size_t>(vk_->max_buffer, (size_t)3 << 30) / al * al;
+  if (base % al) return;
+  const size_t target = std::min<size_t>(vk_->max_buffer, (size_t)256 << 20);
+  const size_t mapped_end = gguf_->size() / al * al;
   for (const GGUFTensor* t : ts) {
     const size_t s = ((size_t)t->data - base) / al * al, e = ((size_t)t->data - base + t->nbytes + al - 1) / al * al;
-    if (zc_chunks_.empty() || e - zc_chunks_.back().begin > limit) zc_chunks_.push_back({s, e});
-    else zc_chunks_.back().end = std::max(zc_chunks_.back().end, e);
+    if (e > mapped_end || e - s > vk_->max_buffer) continue;
+    if (zc_chunks_.empty() || (s >= zc_chunks_.back().end && e - zc_chunks_.back().begin > target)) {
+      zc_chunks_.push_back({s, e});
+    } else {
+      auto& chunk = zc_chunks_.back();
+      if (e - chunk.begin > vk_->max_buffer) continue;
+      chunk.end = std::max(chunk.end, e);
+    }
     zc_index_.push_back({t->data, (int)zc_chunks_.size() - 1});
   }
   std::sort(zc_index_.begin(), zc_index_.end());
@@ -381,24 +391,16 @@ bool VkModel::zc_view(const uint8_t* data, size_t bytes, VBuf& out) {
   auto it = std::lower_bound(zc_index_.begin(), zc_index_.end(), std::make_pair(data, -1));
   if (it == zc_index_.end() || it->first != data) return false;
   ZcChunk& c = zc_chunks_[it->second];
-  const size_t file_end = gguf_->size();
   if (!c.tried) {
     c.tried = true;
-    // the mapping covers whole pages, so the last chunk may round past the file end: clamp to the map
-    const size_t end = std::min(c.end, (file_end + vk_->import_align - 1) / vk_->import_align * vk_->import_align);
-    c.buf = vk_->import_host(gguf_->base() + c.begin, end - c.begin);
-    if (!c.buf.buf) {
-      QE_LOG("[plan] host-memory import failed: copying the weights instead\n");
-      zero_copy_ = false;
-      return false;
-    }
-    zc_bytes_ += c.buf.size;
+    c.buf = vk_->import_host(gguf_->base() + c.begin, c.end - c.begin);
   }
   if (!c.buf.buf) return false;
   out = c.buf;
   out.addr = c.buf.addr + (size_t)(data - gguf_->base() - c.begin);
   out.size = bytes;
   out.map = const_cast<uint8_t*>(data);
+  zc_bytes_ += bytes;
   return true;
 }
 
@@ -464,13 +466,24 @@ VkModel::VMat VkModel::load_mat(const std::string& name, bool prefer_device) {
   if (m.rb % 4) QE_FATAL("vulkan backend: %s rows are not 4-byte aligned", name.c_str());
   const size_t bytes = m.rb * m.N;
   if (zero_copy_ && prefer_device && zc_view(t.data, bytes, m.buf)) return m;
-  const bool fits = vk_->vram_free() > bytes + reserve_;
-  if (!fits && vk_->integrated)
-    QE_FATAL("not enough memory for %s (%.0f MiB free after the %.0f MiB reserve): use a smaller model or context",
-             name.c_str(), (vk_->vram_free() > reserve_ ? vk_->vram_free() - reserve_ : 0) / 1048576.0, reserve_ / 1048576.0);
-  // mapped device memory (ReBAR dGPU, any iGPU): the upload is a memcpy, no staging copy
-  m.buf = vk_->alloc(bytes, prefer_device && fits ? Mem::DeviceMapped : Mem::Host);
-  upload(m.buf, t.data, bytes);
+  if (zero_copy_) {
+    m.buf = vk_->alloc(bytes, Mem::SharedWeights);
+    if (m.buf.buf) {
+      memcpy(m.buf.map, t.data, bytes);
+      shared_weight_bytes_ += bytes;
+    } else {
+      QE_DBG("[plan] Vulkan shared allocation unavailable for %s; using normal placement\n", name.c_str());
+    }
+  }
+  if (!m.buf.buf) {
+    const bool fits = vk_->vram_free() > bytes + reserve_;
+    if (!fits && vk_->integrated)
+      QE_FATAL("not enough memory for %s (%.0f MiB free after the %.0f MiB reserve): use a smaller model or context",
+               name.c_str(), (vk_->vram_free() > reserve_ ? vk_->vram_free() - reserve_ : 0) / 1048576.0, reserve_ / 1048576.0);
+    // mapped device memory (ReBAR dGPU, any iGPU): the upload is a memcpy, no staging copy
+    m.buf = vk_->alloc(bytes, prefer_device && fits ? Mem::DeviceMapped : Mem::Host);
+    upload(m.buf, t.data, bytes);
+  }
   // co-execution reads the first rows of gate / up from the mapped file: keep those pages
   const bool cpu_rows = hyb_ && (name.find("ffn_gate") != std::string::npos || name.find("ffn_up") != std::string::npos);
   const size_t keep = cpu_rows ? (size_t)(m.N / 2) * m.rb : 0;
@@ -580,6 +593,10 @@ void VkModel::autotune() {
     if (*g) tune_.gemm = g;
     QE_LOG("[tune] forced: matvec %d teams x %d rows, subgroup %u; prefill GEMM %s\n", tune_.mv_teams, tune_.mv_r,
            tune_.mv_sg, tune_.gemm.c_str());
+    return;
+  }
+  if (!vk_->integrated && zero_copy_ && !L0) {
+    QE_LOG("[tune] Vulkan zero-copy: using default kernels for host-backed weights\n");
     return;
   }
   if (!path.empty() && !getenv("QE_VK_RETUNE")) {
@@ -1337,7 +1354,7 @@ void VkModel::forward_chunk(const int* tokens, int T, int pos0) {
   pend_ = false;
   // prefill: split the pass into several submissions so no single one runs for seconds (GPU drivers
   // reset jobs that exceed their timeout: Xe / i915 / amdgpu; an iGPU runs a 27B layer in ~0.1 s)
-  const int every = T > kMaxTok ? submit_layers_ : 1 << 30;
+  const int every = zero_copy_ && !vk_->integrated ? 1 : T > kMaxTok ? submit_layers_ : 1 << 30;
   int nl = 0;
   for (auto& L : layers_) {
     if (L.attn) layer_attn(L, T, pos0);
