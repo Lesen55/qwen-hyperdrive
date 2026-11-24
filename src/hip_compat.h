@@ -31,7 +31,10 @@
 #define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaDevAttrCanMapHostMemory hipDeviceAttributeCanMapHostMemory
-#define cudaDevAttrHostRegisterReadOnlySupported hipDeviceAttributeHostRegisterReadOnlySupported
+// HIP 7.1 has no HostRegisterReadOnlySupported attribute: an invalid attr
+// makes hipDeviceGetAttribute fail, and model.cpp treats that as "not
+// supported" and skips the read-only zero-copy mode (which is opt-in).
+#define cudaDevAttrHostRegisterReadOnlySupported ((hipDeviceAttribute_t)-1)
 #define cudaEventDisableTiming hipEventDisableTiming
 #define CUstream hipStream_t
 #define CU_STREAM_WRITE_VALUE_DEFAULT 0u  // hipStreamWriteValueDefault; not exported by the 7.1 Windows headers
@@ -64,6 +67,8 @@
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaHostAlloc hipHostMalloc
 #define cudaHostUnregister hipHostUnregister
+#define cudaHostRegister hipHostRegister
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaFreeHost hipHostFree
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaMemGetInfo hipMemGetInfo
