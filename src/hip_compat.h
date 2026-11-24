@@ -27,6 +27,11 @@
 #define CUDA_SUCCESS hipSuccess
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaDeviceScheduleBlockingSync hipDeviceScheduleBlockingSync
+#define cudaDeviceMapHost hipDeviceMapHost
+#define cudaHostRegisterMapped hipHostRegisterMapped
+#define cudaHostRegisterReadOnly hipHostRegisterReadOnly
+#define cudaDevAttrCanMapHostMemory hipDeviceAttributeCanMapHostMemory
+#define cudaDevAttrHostRegisterReadOnlySupported hipDeviceAttributeHostRegisterReadOnlySupported
 #define cudaEventDisableTiming hipEventDisableTiming
 #define CUstream hipStream_t
 #define CU_STREAM_WRITE_VALUE_DEFAULT 0u  // hipStreamWriteValueDefault; not exported by the 7.1 Windows headers
@@ -58,6 +63,7 @@
 #define cudaMemcpyToSymbol hipMemcpyToSymbol
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaHostAlloc hipHostMalloc
+#define cudaHostUnregister hipHostUnregister
 #define cudaFreeHost hipHostFree
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaMemGetInfo hipMemGetInfo
