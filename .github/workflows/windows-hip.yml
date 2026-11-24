@@ -54,6 +54,15 @@ jobs:
           $clang = $clangxx.Replace('clang++.exe', 'clang.exe')
           Write-Host "CXX=$clangxx C=$clang"
           & $clangxx --version
+          # Upstream's hwmon now needs PowrProf/ws2_32, located via the LIB env
+          # var (CMakeLists: find_library(... HINTS ENV LIB REQUIRED)). Enter
+          # the VS DevShell like upstream's own Windows workflows do; the
+          # compilers stay the explicit ROCm paths passed below.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vsPath) { throw 'Visual Studio C++ tools were not found.' }
+          Import-Module "$vsPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vsPath -DevCmdArguments '-arch=x64' -SkipAutomaticLocation
           # CMake writes ROCM_ROOT into a generated .cmake file where backslashes
           # in "Program Files" become invalid escapes; use forward slashes there.
           $hipFwd = $hip -replace '\\', '/'
