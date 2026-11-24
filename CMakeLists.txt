@@ -38,13 +38,18 @@ set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_HIP_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # ---- backend-independent core: GGUF, tokenizer, chat template, sampling / generator, server helpers
-set(QE_COMMON_SRC src/gguf.cpp src/tokenizer.cpp src/chat.cpp src/json.cpp src/engine.cpp src/hwmon.cpp
+set(QE_COMMON_SRC src/gguf.cpp src/tokenizer.cpp src/chat.cpp src/json.cpp src/engine.cpp src/hwmon.cpp src/cache.cpp
                   src/websearch.cpp src/requant.cpp src/cpu_ffn.cpp src/model_config.cpp)
 add_library(qecommon STATIC ${QE_COMMON_SRC})
 target_include_directories(qecommon PUBLIC src)
 target_compile_options(qecommon PRIVATE ${QE_CPU_FLAGS} -Wall -Wno-unused-function)
 set_target_properties(qecommon PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(qecommon PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+if(WIN32)
+  find_library(QE_POWER_LIBRARY NAMES PowrProf HINTS ENV LIB REQUIRED)
+  find_library(QE_WINSOCK_LIBRARY NAMES ws2_32 HINTS ENV LIB REQUIRED)
+  target_link_libraries(qecommon PUBLIC ${QE_POWER_LIBRARY})
+endif()
 
 # web UI: web/index.html embedded as a raw string (re-generated when the file changes)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/web/index.html)
@@ -60,20 +65,29 @@ function(qe_frontends suffix backend)
   target_include_directories(qwen35-server${suffix} PRIVATE ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(qwen35-server${suffix} PRIVATE ${backend})
   if(WIN32)  # Winsock for the server's HTTP sockets
-    target_link_libraries(qwen35-server${suffix} PRIVATE ws2_32)
+    target_link_libraries(qwen35-server${suffix} PRIVATE ${QE_WINSOCK_LIBRARY})
   endif()
   target_compile_options(qwen35-server${suffix} PRIVATE ${QE_CPU_FLAGS})
+  if(WIN32 AND backend STREQUAL "qecore")
+    # Use nvcc's MSVC linker for the CUDA runtime's bare .lib names.
+    set_target_properties(qwen35-engine${suffix} qwen35-server${suffix} PROPERTIES LINKER_LANGUAGE CUDA)
+  endif()
   install(TARGETS qwen35-engine${suffix} qwen35-server${suffix} RUNTIME DESTINATION bin)
 endfunction()
 
 # ---- CUDA backend
 if(QE_CUDA)
   find_package(CUDAToolkit REQUIRED)
-  add_library(qecore STATIC src/model.cpp src/backend_cuda.cpp src/kernels.cu)
+  if(WIN32)
+    set(QE_NVCC_HOST_FLAGS -Xcompiler=/arch:AVX2)
+  else()
+    set(QE_NVCC_HOST_FLAGS -Xcompiler=-mavx2,-mfma,-mf16c)
+  endif()
+  add_library(qecore STATIC src/model.cpp src/backend_cuda.cpp src/kernels.cu src/inkling.cpp src/inkling_dspark.cpp src/inkling_kernels.cu)
   target_include_directories(qecore PUBLIC src)
   target_compile_options(qecore PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:${QE_CPU_FLAGS} -Wall -Wno-unused-function>
-    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -lineinfo --expt-relaxed-constexpr -Xcompiler=-mavx2,-mfma,-mf16c>)
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -lineinfo --expt-relaxed-constexpr ${QE_NVCC_HOST_FLAGS}>)
   set_target_properties(qecore PROPERTIES CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(qecore PUBLIC qecommon CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   qe_frontends("" qecore)
@@ -85,6 +99,9 @@ if(QE_CUDA)
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE qecore)
     target_compile_options(${n} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${QE_CPU_FLAGS}>)
+    if(WIN32)
+      set_target_properties(${n} PROPERTIES LINKER_LANGUAGE CUDA)
+    endif()
   endforeach()
 endif()
 
@@ -125,9 +142,9 @@ if(QE_VULKAN)
       set(hdr ${CMAKE_BINARY_DIR}/spv/${vname}.h)
       add_custom_command(OUTPUT ${hdr}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/spv
-        # vulkan1.3 target env: the Windows SDK glslc rejects GL_EXT_integer_dot_product
-        # (mvc.comp I8 variants) under vulkan1.2, where it is core in 1.3 / SPIR-V 1.6.
-        COMMAND ${GLSLC} --target-env=vulkan1.3 -O -I${CMAKE_SOURCE_DIR}/src/vk ${defs} -o ${spv} ${sh}
+        # Match the runtime's Vulkan 1.2 baseline. The integer dot-product variants
+        # use SPV_KHR_integer_dot_product with a recent glslc (SDK 1.4.321+ on Windows).
+        COMMAND ${GLSLC} --target-env=vulkan1.2 -O -I${CMAKE_SOURCE_DIR}/src/vk ${defs} -o ${spv} ${sh}
         COMMAND ${CMAKE_COMMAND} -DIN=${spv} -DOUT=${hdr} -DNAME=spv_${vname} -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS ${sh} ${QE_VK_INCLUDES} ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         COMMENT "glslc ${vname}")

@@ -3,6 +3,7 @@
 // vector-add kernel, and measures a device-to-device copy bandwidth.
 #include <hip/hip_runtime.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -56,8 +57,8 @@ int main() {
   CHECK(hipMemcpy(hc.data(), dc, n * 4, hipMemcpyDeviceToHost));
   double maxerr = 0;
   for (int i = 0; i < n; i++) {
-    double d = hc[i] - (ha[i] + hb[i]);
-    if (d < 0) d = -d;
+    const double d = std::abs(hc[i] - (ha[i] + hb[i]));
+    if (!std::isfinite(d)) { printf("VERIFY FAILED: non-finite error at %d\n", i); return 4; }
     if (d > maxerr) maxerr = d;
   }
   printf("vadd max err: %g\n", maxerr);

@@ -13,6 +13,7 @@
 namespace cpu {
 
 bool type_supported(uint32_t t);
+bool baseline_supported();
 
 // Instruction set of the int8 matvec kernels, detected at first use (QE_CPU_ISA overrides)
 enum class Isa { AVX2, VNNI, AVX512 };

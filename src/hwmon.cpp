@@ -1,22 +1,26 @@
 #include "hwmon.h"
 
 #ifdef _WIN32
-// Windows port: no telemetry yet (NVML .so / /proc / /sys do not exist); the web UI
-// shows the "unknown" defaults from hwmon.h.
-GpuStats read_gpu_stats() { return GpuStats{}; }
-CpuStats read_cpu_stats() { return CpuStats{}; }
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <intrin.h>
+#include <powrprof.h>
+#include <shlobj.h>
 #else
-
 #include <dirent.h>
 #include <dlfcn.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <algorithm>
 #include <fstream>
 #include <type_traits>
 #include <mutex>
 #include <sstream>
+#include <vector>
 
 namespace {
 
@@ -45,10 +49,23 @@ struct Nvml {
   std::string name;
 
   Nvml() {
+#ifdef _WIN32
+    HMODULE h = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) {
+      wchar_t program_files[MAX_PATH];
+      if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, SHGFP_TYPE_CURRENT, program_files))) {
+        const auto path = std::wstring(program_files) + L"\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+        h = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+      }
+    }
+    if (!h) return;
+    auto sym = [&](auto& fn, const char* n) { fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(GetProcAddress(h, n)); };
+#else
     void* h = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("/run/opengl-driver/lib/libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!h) return;
     auto sym = [&](auto& fn, const char* n) { fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(h, n)); };
+#endif
     sym(Init, "nvmlInit_v2");
     sym(GetHandleByIndex, "nvmlDeviceGetHandleByIndex_v2");
     sym(GetName, "nvmlDeviceGetName");
@@ -75,6 +92,7 @@ Nvml& nvml() {
   return n;
 }
 
+#ifndef _WIN32
 std::string read_file(const std::string& p) {
   std::ifstream f(p);
   std::stringstream ss;
@@ -100,6 +118,25 @@ double cpu_temp() {
   closedir(d);
   return t;
 }
+#else
+std::string cpu_name() {
+  int regs[4];
+  __cpuid(regs, 0x80000000);
+  if (static_cast<unsigned>(regs[0]) < 0x80000004u) return {};
+  char brand[49]{};
+  for (int i = 0; i < 3; ++i) {
+    __cpuid(regs, 0x80000002 + i);
+    memcpy(brand + i * sizeof regs, regs, sizeof regs);
+  }
+  std::string name = brand;
+  const auto first = name.find_first_not_of(' '), last = name.find_last_not_of(' ');
+  return first == std::string::npos ? std::string{} : name.substr(first, last - first + 1);
+}
+
+uint64_t ticks(const FILETIME& t) {
+  return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+}
+#endif
 
 }  // namespace
 
@@ -130,6 +167,44 @@ GpuStats read_gpu_stats() {
 
 CpuStats read_cpu_stats() {
   CpuStats c;
+#ifdef _WIN32
+  static const auto name = cpu_name();
+  c.name = name;
+  c.threads = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+  MEMORYSTATUSEX mem{sizeof mem};
+  if (GlobalMemoryStatusEx(&mem)) {
+    c.ram_total_mb = mem.ullTotalPhys / 1048576.0;
+    c.ram_used_mb = (mem.ullTotalPhys - mem.ullAvailPhys) / 1048576.0;
+  }
+  static std::mutex mu;
+  static uint64_t prev_idle = 0, prev_total = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    FILETIME idle{}, kernel{}, user{};
+    if (GetSystemTimes(&idle, &kernel, &user)) {
+      const uint64_t idle_now = ticks(idle), total = ticks(kernel) + ticks(user);
+      if (prev_total && total > prev_total && idle_now >= prev_idle)
+        c.util_pct = std::clamp(100.0 * (1.0 - double(idle_now - prev_idle) / double(total - prev_total)), 0.0, 100.0);
+      prev_idle = idle_now;
+      prev_total = total;
+    }
+  }
+  // ProcessorInformation returns these six ULONGs per logical processor.
+  struct ProcessorPower {
+    ULONG number, max_mhz, current_mhz, limit_mhz, max_idle, current_idle;
+  };
+  std::vector<ProcessorPower> power(c.threads);
+  if (!power.empty() && CallNtPowerInformation(ProcessorInformation, nullptr, 0, power.data(),
+          (ULONG)(power.size() * sizeof(ProcessorPower))) == 0) {
+    double total = 0;
+    int n = 0;
+    for (const auto& p : power) {
+      if (p.max_mhz) c.freq_max_mhz = std::max(c.freq_max_mhz, double(p.max_mhz));
+      if (p.current_mhz) { total += p.current_mhz; ++n; }
+    }
+    if (n) c.freq_avg_mhz = total / n;
+  }
+#else
   c.temp_c = cpu_temp();
   // utilization from /proc/stat deltas between calls
   static std::mutex mu;
@@ -175,7 +250,6 @@ CpuStats read_cpu_stats() {
     }
     if (total > 0 && avail >= 0) { c.ram_total_mb = total; c.ram_used_mb = total - avail; }
   }
+#endif
   return c;
 }
-
-#endif  // _WIN32

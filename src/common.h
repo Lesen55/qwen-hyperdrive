@@ -52,6 +52,7 @@ enum QType : uint32_t {
   QT_IQ4_XS = 23,
   QT_IQ1_M = 29,
   QT_BF16 = 30,
+  QT_NVFP4 = 40,  // 64-element blocks: 4 UE4M3 scales (per 16) + 32 bytes of E2M1 nibbles
 };
 
 struct QTypeInfo {

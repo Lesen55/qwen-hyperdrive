@@ -181,4 +181,32 @@ void mhc_route(const float* a, const float* b, const float* w, const float* bias
                cudaStream_t s);
 void mhc_merge(float* a, float* b, const float* x, const float* pk, int d, int T, cudaStream_t s);
 void mhc_leave(float* y, const float* a, const float* b, int64_t n, cudaStream_t s);
+// ---- MoE ---------------------------------------------------------------------------------------
+// y[a*N + r] = (W_e[r,:] . x[a / xdiv]) * escale[eid[a]] for assignments a < A, expert e = ids[a] (ids null: e = a,
+// experts gathered into slots); W_e = W + e * estride.  Activations from quantize_q8 (K % 32 == 0).
+void moe_matvec(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, int A, const int* ids,
+                const int* eid, const float* escale, const int8_t* xq, const float* xd, int xdiv, float* y,
+                cudaStream_t s, const uint8_t* const* wptr = nullptr);  // wptr: per-assignment expert pointers
+// grouped MMQ (MoE prefill): group e multiplies W + e*estride by x rows [goff[e], goff[e+1]) into the same y rows;
+// x from quantize_q8 (per 32); max_rows bounds the rows of a group
+void mmq_grouped(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, const int* goff, int ngroups,
+                 int max_rows, const int8_t* xq, const float* xd, float* y, int ldy, cudaStream_t s);
+// dst slot a <- the nbytes of expert ids[a] (src + ids[a]*estride; src may be mapped host memory)
+void gather_experts(const void* src, size_t estride, size_t nbytes, const int* ids, int A, void* dst, cudaStream_t s);
+// the same with a VRAM cache: expert e is read in place from eptr[e] (non-null: cached) or copied to dst slot a; ptr[a]
+// receives the expert's address, cnt[e] (optional) counts its uses
+void gather_experts_cached(const void* src, size_t estride, const int* ids, int A, const uint8_t* const* eptr, void* dst,
+                           const uint8_t** ptr, int* cnt, cudaStream_t s);
+// small batches (A <= 1024 assignments, duplicates resolved once): cached -> in place, the first `cap` distinct misses
+// -> staging slots, the rest -> read from (mapped) host memory; slot[] is scratch [A]
+void gather_experts_small(const void* host, size_t estride, const int* ids, int A, const uint8_t* const* eptr, void* stg,
+                          int cap, const uint8_t** ptr, int* slot, int* cnt, cudaStream_t s);
+// grouped small-batch MoE matvec: moe_group() lists the distinct experts of ids[A] (grp: moe_group_bytes(A) bytes,
+// *ngrp on the device); each expert's weights are read once for all the assignments using it.  y, escale, xdiv and
+// wptr (per-assignment pointers, the group's first assignment is used) as in moe_matvec.
+size_t moe_group_bytes(int A);
+void moe_group(const int* ids, int A, void* grp, int* ngrp, cudaStream_t s);
+void moe_matvec_grouped(uint32_t type, const void* W, size_t estride, size_t rb, int K, int N, int A, const void* grp,
+                        const int* ngrp, const float* escale, const int8_t* xq, const float* xd, int xdiv, float* y,
+                        cudaStream_t s, const uint8_t* const* wptr = nullptr);
 }  // namespace qk

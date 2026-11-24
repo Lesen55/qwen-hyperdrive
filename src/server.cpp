@@ -14,6 +14,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <BaseTsd.h>
 #include <signal.h>
 typedef SSIZE_T ssize_t;
@@ -44,6 +45,7 @@ inline void qe_close_sock(QeSock s) { close(s); }
 #include <ctime>
 #include <condition_variable>
 #include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 
@@ -57,34 +59,29 @@ inline void qe_close_sock(QeSock s) { close(s); }
 #include "json.h"
 #include "tokenizer.h"
 
-// true when the peer has closed the connection (EOF or reset) - checked without blocking
+// A receive-side EOF can still leave the peer reading our response.
 static bool client_gone(QeSock fd) {
 #ifdef _WIN32
-  WSAPOLLFD p{};
-  p.fd = fd;
-  p.events = (short)POLLRDNORM;
+  WSAPOLLFD p{fd, POLLWRNORM, 0};
   if (WSAPoll(&p, 1, 0) <= 0) return false;
-  if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
-  if (p.revents & POLLRDNORM) {
-    char c;
-    // the socket is blocking, but WSAPoll said readable, so the peek returns at once
-    const int r = recv(fd, &c, 1, MSG_PEEK);
-    return r == 0 || (r < 0 && WSAGetLastError() != WSAEWOULDBLOCK);
-  }
-  return false;
+  // Winsock also reports POLLHUP when the peer only shuts down its send side.
+  return (p.revents & (POLLERR | POLLNVAL)) != 0;
 #else
-  pollfd p{fd, (short)(POLLIN | POLLRDHUP), 0};
+  pollfd p{fd, 0, 0};
   if (poll(&p, 1, 0) <= 0) return false;
-  if (p.revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL)) return true;
-  if (p.revents & POLLIN) {
-    char c;
-    const ssize_t r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
-    return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
-  }
-  return false;
+  return (p.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
 #endif
 }
 
+static void enable_client_keepalive(QeSock fd) {
+  // Detect a dead response path without sending interim HTTP data. A FIN by
+  // itself cannot distinguish a closed client from one still reading.
+  const int enabled = 1, idle = 10, interval = 3, probes = 3;
+  if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char*)&enabled, sizeof enabled) != 0) return;
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&idle, sizeof idle);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&interval, sizeof interval);
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&probes, sizeof probes);
+}
 
 namespace {
 
@@ -209,7 +206,10 @@ struct Server {
     while (!out.empty() && (out.back() == stop_ids[0] || out.back() == stop_ids[1])) out.pop_back();
     for (size_t i = 0; i < out.size(); i++)
       if (out[i] == stop_ids[0] || out[i] == stop_ids[1]) { out.resize(i); break; }
-    return tok->decode(out);
+    ThinkSplitter sp(false);
+    std::string r, c;
+    sp.feed(tok->decode(out), r, c, true);
+    return c.empty() ? r : c;
   }
   std::string skip_ffn_str;
   std::mutex search_mu;
@@ -450,7 +450,8 @@ struct Server {
       thinking = kw.get_bool("enable_thinking", b.get_bool("enable_thinking", def_think));
       // reasoning_effort as sent by OpenAI-style clients (none/minimal/low/medium/high/xhigh)
       const std::string re = b.get_str("reasoning_effort");
-      if (re == "none") thinking = false;
+      if (chat_format() == ChatFormat::Inkling && !re.empty() && re != "none") effort = re;  // its own effort levels
+      else if (re == "none") thinking = false;
       else if (re == "minimal" || re == "low") effort = "low";
       else if (re == "medium") effort = "medium";
       else if (re == "high" || re == "xhigh") effort = "xhigh";
@@ -564,12 +565,13 @@ struct Server {
 
     const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(++id_counter);
     const int64_t created = (int64_t)time(nullptr);
-    if (stream)
+    if (stream) {
       // no-transform / X-Accel-Buffering: keep proxies (Cloudflare, nginx) from compressing or buffering the
       // stream; the padded comment pushes past proxies that hold back the first few KB
-      send_all(fd, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
+      if (!send_all(fd, std::string("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n"
                                "Cache-Control: no-cache, no-transform\r\nX-Accel-Buffering: no\r\n") + kCors +
-                       "Connection: close\r\n\r\n:" + std::string(2048, ' ') + "\n\n");
+                       "Connection: close\r\n\r\n:" + std::string(2048, ' ') + "\n\n")) return;
+    }
     auto chunk = [&](const std::string& reasoning, const std::string& content, const char* finish) -> bool {
       Json c = Json::object();
       c["id"] = id;
@@ -599,11 +601,15 @@ struct Server {
     // The same thread watches the connection every second (streaming or not) and raises `cancel`
     // when the client has gone, which stops the prefill between chunks.
     std::atomic<bool> cancel{false};
-    auto keepalive = [&](auto&& fn) {
+    auto prefill = [&](const std::vector<int>& prompt) {
       std::mutex km;
       std::condition_variable kcv;
       bool kdone = false;
       model->set_cancel(&cancel);
+      struct ClearCancel {
+        IModel& model;
+        ~ClearCancel() { model.set_cancel(nullptr); }
+      } clear_cancel{*model};
       std::thread th([&] {
         std::unique_lock<std::mutex> lk(km);
         for (int tick = 1; !kcv.wait_for(lk, std::chrono::seconds(1), [&] { return kdone; }); tick++) {
@@ -615,9 +621,7 @@ struct Server {
         std::mutex& m; std::condition_variable& cv; bool& done; std::thread& t;
         ~Join() { { std::lock_guard<std::mutex> g(m); done = true; } cv.notify_all(); t.join(); }
       } join{km, kcv, kdone, th};
-      const int r = fn();
-      model->set_cancel(nullptr);
-      return r;
+      return gen->start(prompt, true, 4096, &cancel);
     };
 
     gen->set_sampling(sp);
@@ -641,13 +645,14 @@ struct Server {
       live.cur = rsn;
     }
     live_update("prefill", nullptr, false);
-    out.push_back(keepalive([&] { return gen->start(ids); }));
-    if (cancel) {  // the client left during the prompt: drop the partial state, send nothing
+    const int first = prefill(ids);
+    if (first == Generator::kCancelled || cancel) {
       gen->abandon();
       QE_LOG("[server] %s: client disconnected during prompt processing, cancelled\n", id.c_str());
       live_update("idle", nullptr, true);
       return;
     }
+    out.push_back(first);
     {
       const auto& st0 = gen->stats();
       reused0 = gen->reused();
@@ -718,7 +723,7 @@ struct Server {
         // close the reasoning: feed the closing text as a prompt continuation (state is reused)
         forced = true;
         const std::vector<int> fx =
-            tok->encode("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n");
+            tok->encode(chat_close_reasoning());
         const GenStats sx = gen->stats();
         pre.steps += sx.steps; pre.drafted += sx.drafted; pre.accepted += sx.accepted; pre.generated += sx.generated;
         pre.t_prefill += sx.t_prefill; pre.t_decode += sx.t_decode;
@@ -727,8 +732,9 @@ struct Server {
         cont.insert(cont.end(), fx.begin(), fx.end());
         out.insert(out.end(), fx.begin(), fx.end());
         if (!looping) QE_LOG("[server] %s: thinking budget %d reached, closing the reasoning\n", id.c_str(), think_budget);
-        out.push_back(keepalive([&] { return gen->start(cont); }));
-        if (cancel) { gen->abandon(); alive = false; break; }
+        const int next = prefill(cont);
+        if (next == Generator::kCancelled || cancel) { gen->abandon(); alive = false; break; }
+        out.push_back(next);
         pre.t_decode += gen->stats().t_prefill;  // the forced tokens count as decode time
         continue;
       }
@@ -931,13 +937,22 @@ int main(int argc, char** argv) {
     } else QE_FATAL("unknown argument %s (see --help)", a.c_str());
   }
   if (srv.opt.model_path.empty()) QE_FATAL("-m model.gguf is required");
-  if (!srv.draft_model.empty()) srv.draft = create_draft_model(srv.draft_model, srv.opt);  // before the target
+  if (!srv.draft_model.empty()) {
+    // a DSpark block drafter (dflash) runs inside the target; other drafts are separate models
+    if (GGUFFile(srv.draft_model).get_str("general.architecture", "") == "dflash") srv.opt.dspark_path = srv.draft_model;
+    else srv.draft = create_draft_model(srv.draft_model, srv.opt);  // before the target
+  }
   srv.model = create_model(srv.opt);
   srv.tok = std::make_unique<Tokenizer>(srv.model->gguf());
   srv.gen = std::make_unique<Generator>(*srv.model, SamplingParams{}, srv.opt.use_mtp);
   srv.stop_ids[0] = srv.tok->eos();
   srv.stop_ids[1] = srv.tok->find("<|endoftext|>");
   srv.gen->set_boundary_token(srv.tok->find("<|im_start|>"));
+  if (srv.tok->find("<|message_model|>") >= 0 && srv.tok->find("<|content_model_end_sampling|>") >= 0) {
+    chat_set_format(ChatFormat::Inkling);
+    srv.gen->set_boundary_token(srv.tok->find("<|end_message|>"));  // checkpoint at the end of the last message
+    QE_LOG("[server] chat format: Inkling 2\n");
+  }
   srv.gen->set_spec_relax(srv.spec_relax);
   srv.gen->set_mtp_max(srv.mtp_max);
   srv.gen->set_ngram(srv.ngram);
@@ -945,14 +960,19 @@ int main(int argc, char** argv) {
     if (srv.draft->cfg().n_vocab != srv.model->cfg().n_vocab) QE_FATAL("draft model vocabulary differs from the model's");
     srv.gen->set_draft_model(srv.draft.get());
   }
-  {
-    std::string p = srv.opt.model_path;
-    const size_t sl = p.find_last_of('/');
-    srv.model_name = sl == std::string::npos ? p : p.substr(sl + 1);
-  }
+  srv.model_name = std::filesystem::path(srv.opt.model_path).filename().string();
+#ifdef _WIN32
   const QeSock ls = socket(AF_INET, SOCK_STREAM, 0);
+#else
+  const QeSock ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#endif
   int one = 1;
+#ifdef _WIN32
+  if (setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&one, sizeof one) != 0)
+    QE_FATAL("could not configure exclusive listener binding: Winsock error %d", WSAGetLastError());
+#else
   setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one);
+#endif
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
@@ -962,9 +982,14 @@ int main(int argc, char** argv) {
   QE_LOG("[server] listening on http://%s:%d  (model %s, ctx %d, mtp %s)\n", host.c_str(), port, srv.model_name.c_str(),
          srv.opt.ctx, srv.model->has_mtp() ? "on" : "off");
   for (;;) {
+#ifdef _WIN32
     const QeSock fd = accept(ls, nullptr, nullptr);
+#else
+    const QeSock fd = accept4(ls, nullptr, nullptr, SOCK_CLOEXEC);
+#endif
     if (fd == (QeSock)-1) continue;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
+    enable_client_keepalive(fd);
     std::thread([&srv, fd] { srv.handle(fd); }).detach();
   }
 }

@@ -60,10 +60,12 @@ class Generator {
   // separate draft model (same tokenizer, e.g. Qwen3.5-0.8B) for targets without an MTP head
   void set_draft_model(IModel* d) { dm_ = d; }
   // after a cancelled start(): the model state is partial, so forget it (no prefix reuse from it)
-  void abandon() { committed().clear(); m_.reset(); history_.clear(); pos_ = 0; }
+  void abandon();
   // Process the prompt; returns the first generated token.  If the model state currently holds a
   // strict prefix of `prompt` (previous conversation turn), only the new suffix is processed.
-  int start(const std::vector<int>& prompt, bool allow_reuse = true, int reserve = 4096);
+  static constexpr int kCancelled = -1;
+  int start(const std::vector<int>& prompt, bool allow_reuse = true, int reserve = 4096,
+            const std::atomic<bool>* cancel = nullptr);
   int reused() const { return reused_; }
   // Generate the next tokens (1 .. draft_max+1, appended to `out`).
   void step(std::vector<int>& out);
