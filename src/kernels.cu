@@ -4727,10 +4727,23 @@ __global__ void __launch_bounds__(256)
 // (128 floats per lane) -- register pressure is the known stage-1 risk.
 constexpr int FA_WMMA_BQ = 16;   // queries per block
 constexpr int FA_WMMA_BN = 32;   // KV tile positions
-constexpr int FA_WMMA_VLD = FA_WMMA_BN + 4;  // V/P smem row stride (halves)
+constexpr int FA_WMMA_VLD = FA_WMMA_BN + 8;  // V/P smem row stride (halves; 80B rows keep every row 16B-aligned for vector frag loads)
 
 using qe_f16x16 = __fp16 __attribute__((ext_vector_type(16)));
 using qe_f32x8 = float __attribute__((ext_vector_type(8)));
+
+struct qe_raw16h {
+  uint4 lo, hi;
+};
+// Load 16 consecutive halves as one WMMA fragment (raw bits; the values are
+// already fp16, so the stage-1 scalar __half2float round trips were pure
+// overhead). p must be 16B-aligned.
+__device__ inline qe_f16x16 qe_frag16(const __half* p) {
+  qe_raw16h r;
+  r.lo = *(const uint4*)p;
+  r.hi = *(const uint4*)(p + 8);
+  return __builtin_bit_cast(qe_f16x16, r);
+}
 
 template <int KT, int G>
 __global__ void __launch_bounds__(192)
@@ -4790,12 +4803,8 @@ __global__ void __launch_bounds__(192)
       qe_f32x8 s = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int ks = 0; ks < 16; ks++) {
-        qe_f16x16 a, b;
-#pragma unroll
-        for (int e = 0; e < 16; e++) {
-          a[e] = (__fp16)__half2float(qrow[16 * ks + e]);
-          b[e] = (__fp16)__half2float(Ks[sub * 16 + (lane & 15)][16 * ks + e]);
-        }
+        const qe_f16x16 a = qe_frag16(qrow + 16 * ks);
+        const qe_f16x16 b = qe_frag16(&Ks[sub * 16 + (lane & 15)][16 * ks]);
         s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
       }
       // Causal mask, then row max in slot space (16-lane xor reduction).
@@ -4837,12 +4846,8 @@ __global__ void __launch_bounds__(192)
         qe_f32x8 acc;
 #pragma unroll
         for (int i = 0; i < 8; i++) acc[i] = o_[dt][i] * al[i];
-        qe_f16x16 a, b;
-#pragma unroll
-        for (int e = 0; e < 16; e++) {
-          a[e] = (__fp16)__half2float(Ps[warp][lane & 15][e]);
-          b[e] = (__fp16)__half2float(VsT[16 * dt + (lane & 15)][sub * 16 + e]);
-        }
+        const qe_f16x16 a = qe_frag16(&Ps[warp][lane & 15][0]);
+        const qe_f16x16 b = qe_frag16(&VsT[16 * dt + (lane & 15)][sub * 16]);
         o_[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
       }
       __syncwarp();
