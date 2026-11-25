@@ -4713,6 +4713,155 @@ __global__ void __launch_bounds__(256)
     for (int d = 0; d < 8; d++) op[d] = o_[i][d] * il;
   }
 }
+// WMMA flash attention (QE_FA_WMMA=1), stage 1: minimal fp16-WMMA version.
+// Fragment layouts are the spike-verified ones (qe-wmma-spike, 2026-11-25):
+// A/B frags: lane l supplies row (l % 16), all 16 K elements (v16f16);
+// C frag: element (m, n) sits in lane (m % 2) * 16 + n, slot m / 2 (f32x8).
+// One block = one kv head x 16 queries (96 rows = 6 WMMA row tiles), one
+// warp per row tile. KV streams in 32-position tiles; K is staged as
+// [pos][dim], V transposed as [dim][pos] so both B fragments load
+// contiguously. Scores run 16 K-steps of WMMA per 16-position sub-tile;
+// softmax is slot-local (lane l's slot i belongs to row 2i + (l >> 4)) with
+// 16-lane xor reductions for row max/sum; P crosses to the PV product
+// through a small per-warp smem tile. Output accumulators are 16 f32x8
+// (128 floats per lane) -- register pressure is the known stage-1 risk.
+constexpr int FA_WMMA_BQ = 16;   // queries per block
+constexpr int FA_WMMA_BN = 32;   // KV tile positions
+constexpr int FA_WMMA_VLD = FA_WMMA_BN + 4;  // V/P smem row stride (halves)
+
+using qe_f16x16 = __fp16 __attribute__((ext_vector_type(16)));
+using qe_f32x8 = float __attribute__((ext_vector_type(8)));
+
+template <int KT, int G>
+__global__ void __launch_bounds__(192)
+    k_fa_wmma(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
+              const __half* __restrict__ q16, float* __restrict__ out, int nh, int pos0, int T,
+              int recb, KVMap bs) {
+  __shared__ __align__(16) __half Ks[FA_WMMA_BN][FA_QLD];
+  __shared__ __align__(16) __half VsT[FA_D][FA_WMMA_VLD];
+  __shared__ __align__(16) __half Ps[6][16][FA_WMMA_VLD];
+  const int kvh = blockIdx.y;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int q0 = blockIdx.x * FA_WMMA_BQ;
+  const int ptot = pos0 + T;
+  const int kt_max = pos0 + min(q0 + FA_WMMA_BQ, T) - 1;
+
+  // Per-slot row data: slot i of lane l belongs to row j = 2i + (l >> 4) of
+  // this warp's 16-row tile.
+  int tslot[8], hslot[8];
+  float m_[8], l_[8];
+  qe_f32x8 o_[16];
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const int rr = warp * 16 + 2 * i + (lane >> 4);
+    tslot[i] = q0 + rr / G;
+    hslot[i] = kvh * G + rr % G;
+    m_[i] = -1e30f;
+    l_[i] = 0.f;
+  }
+#pragma unroll
+  for (int d = 0; d < 16; d++)
+#pragma unroll
+    for (int i = 0; i < 8; i++) o_[d][i] = 0.f;
+
+  // A-fragment row (score): lane l supplies Q row (l % 16) of the tile.
+  const int rrA = warp * 16 + (lane & 15);
+  const int tA = min(q0 + rrA / G, T - 1);
+  const int hA = kvh * G + (rrA % G);
+  const __half* qrow = q16 + ((size_t)tA * nh + hA) * FA_D;
+
+  for (int kt = 0; kt <= kt_max; kt += FA_WMMA_BN) {
+    // Cooperative fill: K as [pos][dim], V transposed as [dim][pos].
+    for (int idx = tid; idx < FA_WMMA_BN * 32; idx += 192) {
+      const int pi = idx >> 5, c = idx & 31;
+      const int p = min(kt + pi, ptot - 1);
+      const uint4 kk = kv_read8h<KT>(kc + kv_off(kvh, p, bs, recb), c);
+      const uint4 vv = kv_read8h<KT>(vc + kv_off(kvh, p, bs, recb), c);
+      *(uint4*)&Ks[pi][8 * c] = kk;
+      const __half* vh = (const __half*)&vv;
+#pragma unroll
+      for (int d = 0; d < 8; d++) VsT[8 * c + d][pi] = vh[d];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int sub = 0; sub < 2; sub++) {
+      // Scores: S = Q . K^T over this 16-position sub-tile (16 K-steps).
+      qe_f32x8 s = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int ks = 0; ks < 16; ks++) {
+        qe_f16x16 a, b;
+#pragma unroll
+        for (int e = 0; e < 16; e++) {
+          a[e] = (__fp16)__half2float(qrow[16 * ks + e]);
+          b[e] = (__fp16)__half2float(Ks[sub * 16 + (lane & 15)][16 * ks + e]);
+        }
+        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
+      }
+      // Causal mask, then row max in slot space (16-lane xor reduction).
+      const int pcol = kt + sub * 16 + (lane & 15);
+      qe_f32x8 mx, al, pv;
+      float ls[8];
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        if (tslot[i] >= T || pcol > pos0 + tslot[i]) s[i] = -1e30f;
+        mx[i] = s[i];
+      }
+#pragma unroll
+      for (int off = 8; off > 0; off >>= 1)
+#pragma unroll
+        for (int i = 0; i < 8; i++) mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], off));
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const float mn = fmaxf(m_[i], mx[i]);
+        al[i] = exp2f(m_[i] - mn);
+        pv[i] = s[i] <= -1e29f ? 0.f : exp2f(s[i] - mn);
+        ls[i] = pv[i];
+        m_[i] = mn;
+      }
+#pragma unroll
+      for (int off = 8; off > 0; off >>= 1)
+#pragma unroll
+        for (int i = 0; i < 8; i++) ls[i] += __shfl_xor_sync(0xffffffffu, ls[i], off);
+#pragma unroll
+      for (int i = 0; i < 8; i++) l_[i] = l_[i] * al[i] + ls[i];
+      // P to smem in A-fragment order ([row][pos] of this warp's tile).
+#pragma unroll
+      for (int i = 0; i < 8; i++) Ps[warp][2 * i + (lane >> 4)][lane & 15] = __float2half(pv[i]);
+      __syncwarp();
+      // PV: O = al * O + P . V, for all 16 dim tiles (2 K-steps of 16 pos).
+#pragma unroll
+      for (int dt = 0; dt < 16; dt++) {
+        qe_f32x8 acc;
+#pragma unroll
+        for (int i = 0; i < 8; i++) acc[i] = o_[dt][i] * al[i];
+#pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+          qe_f16x16 a, b;
+#pragma unroll
+          for (int e = 0; e < 16; e++) {
+            a[e] = (__fp16)__half2float(Ps[warp][lane & 15][16 * ks + e]);
+            b[e] = (__fp16)__half2float(VsT[16 * dt + (lane & 15)][16 * ks + e]);
+          }
+          acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+        }
+        o_[dt] = acc;
+      }
+      __syncwarp();
+    }
+    __syncthreads();
+  }
+  // Epilogue: normalize and scatter (slot i, dim tile dt -> row tslot[i],
+  // dim 16*dt + (lane & 15)).
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    if (tslot[i] >= T) continue;
+    const float il = l_[i] > 0.f ? 1.f / l_[i] : 0.f;
+    float* op = out + ((size_t)tslot[i] * nh + hslot[i]) * FA_D;
+#pragma unroll
+    for (int dt = 0; dt < 16; dt++) op[16 * dt + (lane & 15)] = o_[dt][i] * il;
+  }
+}
 #endif  // __HIP_PLATFORM_AMD__
 
 void attn_prefill(int kvtype, const void* kcache, const void* vcache, const float* q, int qhs,
@@ -4722,6 +4871,28 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   // HIP prefill attention: SIMT flash attention when QE_FA_SIMT=1 (and the
   // shape matches), else the v1 fallback -- the decode path in chunks of 4
   // (exactly the engine's own QE_SLOW_ATTN reference route).
+  static const int fa_wmma_v = getenv("QE_FA_WMMA") ? atoi(getenv("QE_FA_WMMA")) : 0;
+  if (fa_wmma_v == 1 && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
+    const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
+    const float sl2 = scale * 1.4426950408889634f;
+    __half* q16 = (__half*)work;
+    const uint8_t* kc = (const uint8_t*)kcache;
+    const uint8_t* vc = (const uint8_t*)vcache;
+    const dim3 grid(cdiv(T, FA_WMMA_BQ), nkv);
+    switch (kvtype) {
+#define FA_WMMA_CASE(KT)                                                                 \
+  case KT:                                                                               \
+    k_fa_prep_q<KT><<<cdiv(T * nh, 8), 256, 0, s>>>(q, qhs, qts, nh, T, sl2, q16);       \
+    k_fa_wmma<KT, 6><<<grid, 192, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);       \
+    if (KT != KV_F16) k_wht_rows<<<cdiv(T * nh, 8), 256, 0, s>>>(out, T * nh);           \
+    break;
+      FA_WMMA_CASE(KV_Q4) FA_WMMA_CASE(KV_Q8) FA_WMMA_CASE(KV_Q3) FA_WMMA_CASE(KV_F16)
+#undef FA_WMMA_CASE
+      default:
+        break;
+    }
+    if (kvtype == KV_Q4 || kvtype == KV_Q8 || kvtype == KV_Q3 || kvtype == KV_F16) return;
+  }
   static const int fa_simt_v = getenv("QE_FA_SIMT") ? atoi(getenv("QE_FA_SIMT")) : 0;
   if ((fa_simt_v == 1 || fa_simt_v == 2 || fa_simt_v == 3 || fa_simt_v == 4) && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
     const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
@@ -4735,7 +4906,7 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   case KT:                                                                               \
     k_fa_prep_q<KT><<<cdiv(T * nh, 8), 256, 0, s>>>(q, qhs, qts, nh, T, sl2, q16);       \
     if (fa_simt_v == 4) k_fa_simt4<KT, 6><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
-    if (fa_simt_v == 3) k_fa_simt<KT, 6, 16, true><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
+    else if (fa_simt_v == 3) k_fa_simt<KT, 6, 16, true><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
     else if (fa_simt_v == 2) k_fa_simt<KT, 6, 16><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
     else k_fa_simt<KT, 6><<<grid, 256, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);      \
     if (KT != KV_F16) k_wht_rows<<<cdiv(T * nh, 8), 256, 0, s>>>(out, T * nh);           \
