@@ -4829,23 +4829,21 @@ __global__ void __launch_bounds__(192)
 #pragma unroll
       for (int i = 0; i < 8; i++) Ps[warp][2 * i + (lane >> 4)][lane & 15] = __float2half(pv[i]);
       __syncwarp();
-      // PV: O = al * O + P . V, for all 16 dim tiles (2 K-steps of 16 pos).
+      // PV: O = al * O + P . V over this sub-tile's 16 positions only --
+      // Ps holds exactly those 16 columns (the 32-wide read of the first
+      // version mixed in stale smem and produced garbage output).
 #pragma unroll
       for (int dt = 0; dt < 16; dt++) {
         qe_f32x8 acc;
 #pragma unroll
         for (int i = 0; i < 8; i++) acc[i] = o_[dt][i] * al[i];
+        qe_f16x16 a, b;
 #pragma unroll
-        for (int ks = 0; ks < 2; ks++) {
-          qe_f16x16 a, b;
-#pragma unroll
-          for (int e = 0; e < 16; e++) {
-            a[e] = (__fp16)__half2float(Ps[warp][lane & 15][16 * ks + e]);
-            b[e] = (__fp16)__half2float(VsT[16 * dt + (lane & 15)][16 * ks + e]);
-          }
-          acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+        for (int e = 0; e < 16; e++) {
+          a[e] = (__fp16)__half2float(Ps[warp][lane & 15][e]);
+          b[e] = (__fp16)__half2float(VsT[16 * dt + (lane & 15)][sub * 16 + e]);
         }
-        o_[dt] = acc;
+        o_[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
       }
       __syncwarp();
     }
