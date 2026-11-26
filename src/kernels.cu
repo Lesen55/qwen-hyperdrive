@@ -2634,6 +2634,149 @@ __global__ void __launch_bounds__(256)
       }
   }
 }
+// Register-prefetch pipelined variant of k_gq_wmma_iq3s_t128
+// (QE_GQ_T128=2): the next 128-wide chunk's global loads are issued into
+// registers before the current chunk's WMMA work, then stored into the
+// SAME smem buffers after a sync. Smem stays ~27.6KB so occupancy
+// (2 blocks/CU) is preserved -- the double-buffered k_gq_wmma_iq3s_p
+// doubled smem and lost a block per CU, which ate its pipelining gain.
+// Tiling, scale handling and numerics are identical to the t128 kernel.
+__global__ void __launch_bounds__(256)
+    k_gq_wmma_iq3s_t128p(const int8_t* __restrict__ w8, const int8_t* __restrict__ s8, const float* __restrict__ fac,
+                         int K, int N, const int8_t* __restrict__ xq, const float* __restrict__ xd256, int Tt,
+                         float* __restrict__ y, int ldy, int accum) {
+  __shared__ __align__(16) int8_t sW[GQT_BM][GQT_LD];
+  __shared__ __align__(16) int8_t sX[GQT_BN][GQT_LD];
+  __shared__ float sws[GQT_BM][GQT_GC];
+  __shared__ float sfac[GQT_BM];
+  __shared__ float sxd[GQT_BN];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int n0 = blockIdx.x * GQT_BM, t0 = blockIdx.y * GQT_BN;
+  const int nkb = K / 256;  // superblocks in K
+  const int nch = K / 128;  // 128-wide chunks (2 per superblock)
+  const int tn = (warp & 3) * 16;
+  const int nn0 = (warp >> 2) * 16;
+  const int nloc = lane % 16, hi = lane / 16;
+  float acc[2][2][8] = {};
+
+  auto load_fac = [&](int kb) {
+    if (tid < GQT_BM) sfac[tid] = fac[(size_t)min(n0 + tid, N - 1) * nkb + kb];
+    if (tid >= GQT_BM && tid < GQT_BM + GQT_BN) {
+      const int t = t0 + (tid - GQT_BM);
+      sxd[tid - GQT_BM] = t < Tt ? xd256[(size_t)t * nkb + kb] : 0.f;
+    }
+  };
+  // Load chunk ck's staging data into registers (no smem traffic yet).
+  auto load_chunk = [&](int ck, uint4 (&rw)[2], uint4 (&rx)[4], float& rs) {
+    const int kb = ck >> 1, g0 = (ck & 1) * GQT_GC;
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int idx = tid + u * 256, row = idx >> 3, ch = idx & 7;
+      const int n = min(n0 + row, N - 1);
+      rw[u] = *(const uint4*)(w8 + (size_t)n * K + kb * 256 + g0 * 32 + ch * 16);
+    }
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int idx = tid + u * 256, row = idx >> 3, ch = idx & 7;
+      const int t = t0 + row;
+      rx[u] = t < Tt ? *(const uint4*)(xq + (size_t)t * K + kb * 256 + g0 * 32 + ch * 16)
+                     : make_uint4(0, 0, 0, 0);
+    }
+    const int row = tid >> 2, gl = tid & 3;
+    const int n = min(n0 + row, N - 1);
+    rs = (float)s8[(size_t)n * (K / 16) + (size_t)(kb * 8 + g0 + gl) * 2];
+  };
+  auto store_chunk = [&](const uint4 (&rw)[2], const uint4 (&rx)[4], float rs) {
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int idx = tid + u * 256, row = idx >> 3, ch = idx & 7;
+      *(uint4*)&sW[row][ch * 16] = rw[u];
+    }
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int idx = tid + u * 256, row = idx >> 3, ch = idx & 7;
+      *(uint4*)&sX[row][ch * 16] = rx[u];
+    }
+    sws[tid >> 2][tid & 3] = rs;
+  };
+
+  load_fac(0);
+  {
+    uint4 rw[2], rx[4]; float rs;
+    load_chunk(0, rw, rx, rs);
+    store_chunk(rw, rx, rs);
+  }
+  __syncthreads();
+
+  float bacc[2][2][8] = {};
+  for (int ck = 0; ck < nch; ck++) {
+    uint4 rw[2], rx[4]; float rs;
+    const bool has_next = ck + 1 < nch;
+    if (has_next) load_chunk(ck + 1, rw, rx, rs);  // global loads in flight during compute
+#pragma unroll
+    for (int gl = 0; gl < GQT_GC; gl++) {
+#pragma unroll
+      for (int b = 0; b < 2; b++) {
+        const int nn = nn0 + b * 32;
+        wmma_i32x8 c[2] = {{0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}};
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          const uint4 bv = *(const uint4*)&sW[nn + nloc][gl * 32 + h * 16];
+          wmma_i32x4 b4;
+          b4[0] = (int)bv.x; b4[1] = (int)bv.y; b4[2] = (int)bv.z; b4[3] = (int)bv.w;
+#pragma unroll
+          for (int tt = 0; tt < 2; tt++) {
+            const uint4 av = *(const uint4*)&sX[tn + tt * 64 + nloc][gl * 32 + h * 16];
+            wmma_i32x4 a4;
+            a4[0] = (int)av.x; a4[1] = (int)av.y; a4[2] = (int)av.z; a4[3] = (int)av.w;
+            c[tt] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a4, true, b4, c[tt], false);
+          }
+        }
+        const float s = sws[nn + nloc][gl];
+#pragma unroll
+        for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+          for (int i = 0; i < 8; i++) bacc[b][tt][i] += (float)c[tt][i] * s;
+      }
+    }
+    if (ck & 1) {  // end of a 256-wide superblock: float epilogue
+#pragma unroll
+      for (int b = 0; b < 2; b++) {
+        const float f = sfac[nn0 + b * 32 + nloc];
+#pragma unroll
+        for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+          for (int i = 0; i < 8; i++) acc[b][tt][i] += bacc[b][tt][i] * f * sxd[tn + tt * 64 + 2 * i + hi];
+      }
+#pragma unroll
+      for (int b = 0; b < 2; b++)
+#pragma unroll
+        for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+          for (int i = 0; i < 8; i++) bacc[b][tt][i] = 0.f;
+    }
+    __syncthreads();  // compute reads of smem done; sfac/sxd epilogue reads done
+    if (has_next) {
+      store_chunk(rw, rx, rs);
+      if ((ck & 1) && (ck >> 1) + 1 < nkb) load_fac((ck >> 1) + 1);
+      __syncthreads();  // staged chunk visible to all warps
+    }
+  }
+#pragma unroll
+  for (int b = 0; b < 2; b++) {
+    const int n = n0 + nn0 + b * 32 + nloc;
+    if (n >= N) continue;
+#pragma unroll
+    for (int tt = 0; tt < 2; tt++)
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const int t = t0 + tn + tt * 64 + 2 * i + hi;
+        if (t >= Tt) continue;
+        float* o = y + (size_t)t * ldy + n;
+        *o = accum ? *o + acc[b][tt][i] : acc[b][tt][i];
+      }
+  }
+}
 #endif  // __HIP_PLATFORM_AMD__
 
 bool gq_needs_xsum(uint32_t type) { return type == QT_Q2_K || type == QT_Q4_K || type == QT_Q5_K; }  // IQ1_S: min folded
@@ -2658,10 +2801,13 @@ void gq_gemm(uint32_t type, const void* buf, int K, int N, const int8_t* xq, con
 #ifdef __HIP_PLATFORM_AMD__
   if (type == QT_IQ3_S) {
     QE_ASSERT(K % 256 == 0);
-    static const bool t128 = getenv("QE_GQ_T128") && atoi(getenv("QE_GQ_T128")) != 0;
+    static const int t128 = getenv("QE_GQ_T128") ? atoi(getenv("QE_GQ_T128")) : 0;
     if (t128) {
       const dim3 grid128(cdiv(N, GQT_BM), cdiv(T, GQT_BN));
-      k_gq_wmma_iq3s_t128<<<grid128, 256, 0, s>>>(w8, s8, fac, K, N, xq, xd256, T, y, ldy, accumulate);
+      if (t128 == 2)
+        k_gq_wmma_iq3s_t128p<<<grid128, 256, 0, s>>>(w8, s8, fac, K, N, xq, xd256, T, y, ldy, accumulate);
+      else
+        k_gq_wmma_iq3s_t128<<<grid128, 256, 0, s>>>(w8, s8, fac, K, N, xq, xd256, T, y, ldy, accumulate);
       return;
     }
     const dim3 grid(cdiv(N, GQH_BM), cdiv(T, GQH_BN));
