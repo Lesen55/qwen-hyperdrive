@@ -15,9 +15,10 @@ rem FA_WMMA=1: WMMA flash attention for prefill (measured 746 tok/s at ~12k
 rem context vs 612 for the SIMT path, 813 vs 786 at ~4k, 2026-11-26). The
 rem SIMT path (QE_FA_SIMT=2) remains available as a fallback via env.
 set QE_FA_WMMA=1
-rem GQ_T128=1: 128-token GEMM tiles (measured 786 vs 764 tok/s prefill at ~4k
-rem context, no regression at ~10k, 2026-11-22).
-set QE_GQ_T128=1
+rem GQ_T128=2: 128-token GEMM tiles with register-prefetch pipelining
+rem (measured 852 vs 788 tok/s prefill, same 8k single-shot prompt on the
+rem same hardware, 2026-11-28; =1 is the non-pipelined variant).
+set QE_GQ_T128=2
 cd /d %~dp0
 qwen35-server-hip.exe --draft 3 --host 0.0.0.0 -m "%MODEL%" --port %PORT% %*
 pause
