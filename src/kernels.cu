@@ -4891,14 +4891,17 @@ __device__ inline qe_f16x16 qe_frag16(const __half* p) {
   return __builtin_bit_cast(qe_f16x16, r);
 }
 
-template <int KT, int G>
+template <int KT, int G, int BN = FA_WMMA_BN>
 __global__ void __launch_bounds__(192)
     k_fa_wmma(const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
               const __half* __restrict__ q16, float* __restrict__ out, int nh, int pos0, int T,
               int recb, KVMap bs) {
-  __shared__ __align__(16) __half Ks[FA_WMMA_BN][FA_QLD];
-  __shared__ __align__(16) __half VsT[FA_D][FA_WMMA_VLD];
-  __shared__ __align__(16) __half Ps[6][16][FA_WMMA_VLD];
+  // BN=32 (QE_FA_WMMA=1): ~45KB smem, 1 block/CU. BN=16 (QE_FA_WMMA=2):
+  // ~25KB smem, 2 blocks/CU -- half the KV reuse per fill, twice the warps.
+  constexpr int VLD = BN + 8;  // row stride (halves); (BN+8)*2 B rows stay 16B-aligned
+  __shared__ __align__(16) __half Ks[BN][FA_QLD];
+  __shared__ __align__(16) __half VsT[FA_D][VLD];
+  __shared__ __align__(16) __half Ps[6][16][VLD];
   const int kvh = blockIdx.y;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int q0 = blockIdx.x * FA_WMMA_BQ;
@@ -4929,9 +4932,9 @@ __global__ void __launch_bounds__(192)
   const int hA = kvh * G + (rrA % G);
   const __half* qrow = q16 + ((size_t)tA * nh + hA) * FA_D;
 
-  for (int kt = 0; kt <= kt_max; kt += FA_WMMA_BN) {
+  for (int kt = 0; kt <= kt_max; kt += BN) {
     // Cooperative fill: K as [pos][dim], V transposed as [dim][pos].
-    for (int idx = tid; idx < FA_WMMA_BN * 32; idx += 192) {
+    for (int idx = tid; idx < BN * 32; idx += 192) {
       const int pi = idx >> 5, c = idx & 31;
       const int p = min(kt + pi, ptot - 1);
       const uint4 kk = kv_read8h<KT>(kc + kv_off(kvh, p, bs, recb), c);
@@ -4944,7 +4947,7 @@ __global__ void __launch_bounds__(192)
     __syncthreads();
 
 #pragma unroll
-    for (int sub = 0; sub < 2; sub++) {
+    for (int sub = 0; sub < BN / 16; sub++) {
       // Scores: S = Q . K^T over this 16-position sub-tile (16 K-steps).
       qe_f32x8 s = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -5021,7 +5024,7 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
   // shape matches), else the v1 fallback -- the decode path in chunks of 4
   // (exactly the engine's own QE_SLOW_ATTN reference route).
   static const int fa_wmma_v = getenv("QE_FA_WMMA") ? atoi(getenv("QE_FA_WMMA")) : 0;
-  if (fa_wmma_v == 1 && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
+  if ((fa_wmma_v == 1 || fa_wmma_v == 2) && hd == FA_D && nh % nkv == 0 && nh / nkv == 6 && work) {
     const int recb = (int)kv_bytes_per_token_head(kvtype, hd);
     const float sl2 = scale * 1.4426950408889634f;
     __half* q16 = (__half*)work;
@@ -5032,7 +5035,8 @@ void attn_prefill(int kvtype, const void* kcache, const void* vcache, const floa
 #define FA_WMMA_CASE(KT)                                                                 \
   case KT:                                                                               \
     k_fa_prep_q<KT><<<cdiv(T * nh, 8), 256, 0, s>>>(q, qhs, qts, nh, T, sl2, q16);       \
-    k_fa_wmma<KT, 6><<<grid, 192, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);       \
+    if (fa_wmma_v == 2) k_fa_wmma<KT, 6, 16><<<grid, 192, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs); \
+    else k_fa_wmma<KT, 6><<<grid, 192, 0, s>>>(kc, vc, q16, out, nh, pos0, T, recb, bs);       \
     if (KT != KV_F16) k_wht_rows<<<cdiv(T * nh, 8), 256, 0, s>>>(out, T * nh);           \
     break;
       FA_WMMA_CASE(KV_Q4) FA_WMMA_CASE(KV_Q8) FA_WMMA_CASE(KV_Q3) FA_WMMA_CASE(KV_F16)
